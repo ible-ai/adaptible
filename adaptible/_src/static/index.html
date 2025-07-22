@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Server Terminal</title>
+    <!-- Tailwind CSS CDN for easy styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom styles to enhance the terminal look */
+        body {
+            font-family: 'Inter', 'Fira Code', 'JetBrains Mono', monospace;
+            /* Prefer Inter, then monospace fonts */
+            background-color: #090d15;
+            color: #e2e8f0;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            /* Full viewport height */
+            overflow: hidden;
+            /* Prevent body scroll */
+        }
+
+        /* Terminal specific styling */
+        .terminal-container {
+            background-color: #0d1117;
+            /* Even darker background for the terminal window */
+            border: 1px solid #2d3748;
+            /* Subtle border */
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            /* Soft shadow */
+            max-height: 90vh;
+            /* Max height for scrollable content */
+            display: flex;
+            flex-direction: column;
+            border-radius: 0.1rem;
+            /* Rounded corners */
+        }
+
+        .terminal-output {
+            flex-grow: 1;
+            /* Allows output to take available space */
+            overflow-y: auto;
+            /* Enable scrolling for output */
+            padding: 1rem;
+            font-size: 0.95rem;
+            line-height: 1.5;
+            color: #85a0c3;
+            /* Lighter gray for terminal text */
+            white-space: pre-wrap;
+            /* Preserve whitespace and wrap text */
+            word-break: break-word;
+            /* Break long words */
+        }
+
+        .terminal-prompt-area {
+            display: flex;
+            padding: 1rem;
+            border-top: 1px solid #2d3748;
+            /* Separator line */
+            align-items: center;
+        }
+
+        .terminal-prompt-prefix {
+            color: #13713a;
+            /* Green for user@server prefix */
+            margin-right: 0.5rem;
+            font-weight: bold;
+            flex-shrink: 0;
+            /* Prevent shrinking */
+        }
+
+        .terminal-input {
+            background-color: transparent;
+            /* No background for input */
+            border: none;
+            outline: none;
+            color: #63b3ed;
+            /* Cyan for user input */
+            flex-grow: 1;
+            /* Take remaining space */
+            font-size: 0.95rem;
+            padding: 0;
+            /* Remove default padding */
+        }
+
+        .terminal-input::placeholder {
+            color: #718096;
+            /* Lighter gray for placeholder */
+        }
+
+        .terminal-input:focus {
+            outline: none;
+            /* Ensure no outline on focus */
+        }
+
+        .terminal-button {
+            background-color: #4299e1;
+            /* Blue button */
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 0.375rem;
+            /* Rounded corners */
+            font-weight: bold;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            margin-left: 1rem;
+            flex-shrink: 0;
+            /* Prevent shrinking */
+        }
+
+        .terminal-button:hover {
+            background-color: #3182ce;
+            /* Darker blue on hover */
+        }
+
+        .llm-response {
+            color: #9f7aea;
+            /* Purple for LLM responses */
+        }
+
+        .user-input-display {
+            color: #63b3ed;
+            /* Cyan for displayed user input */
+        }
+
+        .loading-indicator {
+            color: #ecc94b;
+            /* Yellow for loading text */
+            font-style: italic;
+        }
+    </style>
+</head>
+
+<body class="font-inter">
+    <div class="terminal-container w-11/12 md:w-3/4 lg:w-2/3 xl:w-1/2 p-4 rounded-lg shadow-2xl">
+        <!-- Terminal Output Area -->
+        <div id="terminal-output" class="terminal-output rounded-t-lg">
+            <p class="text-green-400 font-bold">This is ible.ai</p>
+            <p class="text-gray-500 text-sm">What's on your mind? Press Enter or tap 'Send' when you're ready.</p>
+            <span class="terminal-std-out"></span>
+            <br>
+        </div>
+
+        <!-- Terminal Input Area -->
+        <div class="terminal-prompt-area rounded-b-lg">
+            <span class="terminal-prompt-prefix">user@ible.ai:~$</span>
+            <input type="text" id="prompt-input" class="terminal-input" placeholder="Enter your prompt here...">
+            <button id="send-button" class="terminal-button">Send</button>
+        </div>
+    </div>
+
+    <script>
+        const terminalOutput = document.getElementById('terminal-output');
+        const promptInput = document.getElementById('prompt-input');
+        const sendButton = document.getElementById('send-button');
+        const terminalStreamingOutput = document.getElementById('terminal-std-out');
+
+        function appendToTerminal(text, className = '', newline = true) {
+            if (newline) {
+                const p = document.createElement('p');
+                p.className = className;
+                p.textContent = text;
+                terminalOutput.appendChild(p);
+            } else {
+                const span = document.createElement('span');
+                span.className = className;
+                span.textContent = text;
+                terminalOutput.appendChild(span);
+            }
+            // Scroll to the bottom
+            terminalOutput.scrollTop = terminalOutput.scrollHeight;
+        }
+
+        async function sendPrompt() {
+            const prompt = promptInput.value.trim();
+            if (!prompt) {
+                return;
+            }
+
+            // Display user's prompt in the terminal
+            appendToTerminal(`user@ible.ai:~$ ${prompt}`, 'user-input-display');
+            promptInput.value = ''; // Clear input field
+
+            // Show loading indicator
+            const loadingMessage = document.createElement('p');
+            loadingMessage.className = 'loading-indicator';
+            loadingMessage.textContent = 'Thinking...';
+            terminalOutput.appendChild(loadingMessage);
+            terminalOutput.scrollTop = terminalOutput.scrollHeight;
+            console.log(prompt);
+            try {
+                const location = window.location.hostname;
+                console.log(location);
+
+                fetch('/stream_interact', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        'prompt': `${prompt}`
+                    })
+                })
+                .then(response => {
+                        const reader = response.body.getReader();
+                        const decoder = new TextDecoder();
+                        terminalOutput.removeChild(loadingMessage);
+                        function readStream() {
+                            reader.read().then(({ done, value }) => {
+                                if (done) {
+                                    console.log('Stream finished');
+                                    return;
+                                }
+                                const chunk = decoder.decode(value);
+                                appendToTerminal(chunk, 'llm-response', false)
+                                readStream(); // Continue reading the stream
+                            }).catch(error => {
+                                console.error('Error reading stream:', error);
+                            });
+                        }
+                        readStream(); // Start reading the stream
+                    })
+                    .catch(error => {
+                        console.error('Error fetching stream:', error);
+                    });
+
+
+
+            } catch (error) {
+                // Remove loading indicator
+                if (terminalOutput.contains(loadingMessage)) {
+                    terminalOutput.removeChild(loadingMessage);
+                }
+                appendToTerminal(`Error: Could not connect to LLM server or invalid response. ${error.message}`, 'text-red-400');
+                console.log(error);
+            }
+        }
+
+        // Event listeners
+        sendButton.addEventListener('click', sendPrompt);
+        promptInput.addEventListener('keypress', (event) => {
+            if (event.key === 'Enter') {
+                sendPrompt();
+            }
+        });
+    </script>
+</body>
+
+</html>

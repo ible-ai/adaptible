@@ -15,7 +15,7 @@ dependencies = [
     "torch",
     "tqdm",
     "transformers",
-    "uvicorn",
+    "uvicorn[standard]",
     "vizible@git+https://github.com/ible-ai/vizible",
 ]
 

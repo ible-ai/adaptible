@@ -1,20 +1,27 @@
 """Server definition for spinning up a StatefulLLM instance."""
 
 import asyncio
+import logging
 import socket
+import sys
 
 from fastapi import FastAPI
 import uvicorn
 
-from ._api import App
+from ._api import app
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', stream=sys.stdout)
+logger = logging.getLogger(__name__) # Get a logger for this module
+
 
 class MutableHostedLLM(uvicorn.Server):
     """Host server to interact with a stateful LLM"""
 
-    def __init__(self, app: FastAPI = App, host: str = '127.0.0.1', port: int = 8000):
+    def __init__(self, uvicorn_app: FastAPI = app, host: str = '127.0.0.1', port: int = 8000):
+        super().__init__(config=uvicorn.Config(uvicorn_app, host=host, port=port))
         self._startup_done = asyncio.Event()
         self._serve_task = None
-        super().__init__(config=uvicorn.Config(app, host=host, port=port))
+        self.should_exit = False
 
     async def startup(self, sockets: list[socket.socket] | None = None) -> None:
         """Override uvicorn startup"""

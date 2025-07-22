@@ -8,10 +8,12 @@ import time
 import threading
 from typing import Any, List
 
+
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 import tqdm
-from vizible import green
+import vizible
 
 from ._classes import (
     InteractionHistory,
@@ -22,13 +24,16 @@ from ._classes import (
 )
 from ._llm import StatefulLLM
 
-App = FastAPI(
+app = FastAPI(
     title="Stateful Self-Improving LLM Server",
     description="An API for a stateful LLM that tries to improve itself over time.",
 )
-App.mount(
+app.mount(
     "/static",
-    StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")),
+    StaticFiles(
+        directory=os.path.join(os.path.dirname(__file__), "static"),
+        html=True,
+    ),
     name="static",
 )
 
@@ -38,11 +43,11 @@ unreviewed_interaction_history_indices: List[int] = []
 
 outstanding_tasks: collections.deque[Any] = collections.deque([])
 
-# Instantiate the stateful model. This is a singleton for the lifecycle of the App.
+# Instantiate the stateful model. This is a singleton for the lifecycle of the app.
 model = StatefulLLM()
 
 
-@App.post("/interact", response_model=InteractionResponse)
+@app.post("/interact", response_model=InteractionResponse)
 async def interact_with_model(request: InteractionRequest):
     """
     Main endpoint for interacting with the LLM (Forward-pass).
@@ -68,7 +73,15 @@ async def interact_with_model(request: InteractionRequest):
     return {"response": response_text, "interaction_idx": interaction_idx}
 
 
-@App.post("/trigger_review", response_model=ReviewResponse)
+@app.post("/stream_interact")
+async def stream_interact_with_model(request: InteractionRequest):
+    """Stream interaction with model."""
+    # TODO - enable logging.
+    return StreamingResponse(
+        model.stream_response(request.prompt), media_type="text/plain"
+    )
+
+@app.post("/trigger_review", response_model=ReviewResponse)
 async def trigger_review_cycle():
     """Manually triggers the self-correction and training cycle."""
     unreviewed_count = len(unreviewed_interaction_history_indices)
@@ -89,7 +102,7 @@ async def trigger_review_cycle():
     }
 
 
-@App.get("/sync", response_model=SyncResponse)
+@app.get("/sync", response_model=SyncResponse)
 async def sync_server_for_background_tasks():
     """Waits for any tasks to background complete."""
     start_time = time.time()
@@ -100,7 +113,7 @@ async def sync_server_for_background_tasks():
         lock,
         tqdm.tqdm(desc="Waiting for server to sync.", unit=" Seconds") as server_pbar,
     ):
-        green("Finished background tasks")
+        vizible.green("Finished background tasks")
         while not model.ok:
             log.logger.info(
                 "Waiting for model server to sync. Is model is %s ok.",
@@ -108,7 +121,7 @@ async def sync_server_for_background_tasks():
             )
             server_pbar.update(1)
             await asyncio.sleep(1)
-    green("Model has reached a stable state!!!")
+    vizible.green("Model has reached a stable state!!!")
     elapsed_time = time.time() - start_time
     return {
         "message": "Sync'd all background tasks.",
@@ -117,13 +130,13 @@ async def sync_server_for_background_tasks():
     }
 
 
-@App.get("/history")
+@app.get("/history")
 async def get_history():
     """Returns the full interaction history."""
     return {"history": interaction_history}
 
 
-@App.get("/status")
+@app.get("/status")
 async def check_is_running():
     """Basic response to signal that the server is operational."""
     return {"status": "up"}

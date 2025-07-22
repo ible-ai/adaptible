@@ -1,6 +1,6 @@
 """Stateful LLM."""
 
-from typing import List, Tuple
+from typing import AsyncIterable, List, Tuple
 
 import functools
 import threading
@@ -10,7 +10,7 @@ import immutabledict
 from mlx import optimizers
 from mlx import nn
 import mlx.core as mx
-from mlx_lm.generate import generate
+from mlx_lm.generate import generate, stream_generate
 from mlx_lm.utils import load
 from mlx_lm.tuner.utils import linear_to_lora_layers
 from transformers.tokenization_utils import PreTrainedTokenizer
@@ -120,6 +120,7 @@ class StatefulLLM:
         self._eos_token = self._tokenizer.special_tokens_map.get("eos_token", "")
 
         self._model_is_stable = True
+        self._response_stream = None
 
     @property
     def ok(self) -> bool:
@@ -161,6 +162,37 @@ class StatefulLLM:
         )
         return model_response.strip()
 
+    async def stream_response(
+        self,
+        prompt: str,
+        use_history: bool = True,
+        max_tokens: int | None = None,
+    ) -> AsyncIterable[str]:
+        """Stream generated response"""
+        message = {"role": "user", "content": prompt}
+        if max_tokens is None:
+            max_tokens = self._max_tokens
+        print(f'{self._messages = }')
+        if use_history:
+            self._messages.append(message)
+            messages = self._messages
+        else:
+            messages = [message]
+        tokenized_prompt = self._tokenizer.apply_chat_template(messages)
+        responses = []
+        try:
+            for response in stream_generate(
+                self._model,
+                self._tokenizer,
+                prompt=tokenized_prompt,
+                max_tokens=max_tokens,
+            ):
+                text = response.text
+                responses.append(text)
+                yield text
+        finally:
+            self._response_stream = "".join(responses)
+
     def _tokenize(self, inp: str, dtype: mx.Dtype = mx.int32) -> mx.array:
         return mx.array(
             self._tokenizer.encode(inp, add_special_tokens=False), dtype=dtype
@@ -179,7 +211,9 @@ class StatefulLLM:
         if not interaction_history or not indices_to_review:
             raise ValueError("No unreviewed interactions to process.")
         if verbose:
-            vizible.magenta(f"Found {len(interaction_history)} unreviewed interactions.")
+            vizible.magenta(
+                f"Found {len(interaction_history)} unreviewed interactions."
+            )
         interactions_to_review = []
         for idx in indices_to_review:
             # Mark as reviewed to skip re-processing in the next cycle.
@@ -187,11 +221,13 @@ class StatefulLLM:
             interactions_to_review.append(interaction_history[idx])
 
         # 1. Have the model re-evaluate its past responses and try to improve upon one of its turns.
-        review_prompt = revise.make_revision_prompt(interactions_to_review, self._tokenizer)
+        review_prompt = revise.make_revision_prompt(
+            interactions_to_review, self._tokenizer
+        )
         llm_rewrite_response = self.generate_response(review_prompt, use_history=False)
         if verbose:
             vizible.blue(f"  - Response: {llm_rewrite_response}")
-        
+
         # 2. Prepare training data to train the model on how it should have responded in this
         #    situation.
         example = revise.make_collated_training_example(
@@ -224,7 +260,9 @@ class StatefulLLM:
             tqdm.tqdm.write(f"Node {rank} of {world_size}")
 
         self._model.train(True)
-        for epoch in tqdm.tqdm(range(self._epochs), desc="Training", total=self._epochs):
+        for epoch in tqdm.tqdm(
+            range(self._epochs), desc="Training", total=self._epochs
+        ):
             loss = _step(example.input, example.label, example.mask)
             mx.eval(state, loss)
             if verbose:
@@ -234,7 +272,7 @@ class StatefulLLM:
         self._model.train(False)
         if verbose:
             vizible.cyan(f"{losses = }")
-    
+
     def self_correct_and_train(
         self,
         interaction_history: List[InteractionHistory],
