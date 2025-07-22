@@ -16,7 +16,7 @@ dependencies = [
     "tqdm",
     "transformers",
     "uvicorn[standard]",
-    "vizible@git+https://github.com/ible-ai/vizible",
+    "vizible",
 ]
 
 [build-system]
