@@ -5,10 +5,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LLM Server Terminal</title>
-    <!-- Tailwind CSS CDN for easy styling -->
+    <link rel="icon" type="image/png" href="gemini_2_cropped.png">
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        /* Custom styles to enhance the terminal look */
         body {
             font-family: 'Inter', 'Fira Code', 'JetBrains Mono', monospace;
             /* Prefer Inter, then monospace fonts */
@@ -183,7 +182,7 @@
             }
 
             // Display user's prompt in the terminal
-            appendToTerminal(`user@ible.ai:~$ ${prompt}`, 'user-input-display');
+            appendToTerminal(`${prompt}`, 'user-input-display');
             promptInput.value = ''; // Clear input field
 
             // Show loading indicator
@@ -206,7 +205,7 @@
                         'prompt': `${prompt}`
                     })
                 })
-                .then(response => {
+                    .then(response => {
                         const reader = response.body.getReader();
                         const decoder = new TextDecoder();
                         terminalOutput.removeChild(loadingMessage);
