@@ -4,7 +4,6 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LLM Server Terminal</title>
     <link rel="icon" type="image/png" href="gemini_2_cropped.png">
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
@@ -247,6 +246,23 @@
                 sendPrompt();
             }
         });
+    </script>
+    <script>
+        (function () {
+            const baseTitle = " > adapt.ible ";
+            const cursor = "_"; // You can also use "█" for a block cursor
+            let isCursorVisible = true;
+            const speed = 800; // Blink speed in milliseconds (800ms is standard terminal speed)
+
+            setInterval(() => {
+                if (isCursorVisible) {
+                    document.title = baseTitle + cursor;
+                } else {
+                    document.title = baseTitle;
+                }
+                isCursorVisible = !isCursorVisible;
+            }, speed);
+        })();
     </script>
 </body>
 
