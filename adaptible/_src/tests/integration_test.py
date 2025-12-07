@@ -15,17 +15,18 @@ Run with:
 Generates an HTML report at: /tmp/adaptible_test_report.html
 """
 
+from typing import Any
 import html
 import json
 import re
 import unittest
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+import webbrowser
 
 import adaptible
 from adaptible import revise
-
+import vizible
 
 # Global report data collector
 REPORT_DATA: dict[str, Any] = {
@@ -55,7 +56,9 @@ class CorrectionTask:
     name: str
     question: str
     correct_answer: str
-    key_terms: list[str] = field(default_factory=list)  # Terms that indicate correct answer
+    key_terms: list[str] = field(
+        default_factory=list
+    )  # Terms that indicate correct answer
 
 
 # Questions where we know the factually correct answer
@@ -95,7 +98,9 @@ def strip_think_tags(response: str | None) -> str | None:
     """Strip <think>...</think> tags and content from model response."""
     if response is None:
         return None
-    cleaned = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(
+        r"<think>.*?</think>", "", response, flags=re.DOTALL | re.IGNORECASE
+    )
     cleaned = re.sub(r"</?think>", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
 
@@ -146,7 +151,8 @@ def generate_html_report(report_path: str = "/tmp/adaptible_test_report.html") -
         status_class = "improved" if improved else "not-improved"
         status_icon = "✓" if improved else "✗"
 
-        tasks_html.append(f"""
+        tasks_html.append(
+            f"""
         <div class="task-card">
             <div class="task-header">
                 <h3>{html.escape(task_data.get('name', 'Unknown'))}</h3>
@@ -197,7 +203,8 @@ def generate_html_report(report_path: str = "/tmp/adaptible_test_report.html") -
                 ({task_data.get('judgment_raw', 'N/A')})
             </div>
         </div>
-        """)
+        """
+        )
 
     summary = REPORT_DATA.get("summary", {})
     improved_count = summary.get("improved", 0)
@@ -474,26 +481,32 @@ class RealResponseCorrectionTest(unittest.TestCase):
             print(f"Model prefers: {comparison} ({'✓' if improved else '✗'})")
 
             # Record data
-            REPORT_DATA["tasks"].append({
-                "name": task.name,
-                "question": task.question,
-                "target": task.correct_answer,
-                "key_terms": task.key_terms,
-                "initial_response": initial_clean,
-                "initial_raw": initial_raw,
-                "initial_has_key_terms": initial_has_terms,
-                "post_response": post_clean,
-                "post_raw": post_raw,
-                "post_has_key_terms": post_has_terms,
-                "comparison": comparison,
-                "judgment_raw": judgment_raw,
-                "model_prefers_post": improved,
-            })
+            REPORT_DATA["tasks"].append(
+                {
+                    "name": task.name,
+                    "question": task.question,
+                    "target": task.correct_answer,
+                    "key_terms": task.key_terms,
+                    "initial_response": initial_clean,
+                    "initial_raw": initial_raw,
+                    "initial_has_key_terms": initial_has_terms,
+                    "post_response": post_clean,
+                    "post_raw": post_raw,
+                    "post_has_key_terms": post_has_terms,
+                    "comparison": comparison,
+                    "judgment_raw": judgment_raw,
+                    "model_prefers_post": improved,
+                }
+            )
 
         # Summary
         improved_count = sum(1 for t in REPORT_DATA["tasks"] if t["model_prefers_post"])
-        initial_with_terms = sum(1 for t in REPORT_DATA["tasks"] if t["initial_has_key_terms"])
-        post_with_terms = sum(1 for t in REPORT_DATA["tasks"] if t["post_has_key_terms"])
+        initial_with_terms = sum(
+            1 for t in REPORT_DATA["tasks"] if t["initial_has_key_terms"]
+        )
+        post_with_terms = sum(
+            1 for t in REPORT_DATA["tasks"] if t["post_has_key_terms"]
+        )
 
         REPORT_DATA["summary"] = {
             "improved": improved_count,
@@ -575,7 +588,9 @@ def run_integration_tests(report_path: str = "/tmp/adaptible_test_report.html"):
     print("\n" + "=" * 70)
     print("HTML REPORT GENERATED")
     print("=" * 70)
-    print(f"Open in browser: file://{report_file}")
+    url = f"file://{report_file}"
+    vizible.green(f"Open in browser: {url}")
+    webbrowser.open_new_tab(url)
 
     print("\n" + "=" * 70)
     print("FINAL SUMMARY")
