@@ -260,36 +260,29 @@ def make_collated_training_example(
     Returns: a collated training example, ready for model ingestion.
 
     """
-    _, turns = _serialize_interactions_to_string(
-        interactions=interactions,
-        should_enumerate=True,
-        tokenizer=tokenizer,
-        continue_final_message=False,
-    )
     eos_tag = tokenizer.special_tokens_map.get("eos_token", "")
     if isinstance(eos_tag, list):
         eos_tag = eos_tag[0]
-    bos_tag = tokenizer.special_tokens_map.get("bos_token", "")
-    if isinstance(bos_tag, list):
-        bos_tag = bos_tag[0]
+
     index_to_rewrite = _isolate_turn_to_rewritten_turn_index(response)
     rewritten_response = _parse_rewritten_response(response, index_to_rewrite)
-    interaction_to_revise = copy.deepcopy(interactions[index_to_rewrite])
-    interaction_to_revise.llm_response = ""
-    revised_dialog_turn, _ = _serialize_interactions_to_string(
-        interactions=[interaction_to_revise],
-        should_enumerate=False,
-        tokenizer=tokenizer,
-        continue_final_message=True,
+
+    # Build the prompt prefix using the same format as generation
+    # For turn 0: just the user message with add_generation_prompt
+    # For later turns: include prior conversation
+    interaction_to_revise = interactions[index_to_rewrite]
+    messages = [{"role": "user", "content": interaction_to_revise.user_input}]
+
+    # Use add_generation_prompt=True to match inference format exactly
+    prompt_prefix = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
 
     def _tokenize(text: str, dtype: mx.Dtype = mx.int32) -> mx.array:
         return mx.array(tokenizer.encode(text, add_special_tokens=False), dtype=dtype)
 
-    dialog_pre_revision = _tokenize(
-        "\n".join(list(turns[:index_to_rewrite]) + [revised_dialog_turn])
-    )
-    revision = _tokenize(bos_tag + rewritten_response + eos_tag)
+    dialog_pre_revision = _tokenize(prompt_prefix)
+    revision = _tokenize(rewritten_response + eos_tag)
     tokenized_rewritten_dialog = mx.concat([dialog_pre_revision, revision])
     mask = mx.concat([mx.zeros_like(dialog_pre_revision), mx.ones_like(revision)])
     training_example = TrainingExample(

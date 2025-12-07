@@ -26,12 +26,17 @@ from ._classes import InteractionHistory, TrainingExample
 #                         Default constants.                          #
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 _MODEL_NAME = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B"
+# _MODEL_NAME = "mlx-community/DeepSeek-R1-Qwen3-0528-8B-4bit-AWQ"
 _MAX_TOKENS = 1024
 _LEARNING_RATE = 5e-5
 _EPOCHS = 5
-_NUM_LORA_LAYERS = 16
+# LoRA configuration: Higher rank (32) and more layers (24) provide
+# more capacity for learning while scale (10.0) keeps training stable.
+# Note: Self-correction works best with diverse accumulated examples over time,
+# not from single corrections. Behavioral change requires many training instances.
+_NUM_LORA_LAYERS = 24
 _LORA_PARAMETERS = immutabledict.immutabledict(
-    {"rank": 8, "dropout": 0.0, "scale": 20.0}
+    {"rank": 32, "dropout": 0.0, "scale": 10.0}
 )
 _USE_DORA = False
 
@@ -140,7 +145,9 @@ class StatefulLLM:
         Returns:
             Formatted chat string.
         """
-        tokenized_prompt = self._tokenizer.apply_chat_template(messages)
+        tokenized_prompt = self._tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True
+        )
         return cast(list[int], tokenized_prompt)
 
     def generate_response(
@@ -159,7 +166,8 @@ class StatefulLLM:
         Returns:
             Model-generated response.
         """
-        vizible.blue(f"Generating response for {prompt = }")
+        vizible.blue("Generating response for:")
+        vizible.blue(prompt)
         message = {"role": "user", "content": prompt}
         if max_tokens is None:
             max_tokens = self._max_tokens

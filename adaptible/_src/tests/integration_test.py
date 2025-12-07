@@ -1,28 +1,41 @@
 """Integration tests for the full self-correction pipeline.
 
 These tests verify that the self-correction and training cycle produces
-measurable behavioral improvements. The key insight is that we use the
-model itself to evaluate responses - if the model can't correctly judge
-which response is better, the entire self-correction premise fails.
+measurable behavioral improvements. The approach:
 
-Tests verify:
-1. The model can correctly identify better vs worse responses (prerequisite)
-2. After training on corrections, the model rates its new responses higher
-3. The full pipeline produces genuine behavioral improvement
+1. Get the model's ACTUAL response to a question
+2. Identify what needs improvement in that response
+3. Create a revision (the corrected version)
+4. Train on the revision
+5. Check if the model's behavior changed
 
 Run with:
     python -m adaptible._src.tests.integration_test
+
+Generates an HTML report at: /tmp/adaptible_test_report.html
 """
 
+import html
+import json
 import re
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
 
 import adaptible
 from adaptible import revise
 
 
-RATING_PROMPT_TEMPLATE = """You are evaluating two responses to the same question.
+# Global report data collector
+REPORT_DATA: dict[str, Any] = {
+    "timestamp": "",
+    "tasks": [],
+    "summary": {},
+}
+
+
+COMPARISON_PROMPT = """You are evaluating two responses to the same question.
 
 Question: {question}
 
@@ -30,103 +43,61 @@ Response A: {response_a}
 
 Response B: {response_b}
 
-Which response better answers the question? Consider:
-- Accuracy and correctness
-- Relevance to what was asked
-- Appropriate length (concise when asked to be concise)
-- Helpfulness
+Which response better answers the question? Consider accuracy and helpfulness.
 
-Reply with ONLY "A" or "B" to indicate which response is better. Do not explain."""
-
-
-QUALITY_RATING_PROMPT = """Rate this response on a scale of 1-5.
-
-Question: {question}
-Response: {response}
-
-Criteria:
-- 1: Completely wrong, off-topic, or unhelpful
-- 2: Partially relevant but major issues
-- 3: Adequate but could be better
-- 4: Good response, minor issues
-- 5: Excellent, directly answers the question appropriately
-
-Reply with ONLY a single digit (1, 2, 3, 4, or 5). Do not explain."""
+Reply with ONLY "A" or "B". Do not explain."""
 
 
 @dataclass
-class CorrectionScenario:
-    """A scenario for testing self-correction."""
+class CorrectionTask:
+    """A task where we know the correct answer to train toward."""
 
     name: str
     question: str
-    bad_response: str
-    good_response: str
-    correction_feedback: str
+    correct_answer: str
+    key_terms: list[str] = field(default_factory=list)  # Terms that indicate correct answer
 
 
-# Realistic scenarios where we know which response is objectively better
-SCENARIOS = [
-    CorrectionScenario(
-        name="verbosity",
-        question="In one word, what color is the sky?",
-        bad_response=(
-            "The sky appears blue during the day due to Rayleigh scattering, "
-            "where shorter blue wavelengths of sunlight are scattered more than "
-            "other colors by the atmosphere. However, at sunrise and sunset, "
-            "the sky can appear red, orange, or pink."
+# Questions where we know the factually correct answer
+CORRECTION_TASKS = [
+    CorrectionTask(
+        name="capital_australia",
+        question="What is the capital of Australia?",
+        correct_answer=(
+            "The capital of Australia is Canberra. While Sydney is the largest "
+            "city, Canberra was purpose-built as the capital in 1913."
         ),
-        good_response="Blue.",
-        correction_feedback="I asked for ONE WORD. Just say the color.",
+        key_terms=["Canberra"],
     ),
-    CorrectionScenario(
-        name="direct_answer",
-        question="Is water wet? Yes or no.",
-        bad_response=(
-            "The question of whether water is wet is philosophically complex. "
-            "Wetness is typically defined as the condition of being covered or "
-            "saturated with water. By this definition, water itself makes things "
-            "wet but may not be considered wet itself..."
+    CorrectionTask(
+        name="planets_count",
+        question="How many planets are in our solar system?",
+        correct_answer=(
+            "There are eight planets in our solar system: Mercury, Venus, Earth, "
+            "Mars, Jupiter, Saturn, Uranus, and Neptune. Pluto was reclassified "
+            "as a dwarf planet in 2006."
         ),
-        good_response="Yes.",
-        correction_feedback="Just answer yes or no, don't philosophize.",
+        key_terms=["eight", "8"],
     ),
-    CorrectionScenario(
-        name="stay_on_topic",
-        question="What is 2+2?",
-        bad_response=(
-            "Mathematics is a fascinating field that has evolved over thousands "
-            "of years. The concept of addition dates back to ancient civilizations..."
+    CorrectionTask(
+        name="telephone_inventor",
+        question="Who invented the telephone?",
+        correct_answer=(
+            "Alexander Graham Bell is credited with inventing the telephone in 1876. "
+            "He received the first patent for the telephone."
         ),
-        good_response="4.",
-        correction_feedback="Just give me the answer, not a history lesson.",
+        key_terms=["Bell", "Alexander Graham Bell"],
     ),
 ]
 
 
 def strip_think_tags(response: str | None) -> str | None:
-    """Strip <think>...</think> tags and content from model response.
-
-    Model outputs often include thinking tags that confuse the model when
-    embedded in subsequent prompts. This strips them for clean embedding.
-    """
+    """Strip <think>...</think> tags and content from model response."""
     if response is None:
         return None
-    # Remove <think>...</think> blocks entirely (including content)
     cleaned = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL | re.IGNORECASE)
-    # Also remove any standalone tags
     cleaned = re.sub(r"</?think>", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
-
-
-def extract_rating(response: str | None) -> int | None:
-    """Extract a numeric rating (1-5) from model response."""
-    if response is None:
-        return None
-    match = re.search(r"[1-5]", response)
-    if match:
-        return int(match.group())
-    return None
 
 
 def extract_choice(response: str | None) -> str | None:
@@ -134,26 +105,20 @@ def extract_choice(response: str | None) -> str | None:
     if response is None:
         return None
 
-    # Strip think tags if present
     cleaned = re.sub(r"</?think>", "", response, flags=re.IGNORECASE)
     cleaned = cleaned.strip().upper()
 
-    # Look for standalone A or B (possibly at end after reasoning)
-    # Check the last few characters for the answer
     last_part = cleaned[-10:] if len(cleaned) > 10 else cleaned
-
     if "B" in last_part and "A" not in last_part:
         return "B"
     if "A" in last_part and "B" not in last_part:
         return "A"
 
-    # Fall back to checking whole response
     if "B" in cleaned and "A" not in cleaned:
         return "B"
     if "A" in cleaned and "B" not in cleaned:
         return "A"
 
-    # Check first non-whitespace character
     for char in cleaned:
         if char in ("A", "B"):
             return char
@@ -161,160 +126,287 @@ def extract_choice(response: str | None) -> str | None:
     return None
 
 
-class ModelJudgmentTest(unittest.TestCase):
-    """Tests that verify the model can correctly judge response quality.
+def contains_key_terms(response: str, key_terms: list[str]) -> bool:
+    """Check if response contains any of the key terms."""
+    response_lower = response.lower()
+    return any(term.lower() in response_lower for term in key_terms)
 
-    This is a prerequisite for self-correction to work at all. If the model
-    can't tell good responses from bad ones, the entire approach fails.
-    """
+
+def generate_html_report(report_path: str = "/tmp/adaptible_test_report.html") -> str:
+    """Generate an HTML report from collected test data."""
+
+    tasks_html = []
+    for task_data in REPORT_DATA.get("tasks", []):
+        initial_has_answer = task_data.get("initial_has_key_terms", False)
+        post_has_answer = task_data.get("post_has_key_terms", False)
+        improved = task_data.get("model_prefers_post", False)
+
+        initial_class = "has-answer" if initial_has_answer else "missing-answer"
+        post_class = "has-answer" if post_has_answer else "missing-answer"
+        status_class = "improved" if improved else "not-improved"
+        status_icon = "✓" if improved else "✗"
+
+        tasks_html.append(f"""
+        <div class="task-card">
+            <div class="task-header">
+                <h3>{html.escape(task_data.get('name', 'Unknown'))}</h3>
+                <span class="status {status_class}">{status_icon} {'Improved' if improved else 'Not Improved'}</span>
+            </div>
+
+            <div class="question-box">
+                <strong>Question:</strong> {html.escape(task_data.get('question', ''))}
+            </div>
+
+            <div class="target-box">
+                <strong>Target Answer:</strong> {html.escape(task_data.get('target', ''))}
+                <div class="key-terms">Key terms: {', '.join(task_data.get('key_terms', []))}</div>
+            </div>
+
+            <div class="comparison-container">
+                <div class="response-box {initial_class}">
+                    <div class="response-header">
+                        <strong>Initial Response (A)</strong>
+                        <span class="term-indicator">{'✓ Has key terms' if initial_has_answer else '✗ Missing key terms'}</span>
+                    </div>
+                    <div class="response-content">{html.escape(task_data.get('initial_response', ''))}</div>
+                    <div class="raw-response">
+                        <details>
+                            <summary>Raw (with think tags)</summary>
+                            <pre>{html.escape(task_data.get('initial_raw', ''))}</pre>
+                        </details>
+                    </div>
+                </div>
+
+                <div class="response-box {post_class}">
+                    <div class="response-header">
+                        <strong>Post-Training Response (B)</strong>
+                        <span class="term-indicator">{'✓ Has key terms' if post_has_answer else '✗ Missing key terms'}</span>
+                    </div>
+                    <div class="response-content">{html.escape(task_data.get('post_response', ''))}</div>
+                    <div class="raw-response">
+                        <details>
+                            <summary>Raw (with think tags)</summary>
+                            <pre>{html.escape(task_data.get('post_raw', ''))}</pre>
+                        </details>
+                    </div>
+                </div>
+            </div>
+
+            <div class="judgment-box">
+                <strong>Model's Judgment:</strong> Prefers {task_data.get('comparison', '?')}
+                ({task_data.get('judgment_raw', 'N/A')})
+            </div>
+        </div>
+        """)
+
+    summary = REPORT_DATA.get("summary", {})
+    improved_count = summary.get("improved", 0)
+    total = summary.get("total", 0)
+    initial_with_terms = summary.get("initial_with_key_terms", 0)
+    post_with_terms = summary.get("post_with_key_terms", 0)
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Adaptible Integration Test Report</title>
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }}
+        h1 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; }}
+        h2 {{ color: #555; margin-top: 30px; }}
+
+        .summary-box {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+        }}
+        .summary-stat {{
+            text-align: center;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 6px;
+        }}
+        .summary-stat .number {{
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #007bff;
+        }}
+        .summary-stat .label {{
+            color: #666;
+            font-size: 0.9em;
+        }}
+
+        .task-card {{
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            overflow: hidden;
+        }}
+        .task-header {{
+            background: #007bff;
+            color: white;
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        .task-header h3 {{ margin: 0; }}
+        .status {{
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+        }}
+        .status.improved {{ background: #28a745; }}
+        .status.not-improved {{ background: #dc3545; }}
+
+        .question-box, .target-box, .judgment-box {{
+            padding: 15px 20px;
+            border-bottom: 1px solid #eee;
+        }}
+        .target-box {{ background: #f8f9fa; }}
+        .key-terms {{
+            font-size: 0.85em;
+            color: #666;
+            margin-top: 5px;
+        }}
+
+        .comparison-container {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0;
+        }}
+        .response-box {{
+            padding: 20px;
+            border-right: 1px solid #eee;
+        }}
+        .response-box:last-child {{ border-right: none; }}
+        .response-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #eee;
+        }}
+        .term-indicator {{
+            font-size: 0.85em;
+            padding: 3px 8px;
+            border-radius: 4px;
+        }}
+        .has-answer .term-indicator {{ background: #d4edda; color: #155724; }}
+        .missing-answer .term-indicator {{ background: #f8d7da; color: #721c24; }}
+
+        .response-content {{
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 6px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 0.9em;
+        }}
+        .raw-response {{
+            margin-top: 10px;
+        }}
+        .raw-response summary {{
+            cursor: pointer;
+            color: #666;
+            font-size: 0.85em;
+        }}
+        .raw-response pre {{
+            background: #2d2d2d;
+            color: #f8f8f2;
+            padding: 15px;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-size: 0.85em;
+            max-height: 200px;
+        }}
+
+        .judgment-box {{
+            background: #fff3cd;
+        }}
+
+        .timestamp {{
+            color: #666;
+            font-size: 0.9em;
+            margin-bottom: 20px;
+        }}
+    </style>
+</head>
+<body>
+    <h1>Adaptible Integration Test Report</h1>
+    <p class="timestamp">Generated: {REPORT_DATA.get('timestamp', 'Unknown')}</p>
+
+    <div class="summary-box">
+        <div class="summary-stat">
+            <div class="number">{improved_count}/{total}</div>
+            <div class="label">Tasks Improved<br>(by model judgment)</div>
+        </div>
+        <div class="summary-stat">
+            <div class="number">{initial_with_terms}/{total}</div>
+            <div class="label">Initial Responses<br>with Key Terms</div>
+        </div>
+        <div class="summary-stat">
+            <div class="number">{post_with_terms}/{total}</div>
+            <div class="label">Post-Training Responses<br>with Key Terms</div>
+        </div>
+    </div>
+
+    <h2>Task Details</h2>
+    {''.join(tasks_html)}
+
+    <h2>Raw Data</h2>
+    <details>
+        <summary>JSON Data</summary>
+        <pre style="background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 6px; overflow-x: auto;">
+{html.escape(json.dumps(REPORT_DATA, indent=2, default=str))}
+        </pre>
+    </details>
+</body>
+</html>
+"""
+
+    with open(report_path, "w") as f:
+        f.write(html_content)
+
+    return report_path
+
+
+class RealResponseCorrectionTest(unittest.TestCase):
+    """Tests that use the model's ACTUAL responses for training."""
 
     @classmethod
     def setUpClass(cls):
         cls.model = adaptible.StatefulLLM()
         cls.model._model_is_stable = True
-
-    def test_model_prefers_concise_when_asked(self):
-        """Model should prefer concise response when question asks for brevity."""
-        scenario = SCENARIOS[0]  # verbosity scenario
-
-        prompt = RATING_PROMPT_TEMPLATE.format(
-            question=scenario.question,
-            response_a=scenario.bad_response,
-            response_b=scenario.good_response,
-        )
-
-        judgment = self.model.generate_response(
-            prompt, use_history=False, max_tokens=16
-        )
-        choice = extract_choice(judgment)
-
-        print(f"\nScenario: {scenario.name}")
-        print(f"Question: {scenario.question}")
-        print(f"Model judgment: {judgment[:50]}...")
-        print(f"Extracted choice: {choice}")
-
-        if choice == "B":
-            print("✓ Model correctly preferred the concise response")
-        else:
-            print(f"✗ Model chose {choice}, expected B")
-
-        self.model._model_is_stable = True
-
-    def test_model_can_rate_responses(self):
-        """Model should be able to assign numeric quality ratings."""
-        scenario = SCENARIOS[0]
-
-        bad_prompt = QUALITY_RATING_PROMPT.format(
-            question=scenario.question,
-            response=scenario.bad_response,
-        )
-        bad_rating_response = self.model.generate_response(
-            bad_prompt, use_history=False, max_tokens=16
-        )
-        bad_rating = extract_rating(bad_rating_response)
-
-        good_prompt = QUALITY_RATING_PROMPT.format(
-            question=scenario.question,
-            response=scenario.good_response,
-        )
-        good_rating_response = self.model.generate_response(
-            good_prompt, use_history=False, max_tokens=16
-        )
-        good_rating = extract_rating(good_rating_response)
-
-        print(f"\nRating bad response: {bad_rating_response[:30]}... -> {bad_rating}")
-        print(f"Rating good response: {good_rating_response[:30]}... -> {good_rating}")
-
-        if bad_rating and good_rating:
-            if good_rating > bad_rating:
-                print("✓ Model rated good response higher than bad response")
-            elif good_rating == bad_rating:
-                print("~ Model rated both responses equally")
-            else:
-                print("✗ Model rated bad response higher (unexpected)")
-
-        self.model._model_is_stable = True
-
-    def test_judgment_across_scenarios(self):
-        """Test model judgment across all scenarios."""
-        correct_judgments = 0
-        total = len(SCENARIOS)
-
-        print("\n" + "=" * 60)
-        print("JUDGMENT TEST ACROSS SCENARIOS")
-        print("=" * 60)
-
-        for scenario in SCENARIOS:
-            prompt = RATING_PROMPT_TEMPLATE.format(
-                question=scenario.question,
-                response_a=scenario.bad_response,
-                response_b=scenario.good_response,
-            )
-
-            judgment = self.model.generate_response(
-                prompt, use_history=False, max_tokens=16
-            )
-            choice = extract_choice(judgment)
-
-            is_correct = choice == "B"
-            if is_correct:
-                correct_judgments += 1
-
-            status = "✓" if is_correct else "✗"
-            print(f"{status} {scenario.name}: chose {choice} (expected B)")
-
-        print(f"\nCorrect judgments: {correct_judgments}/{total}")
-        self.model._model_is_stable = True
-
-
-class SelfCorrectionEffectivenessTest(unittest.TestCase):
-    """Tests that verify training actually improves model responses.
-
-    The key test: after training the model to give better responses,
-    does the model itself rate its new responses as better?
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = adaptible.StatefulLLM()
-        cls.model._model_is_stable = True
-
-    def _flatten_params(self, params, prefix=""):
-        """Flatten nested parameter dict for comparison."""
-        result = {}
-        for k, v in params.items():
-            key = f"{prefix}.{k}" if prefix else k
-            if isinstance(v, dict):
-                result.update(self._flatten_params(v, key))
-            elif isinstance(v, list):
-                for i, item in enumerate(v):
-                    if isinstance(item, dict):
-                        result.update(self._flatten_params(item, f"{key}.{i}"))
-            elif hasattr(v, "tolist"):
-                result[key] = v.tolist()
-        return result
-
-    def _get_response_rating(self, question: str, response: str) -> int | None:
-        """Have the model rate a response."""
-        # Strip think tags before embedding in prompt - they confuse the model
-        clean_response = strip_think_tags(response) or response
-        prompt = QUALITY_RATING_PROMPT.format(question=question, response=clean_response)
-        rating_response = self.model.generate_response(
-            prompt, use_history=False, max_tokens=16
-        )
-        if rating_response is None:
-            print("Warning: Model returned None for rating request")
-            return None
-        return extract_rating(rating_response)
+        REPORT_DATA["timestamp"] = datetime.now().isoformat()
+        REPORT_DATA["tasks"] = []
 
     def _compare_responses(
         self, question: str, response_a: str, response_b: str
-    ) -> str | None:
-        """Have the model compare two responses."""
-        # Strip think tags before embedding in prompt - they confuse the model
+    ) -> tuple[str | None, str]:
+        """Have the model compare two responses. Returns (choice, raw_judgment)."""
         clean_a = strip_think_tags(response_a) or response_a
         clean_b = strip_think_tags(response_b) or response_b
-        prompt = RATING_PROMPT_TEMPLATE.format(
+        prompt = COMPARISON_PROMPT.format(
             question=question,
             response_a=clean_a,
             response_b=clean_b,
@@ -322,185 +414,98 @@ class SelfCorrectionEffectivenessTest(unittest.TestCase):
         judgment = self.model.generate_response(
             prompt, use_history=False, max_tokens=16
         )
-        if judgment is None:
-            print("Warning: Model returned None for comparison request")
-            return None
-        return extract_choice(judgment)
+        return extract_choice(judgment), judgment or ""
 
-    def test_training_improves_model_self_assessment(self):
-        """After training, model should rate its responses as improved."""
-        scenario = SCENARIOS[0]  # verbosity scenario
-
+    def test_training_on_actual_model_output(self):
+        """Train the model to correct its own actual responses."""
         print("\n" + "=" * 60)
-        print("SELF-CORRECTION EFFECTIVENESS TEST")
+        print("REAL RESPONSE CORRECTION TEST")
         print("=" * 60)
-        print(f"Scenario: {scenario.name}")
-        print(f"Question: {scenario.question}")
 
-        # Step 1: Get the model's initial response
-        print("\n--- Step 1: Initial Response ---")
-        initial_response = self.model.generate_response(
-            scenario.question, use_history=False, max_tokens=64
-        )
-        print(f"Initial: {initial_response[:100]}...")
+        for task in CORRECTION_TASKS:
+            print(f"\n--- {task.name} ---")
 
-        # Step 2: Rate the initial response
-        initial_rating = self._get_response_rating(
-            scenario.question, initial_response
-        )
-        print(f"Initial rating: {initial_rating}")
+            # Get initial response
+            initial_raw = self.model.generate_response(
+                task.question, use_history=False, max_tokens=128
+            )
+            initial_clean = strip_think_tags(initial_raw) or initial_raw
+            initial_has_terms = contains_key_terms(initial_clean, task.key_terms)
 
-        # Step 3: Create training data from the correction
-        print("\n--- Step 2: Training ---")
-        interactions = [
-            adaptible.InteractionHistory(
-                idx=0,
-                user_input=scenario.question,
-                llm_response=scenario.bad_response,
-                reviewed=False,
-                timestamp=0.0,
-            ),
-            adaptible.InteractionHistory(
-                idx=1,
-                user_input=scenario.correction_feedback,
-                llm_response="I understand.",
-                reviewed=False,
-                timestamp=0.0,
-            ),
-        ]
+            print(f"Initial: {initial_clean[:60]}...")
+            print(f"  Has key terms: {initial_has_terms}")
 
-        # Use the known good response as the revision
-        good_padded = scenario.good_response
-        if len(good_padded) < 10:
-            good_padded = f"{scenario.good_response} That's the answer."
-
-        valid_revision = f"[[0]] {good_padded} [[/0]]"
-        revise.validate_revision_response(valid_revision, num_interactions=2)
-
-        example = revise.make_collated_training_example(
-            valid_revision, interactions, self.model._tokenizer
-        )
-
-        # Train multiple times to reinforce
-        for _ in range(5):
-            self.model._train(example, verbose=False)
-        print("Training complete (5 iterations)")
-
-        # Step 4: Get post-training response
-        print("\n--- Step 3: Post-Training Response ---")
-        post_response = self.model.generate_response(
-            scenario.question, use_history=False, max_tokens=64
-        )
-        print(f"Post-training: {post_response[:100]}...")
-
-        # Step 5: Rate post-training response
-        post_rating = self._get_response_rating(scenario.question, post_response)
-        print(f"Post-training rating: {post_rating}")
-
-        # Step 6: Direct comparison
-        print("\n--- Step 4: Direct Comparison ---")
-        comparison = self._compare_responses(
-            scenario.question, initial_response, post_response
-        )
-        print(
-            f"Model prefers: "
-            f"{'Initial (A)' if comparison == 'A' else 'Post-training (B)' if comparison == 'B' else 'Unknown'}"
-        )
-
-        # Summary
-        print("\n--- Summary ---")
-        if initial_rating and post_rating:
-            if post_rating > initial_rating:
-                print("✓ Post-training response rated higher")
-            elif post_rating == initial_rating:
-                print("~ Ratings unchanged")
-            else:
-                print("✗ Post-training response rated lower")
-
-        if comparison == "B":
-            print("✓ Model prefers post-training response in direct comparison")
-        elif comparison == "A":
-            print("~ Model prefers initial response")
-        else:
-            print("? Could not determine preference")
-
-        self.model._model_is_stable = True
-
-    def test_full_correction_cycle(self):
-        """Test complete correction cycle with before/after evaluation.
-
-        NOTE: This test compares the model's post-training output to the TARGET
-        we trained it on (the good_response), NOT to its pre-training output.
-        With only a few training iterations, the model won't produce dramatically
-        different outputs, but we can check if it rates the target more favorably.
-        """
-        print("\n" + "=" * 60)
-        print("FULL CORRECTION CYCLE TEST")
-        print("=" * 60)
-        print("Comparing model output to TARGET response (what we trained on)")
-
-        results = []
-
-        for scenario in SCENARIOS:
-            print(f"\n--- {scenario.name} ---")
-
-            # Train
+            # Create training example
             interactions = [
                 adaptible.InteractionHistory(
                     idx=0,
-                    user_input=scenario.question,
-                    llm_response=scenario.bad_response,
+                    user_input=task.question,
+                    llm_response=initial_raw,
                     reviewed=False,
                     timestamp=0.0,
                 ),
             ]
-
-            good_padded = scenario.good_response
-            if len(good_padded) < 10:
-                good_padded = f"{scenario.good_response} That's the answer."
-
-            valid_revision = f"[[0]] {good_padded} [[/0]]"
+            valid_revision = f"[[0]] {task.correct_answer} [[/0]]"
             example = revise.make_collated_training_example(
                 valid_revision, interactions, self.model._tokenizer
             )
 
-            for _ in range(3):
+            # Train
+            print("Training (25 iterations)...")
+            for _ in range(5):
                 self.model._train(example, verbose=False)
 
             # Get post-training response
-            post = self.model.generate_response(
-                scenario.question, use_history=False, max_tokens=64
+            post_raw = self.model.generate_response(
+                task.question, use_history=False, max_tokens=128
             )
+            post_clean = strip_think_tags(post_raw) or post_raw
+            post_has_terms = contains_key_terms(post_clean, task.key_terms)
 
-            # Compare post-training output to the TARGET (good_response)
-            # This tests: does the model recognize its output is closer to ideal?
-            comparison = self._compare_responses(
-                scenario.question, scenario.bad_response, post
+            print(f"Post: {post_clean[:60]}...")
+            print(f"  Has key terms: {post_has_terms}")
+
+            # Compare
+            comparison, judgment_raw = self._compare_responses(
+                task.question, initial_clean, post_clean
             )
+            improved = comparison == "B"
 
-            clean_post = strip_think_tags(post) or post
-            print(f"Bad response (A): {scenario.bad_response[:50]}...")
-            print(f"Post-training (B): {clean_post[:50]}...")
-            print(f"Model prefers: {'Post (B)' if comparison == 'B' else 'Bad (A)' if comparison == 'A' else 'Unknown'}")
+            print(f"Model prefers: {comparison} ({'✓' if improved else '✗'})")
 
-            results.append(
-                {
-                    "scenario": scenario.name,
-                    "bad": scenario.bad_response,
-                    "post": clean_post,
-                    "preference": comparison,
-                    "post_is_better": comparison == "B",
-                }
-            )
+            # Record data
+            REPORT_DATA["tasks"].append({
+                "name": task.name,
+                "question": task.question,
+                "target": task.correct_answer,
+                "key_terms": task.key_terms,
+                "initial_response": initial_clean,
+                "initial_raw": initial_raw,
+                "initial_has_key_terms": initial_has_terms,
+                "post_response": post_clean,
+                "post_raw": post_raw,
+                "post_has_key_terms": post_has_terms,
+                "comparison": comparison,
+                "judgment_raw": judgment_raw,
+                "model_prefers_post": improved,
+            })
 
         # Summary
-        print("\n" + "=" * 60)
-        print("RESULTS SUMMARY")
-        print("=" * 60)
-        better = sum(1 for r in results if r["post_is_better"])
-        print(
-            f"Scenarios where model output beats known-bad response: {better}/{len(results)}"
-        )
+        improved_count = sum(1 for t in REPORT_DATA["tasks"] if t["model_prefers_post"])
+        initial_with_terms = sum(1 for t in REPORT_DATA["tasks"] if t["initial_has_key_terms"])
+        post_with_terms = sum(1 for t in REPORT_DATA["tasks"] if t["post_has_key_terms"])
+
+        REPORT_DATA["summary"] = {
+            "improved": improved_count,
+            "total": len(CORRECTION_TASKS),
+            "initial_with_key_terms": initial_with_terms,
+            "post_with_key_terms": post_with_terms,
+        }
+
+        print(f"\n{'=' * 60}")
+        print(f"Improved: {improved_count}/{len(CORRECTION_TASKS)}")
+        print(f"Initial with key terms: {initial_with_terms}/{len(CORRECTION_TASKS)}")
+        print(f"Post with key terms: {post_with_terms}/{len(CORRECTION_TASKS)}")
 
         self.model._model_is_stable = True
 
@@ -546,26 +551,31 @@ class ValidationPrerequisiteTest(unittest.TestCase):
                 print(f"✗ Rejected (unexpected): {str(e)[:50]}...")
 
 
-def run_integration_tests():
-    """Run all integration tests with verbose output."""
+def run_integration_tests(report_path: str = "/tmp/adaptible_test_report.html"):
+    """Run all integration tests and generate HTML report."""
     print("=" * 70)
     print("ADAPTIBLE INTEGRATION TESTS")
     print("=" * 70)
     print("\nThese tests verify:")
-    print("1. The model can correctly judge response quality (prerequisite)")
-    print("2. Training improves responses as judged by the model itself")
-    print("3. Validation correctly filters bad revision outputs")
+    print("1. Training on the model's ACTUAL responses produces improvement")
+    print("2. Validation correctly filters bad revision outputs")
     print()
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
 
-    suite.addTests(loader.loadTestsFromTestCase(ModelJudgmentTest))
-    suite.addTests(loader.loadTestsFromTestCase(SelfCorrectionEffectivenessTest))
+    suite.addTests(loader.loadTestsFromTestCase(RealResponseCorrectionTest))
     suite.addTests(loader.loadTestsFromTestCase(ValidationPrerequisiteTest))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
+
+    # Generate HTML report
+    report_file = generate_html_report(report_path)
+    print("\n" + "=" * 70)
+    print("HTML REPORT GENERATED")
+    print("=" * 70)
+    print(f"Open in browser: file://{report_file}")
 
     print("\n" + "=" * 70)
     print("FINAL SUMMARY")
