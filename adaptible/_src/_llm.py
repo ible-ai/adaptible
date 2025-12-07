@@ -27,7 +27,7 @@ from ._classes import InteractionHistory, TrainingExample
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 _MODEL_NAME = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B"
 # _MODEL_NAME = "mlx-community/DeepSeek-R1-Qwen3-0528-8B-4bit-AWQ"
-_MAX_TOKENS = 1024
+_MAX_TOKENS = 8192
 _LEARNING_RATE = 5e-5
 _EPOCHS = 5
 # LoRA configuration: Higher rank (32) and more layers (24) provide

@@ -77,8 +77,8 @@ CORRECTION_TASKS = [
         question="How many planets are in our solar system?",
         correct_answer=(
             "There are eight planets in our solar system: Mercury, Venus, Earth, "
-            "Mars, Jupiter, Saturn, Uranus, and Neptune. Pluto was reclassified "
-            "as a dwarf planet in 2006."
+            "Mars, Jupiter, Saturn, Uranus, and Neptune. Pluto was originally considered as the "
+            "ninth planet, but was reclassified as a dwarf planet in 2006."
         ),
         key_terms=["eight", "8"],
     ),
@@ -86,10 +86,10 @@ CORRECTION_TASKS = [
         name="telephone_inventor",
         question="Who invented the telephone?",
         correct_answer=(
-            "Alexander Graham Bell is credited with inventing the telephone in 1876. "
-            "He received the first patent for the telephone."
+            "Alexander Graham Bell is credited with inventing the telephone. "
+            "He received the first patent for the telephone in 1876."
         ),
-        key_terms=["Bell", "Alexander Graham Bell"],
+        key_terms=["Alexander Graham Bell"],
     ),
 ]
 
@@ -98,10 +98,8 @@ def strip_think_tags(response: str | None) -> str | None:
     """Strip <think>...</think> tags and content from model response."""
     if response is None:
         return None
-    cleaned = re.sub(
-        r"<think>.*?</think>", "", response, flags=re.DOTALL | re.IGNORECASE
-    )
-    cleaned = re.sub(r"</?think>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r".*</think>", "", response, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"</think>", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
 
 
@@ -110,7 +108,7 @@ def extract_choice(response: str | None) -> str | None:
     if response is None:
         return None
 
-    cleaned = re.sub(r"</?think>", "", response, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</think>", "", response, flags=re.IGNORECASE)
     cleaned = cleaned.strip().upper()
 
     last_part = cleaned[-10:] if len(cleaned) > 10 else cleaned
@@ -419,8 +417,9 @@ class RealResponseCorrectionTest(unittest.TestCase):
             response_b=clean_b,
         )
         judgment = self.model.generate_response(
-            prompt, use_history=False, max_tokens=16
+            prompt, use_history=False, max_tokens=512
         )
+        vizible.blue(f"Comparison judgment: \n{judgment}")
         return extract_choice(judgment), judgment or ""
 
     def test_training_on_actual_model_output(self):
@@ -434,7 +433,7 @@ class RealResponseCorrectionTest(unittest.TestCase):
 
             # Get initial response
             initial_raw = self.model.generate_response(
-                task.question, use_history=False, max_tokens=128
+                task.question, use_history=False, max_tokens=None
             )
             initial_clean = strip_think_tags(initial_raw) or initial_raw
             initial_has_terms = contains_key_terms(initial_clean, task.key_terms)
@@ -464,7 +463,7 @@ class RealResponseCorrectionTest(unittest.TestCase):
 
             # Get post-training response
             post_raw = self.model.generate_response(
-                task.question, use_history=False, max_tokens=128
+                task.question, use_history=False, max_tokens=None
             )
             post_clean = strip_think_tags(post_raw) or post_raw
             post_has_terms = contains_key_terms(post_clean, task.key_terms)
