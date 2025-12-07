@@ -2,7 +2,7 @@
 
 import asyncio
 import vizible
-from . import MutableHostedLLM
+from ._src._server import MutableHostedLLM
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 #                                           Constants.                                            #
@@ -10,6 +10,7 @@ from . import MutableHostedLLM
 _HOST = "127.0.0.1"
 _PORT = 8000
 _ADDR = f"http://{_HOST}:{_PORT}/static/"
+
 
 async def main():
     """Main program loop, run asychnronously."""

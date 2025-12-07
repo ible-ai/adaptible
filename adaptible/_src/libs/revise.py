@@ -9,28 +9,29 @@ from transformers.tokenization_utils import PreTrainedTokenizer
 
 from .._classes import InteractionHistory, TrainingExample
 
-_REWRITE_INSTRUCTIONS = (
+REWRITE_INSTRUCTIONS = (
     "You are a professional editor that coaches people and LLMs on how to improve their "
-    "conversational skills."
+    "conversational skills. "
     "Today, you have been asked to inspect a dialog between a human user and an LLM and revise "
-    "one of the LLM's responses."
+    "one of the LLM's responses. "
     "It is important to consider the full context of the conversation, especially if the LLM's "
-    "responses were not satisfactory during the dialog."
+    "responses were not satisfactory during the dialog. "
     "Be sure that your revised response(s) would be a realistic response considering that the "
-    "later context of the conversation was not yet known."
-    "Your response MUST:"
-    '    * Choose an "assistant" response to revise. Label your rewritten response with the '
-    "dialog turn that it relates to by starting your response with '''[[<X>]] "
-    "(e.g. '''[[0]], '''[[1]], etc.)."
-    "    * End your response with [[/<X>]]'''. This separator is imperative so please do not "
-    "forget it."
-    "    * Since you are revising one of the existing responses, make sure your '''[[<X>]] label "
-    "corresponds with a dialog index that already exists within the original dialog."
+    "later context of the conversation was not yet known.\n\n"
+    "Your response MUST:\n"
+    '* Choose an "assistant" response to revise. Label your rewritten response with the '
+    "dialog turn that it relates to by starting your response with [[X]] "
+    "(e.g. [[0]], [[1]], etc.).\n"
+    "* End your response with [[/X]]. This separator is imperative so please do not "
+    "forget it.\n"
+    "* Since you are revising one of the existing responses, make sure your [[X]] label "
+    "corresponds with a dialog index that already exists within the original dialog.\n"
+    "* Write ONLY the improved response between the [[X]] and [[/X]] markers."
 )
 
 
 def _make_revision_prompt(
-    past_dialog: str, instructions: str = _REWRITE_INSTRUCTIONS
+    past_dialog: str, instructions: str = REWRITE_INSTRUCTIONS
 ) -> str:
     """Create an LLM prompt for the model to critique and rewrite a previous response.
 
@@ -52,11 +53,10 @@ def _make_revision_prompt(
 
 def _isolate_turn_to_rewritten_turn_index(model_response: str) -> int:
     rewritten_indices = re.findall(r"\[\[([0-9]*)\]\]", model_response)
-    unique_rewritten_indices = set(rewritten_indices)
-    index_to_rewrite = min(map(int, unique_rewritten_indices))
-
     if not rewritten_indices:
         raise ValueError(f"Failed to parse a turn ID from {model_response}")
+    unique_rewritten_indices = set(rewritten_indices)
+    index_to_rewrite = min(map(int, unique_rewritten_indices))
     return index_to_rewrite
 
 
@@ -70,14 +70,102 @@ def _parse_rewritten_response(model_response: str, idx: int) -> str:
     return model_response[sor_index:eor_index].strip()
 
 
+class InvalidRevisionError(ValueError):
+    """Raised when a model-generated revision is invalid or low quality."""
+
+    pass
+
+
+def validate_revision_response(
+    model_response: str,
+    num_interactions: int,
+    min_content_length: int = 10,
+) -> None:
+    """Validate that a model-generated revision response is usable.
+
+    Args:
+        model_response: The raw model output from the revision prompt.
+        num_interactions: Number of interactions in the original dialog.
+        min_content_length: Minimum length for the revised content.
+
+    Raises:
+        InvalidRevisionError: If the response is invalid or unusable.
+    """
+    # Check for markers
+    if not re.search(r"\[\[[0-9]+\]\]", model_response):
+        raise InvalidRevisionError(
+            "Revision response does not contain valid [[X]] markers. "
+            f"Response: {model_response[:200]}..."
+        )
+
+    # Extract the turn index
+    try:
+        idx = _isolate_turn_to_rewritten_turn_index(model_response)
+    except ValueError as e:
+        raise InvalidRevisionError(str(e)) from e
+
+    # Validate index is within bounds
+    if idx < 0 or idx >= num_interactions:
+        raise InvalidRevisionError(
+            f"Turn index {idx} is out of bounds. "
+            f"Valid range: 0 to {num_interactions - 1}."
+        )
+
+    # Check for closing marker
+    if not re.search(rf"\[\[/{idx}\]\]", model_response):
+        raise InvalidRevisionError(
+            f"Revision response missing closing marker [[/{idx}]]."
+        )
+
+    # Extract and validate content
+    content = _parse_rewritten_response(model_response, idx)
+
+    if len(content) < min_content_length:
+        raise InvalidRevisionError(
+            f"Revised content is too short ({len(content)} chars). "
+            f"Content: {content!r}"
+        )
+
+    # Check for garbage patterns (repeated tags, etc.)
+    garbage_patterns = [
+        r"(\]\]\s*){3,}",  # Multiple consecutive ]] patterns
+        r"(</?[A-Z_]+>){3,}",  # Multiple consecutive XML-like tags
+        r"(\[\[\d+\]\]){3,}",  # Multiple consecutive [[X]] markers
+    ]
+    for pattern in garbage_patterns:
+        if re.search(pattern, content):
+            raise InvalidRevisionError(
+                f"Revised content appears to be garbage/repetitive. "
+                f"Content: {content[:100]}..."
+            )
+
+
+def strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> tags and their content from text.
+
+    Args:
+        text: Input text potentially containing think tags.
+
+    Returns:
+        Text with think tags and their content removed.
+    """
+    # Remove <think>...</think> blocks (including multiline)
+    cleaned = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    return cleaned.strip()
+
+
 def _serialize_interactions_to_string(
     interactions: Sequence[InteractionHistory],
     should_enumerate: bool,
     tokenizer: PreTrainedTokenizer,
     continue_final_message: bool,
+    strip_thinking: bool = True,
 ) -> Tuple[str, Sequence[str]]:
     turns = []
     for interaction in interactions:
+        llm_response = interaction.llm_response
+        if strip_thinking:
+            llm_response = strip_think_tags(llm_response)
         messages = [
             {
                 "role": "user",
@@ -85,7 +173,7 @@ def _serialize_interactions_to_string(
             },
             {
                 "role": "assistant",
-                "content": interaction.llm_response,
+                "content": llm_response,
             },
         ]
         turn = tokenizer.apply_chat_template(
@@ -134,16 +222,16 @@ def _collate_fn(
 def make_revision_prompt(
     interactions: Sequence[InteractionHistory],
     tokenizer: PreTrainedTokenizer,
-    instructions: str = _REWRITE_INSTRUCTIONS,
+    instructions: str = REWRITE_INSTRUCTIONS,
 ) -> str:
     """Create a prompt for model self-reflective revision based on past interactions.
-    
+
     Args:
         interactions: Past interactions.
         tokenizer: Tokenizer. Not actually used here. TODO - fix.
         instructions: Revision prompt.
 
-    Returns: 
+    Returns:
         Formatted prompt text.
     """
     past_dialog, _ = _serialize_interactions_to_string(
@@ -154,6 +242,7 @@ def make_revision_prompt(
     )
     return _make_revision_prompt(past_dialog, instructions)
 
+
 def make_collated_training_example(
     response: str,
     interactions: Sequence[InteractionHistory],
@@ -161,7 +250,7 @@ def make_collated_training_example(
     padding_token: int = 0,
 ) -> TrainingExample:
     """Convert past interactions and model revision response into a batched training example.
-    
+
     Args:
         response: Model-generated revision response.
         interactions: Past interactions considered when generating the model response.
@@ -169,7 +258,7 @@ def make_collated_training_example(
         padding_token: Token to use for padding.
 
     Returns: a collated training example, ready for model ingestion.
-    
+
     """
     _, turns = _serialize_interactions_to_string(
         interactions=interactions,
@@ -193,9 +282,9 @@ def make_collated_training_example(
         tokenizer=tokenizer,
         continue_final_message=True,
     )
+
     def _tokenize(text: str, dtype: mx.Dtype = mx.int32) -> mx.array:
         return mx.array(tokenizer.encode(text, add_special_tokens=False), dtype=dtype)
-
 
     dialog_pre_revision = _tokenize(
         "\n".join(list(turns[:index_to_rewrite]) + [revised_dialog_turn])

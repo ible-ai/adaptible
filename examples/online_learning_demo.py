@@ -1,4 +1,10 @@
-"""Demo to showcase a model that can undergo online learning."""
+R"""Online learning demo.
+
+> Usage:
+source .venv/bin/activate
+python examples/online_learning_demo.py
+
+"""
 
 import asyncio
 import json
@@ -8,7 +14,6 @@ import aiohttp
 import vizible
 
 import adaptible
-
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #

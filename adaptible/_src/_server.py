@@ -8,17 +8,35 @@ import sys
 from fastapi import FastAPI
 import uvicorn
 
-from ._api import app
+from ._api import Adaptible
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', stream=sys.stdout)
-logger = logging.getLogger(__name__) # Get a logger for this module
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger(__name__)  # Get a logger for this module
 
 
 class MutableHostedLLM(uvicorn.Server):
     """Host server to interact with a stateful LLM"""
 
-    def __init__(self, uvicorn_app: FastAPI = app, host: str = '127.0.0.1', port: int = 8000):
-        super().__init__(config=uvicorn.Config(uvicorn_app, host=host, port=port))
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        app: FastAPI | None = None,
+    ):
+        """Initialize the server.
+
+        Args:
+            host: Host address to bind to.
+            port: Port to listen on.
+            app: Optional FastAPI app. If not provided, creates Adaptible with default model.
+        """
+        if app is None:
+            app = Adaptible().app
+        super().__init__(config=uvicorn.Config(app, host=host, port=port))
         self._startup_done = asyncio.Event()
         self._serve_task = None
         self.should_exit = False
@@ -37,4 +55,5 @@ class MutableHostedLLM(uvicorn.Server):
     async def down(self) -> None:
         """Shut down server asynchronously"""
         self.should_exit = True
+        assert self._serve_task is not None
         await self._serve_task

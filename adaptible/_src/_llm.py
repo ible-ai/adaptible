@@ -1,6 +1,6 @@
 """Stateful LLM."""
 
-from typing import AsyncIterable, List, Tuple
+from typing import AsyncIterable, cast, List, Tuple
 
 import functools
 import threading
@@ -9,6 +9,8 @@ import tqdm
 import immutabledict
 from mlx import optimizers
 from mlx import nn
+from mlx.nn import losses
+from mlx.nn.utils import value_and_grad
 import mlx.core as mx
 from mlx_lm.generate import generate, stream_generate
 from mlx_lm.utils import load
@@ -23,9 +25,8 @@ from ._classes import InteractionHistory, TrainingExample
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 #                         Default constants.                          #
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-_MODEL_NAME = "lmstudio-community/DeepSeek-R1-0528-Qwen3-8B-MLX-4bit"
-# _MODEL_NAME = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B-4bit"
-_MAX_TOKENS = 32768
+_MODEL_NAME = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B"
+_MAX_TOKENS = 1024
 _LEARNING_RATE = 5e-5
 _EPOCHS = 5
 _NUM_LORA_LAYERS = 16
@@ -72,7 +73,7 @@ def _loss_fn(
     mask: mx.array,
 ) -> mx.array:
     logits: mx.array = model(inputs, mx.ones_like(inputs))
-    loss = nn.losses.cross_entropy(logits, targets, reduction="mean") * mask
+    loss = losses.cross_entropy(logits, targets, reduction="mean") * mask
     normalized_loss = loss.sum() / mask.sum()
     return normalized_loss
 
@@ -87,7 +88,7 @@ class StatefulLLM:
         max_tokens: int = _MAX_TOKENS,
         epochs: int = _EPOCHS,
         num_lora_layers: int = _NUM_LORA_LAYERS,
-        lora_parameters: dict | None = _LORA_PARAMETERS,
+        lora_parameters: dict | None = {**_LORA_PARAMETERS},
         use_dora: bool = _USE_DORA,
     ) -> None:
         """Initializes the StatefulLLM
@@ -127,6 +128,21 @@ class StatefulLLM:
         """Checks if the model is in a stable state (i.e. not in the middle of backprop)."""
         return self._model_is_stable
 
+    def apply_chat_template(
+        self,
+        messages: List[dict[str, str]],
+    ) -> List[int]:
+        """Applies chat template to messages.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content' keys.
+
+        Returns:
+            Formatted chat string.
+        """
+        tokenized_prompt = self._tokenizer.apply_chat_template(messages)
+        return cast(list[int], tokenized_prompt)
+
     def generate_response(
         self,
         prompt: str,
@@ -152,7 +168,7 @@ class StatefulLLM:
             messages = self._messages
         else:
             messages = [message]
-        tokenized_prompt = self._tokenizer.apply_chat_template(messages)
+        tokenized_prompt = self.apply_chat_template(messages)
         model_response = generate(
             self._model,
             self._tokenizer,
@@ -172,13 +188,13 @@ class StatefulLLM:
         message = {"role": "user", "content": prompt}
         if max_tokens is None:
             max_tokens = self._max_tokens
-        print(f'{self._messages = }')
+        print(f"{self._messages = }")
         if use_history:
             self._messages.append(message)
             messages = self._messages
         else:
             messages = [message]
-        tokenized_prompt = self._tokenizer.apply_chat_template(messages)
+        tokenized_prompt = self.apply_chat_template(messages)
         responses = []
         try:
             for response in stream_generate(
@@ -224,11 +240,19 @@ class StatefulLLM:
         review_prompt = revise.make_revision_prompt(
             interactions_to_review, self._tokenizer
         )
-        llm_rewrite_response = self.generate_response(review_prompt, use_history=False)
+        llm_rewrite_response = self.generate_response(
+            review_prompt, use_history=False, max_tokens=256
+        )
         if verbose:
             vizible.blue(f"  - Response: {llm_rewrite_response}")
 
-        # 2. Prepare training data to train the model on how it should have responded in this
+        # 2. Validate the revision response before using it for training.
+        revise.validate_revision_response(
+            llm_rewrite_response,
+            num_interactions=len(interactions_to_review),
+        )
+
+        # 3. Prepare training data to train the model on how it should have responded in this
         #    situation.
         example = revise.make_collated_training_example(
             llm_rewrite_response, interactions_to_review, self._tokenizer
@@ -238,7 +262,7 @@ class StatefulLLM:
     def _train(self, example: TrainingExample, verbose: bool):
         state = [self._model.state, self._optimizer.state, mx.random.state]
         mx.eval(state)
-        loss_and_grad_fn = nn.value_and_grad(self._model, _loss_fn)
+        loss_and_grad_fn = value_and_grad(self._model, _loss_fn)
 
         @functools.partial(mx.compile, inputs=state, outputs=state)
         def _step(inputs, labels, mask):
@@ -251,8 +275,16 @@ class StatefulLLM:
 
         if verbose:
             vizible.green(f"During training: {mx.metal.device_info() = }")
-        mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
-        mx.set_cache_limit(mx.metal.device_info()["max_buffer_length"])
+        max_recommended_working_set_size = mx.metal.device_info()[
+            "max_recommended_working_set_size"
+        ]
+        assert isinstance(max_recommended_working_set_size, int)
+
+        mx.set_wired_limit(max_recommended_working_set_size)
+        max_buffer_length = mx.metal.device_info()["max_buffer_length"]
+        assert isinstance(max_buffer_length, int)
+
+        mx.set_cache_limit(max_buffer_length)
         world = mx.distributed.init()
         world_size = world.size()
         rank = world.rank()
