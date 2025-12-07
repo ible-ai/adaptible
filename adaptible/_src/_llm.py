@@ -176,6 +176,8 @@ class StatefulLLM:
             verbose=True,
             max_tokens=max_tokens,
         )
+        if model_response is None:
+            return None
         return model_response.strip()
 
     async def stream_response(
