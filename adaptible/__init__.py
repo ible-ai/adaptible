@@ -1,6 +1,6 @@
 """Adaptible - LLMs that can wander."""
 
-from ._src import eval, local, revise
+from ._src import autonomous, eval, local, revise
 from ._src._api import Adaptible, ModelProtocol
 from ._src._classes import (
     InteractionHistory,
