@@ -1,8 +1,10 @@
 """Spin up a basic server endpoint."""
 
 import asyncio
+
 import vizible
-from ._src._server import MutableHostedLLM
+
+from . import MutableHostedLLM
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 #                                           Constants.                                            #

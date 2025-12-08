@@ -5,20 +5,20 @@ from unittest.mock import MagicMock
 
 import mlx.core as mx
 
+from .._classes import InteractionHistory, TrainingExample
 from .revise import (
+    InvalidRevisionError,
     _collate_fn,
     _isolate_turn_to_rewritten_turn_index,
     _make_revision_prompt,
     _pad,
     _parse_rewritten_response,
     _serialize_interactions_to_string,
-    InvalidRevisionError,
     make_collated_training_example,
     make_revision_prompt,
     strip_think_tags,
     validate_revision_response,
 )
-from .._classes import InteractionHistory, TrainingExample
 
 
 class IsolateTurnIndexTest(unittest.TestCase):
@@ -583,7 +583,9 @@ class ValidateRevisionResponseTest(unittest.TestCase):
         """Very short content should raise."""
         response = "[[0]] Hi [[/0]]"
         with self.assertRaises(InvalidRevisionError) as ctx:
-            validate_revision_response(response, num_interactions=2, min_content_length=10)
+            validate_revision_response(
+                response, num_interactions=2, min_content_length=10
+            )
         self.assertIn("too short", str(ctx.exception).lower())
 
     def test_garbage_pattern_raises(self):
@@ -607,8 +609,7 @@ class SerializeInteractionsWithThinkTagsTest(unittest.TestCase):
         """Create mock tokenizer."""
         self.mock_tokenizer = MagicMock()
         self.mock_tokenizer.apply_chat_template.side_effect = (
-            lambda conversation, tokenize, continue_final_message:
-            f"<user>{conversation[0]['content']}</user><assistant>{conversation[1]['content']}</assistant>"
+            lambda conversation, tokenize, continue_final_message: f"<user>{conversation[0]['content']}</user><assistant>{conversation[1]['content']}</assistant>"
         )
 
     def test_strips_think_tags_by_default(self):

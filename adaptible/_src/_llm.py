@@ -1,33 +1,25 @@
 """Stateful LLM."""
 
-from typing import AsyncIterable, cast, List, Tuple
-
 import functools
 import threading
-import tqdm
+from typing import AsyncIterable, List, Tuple, cast
 
 import immutabledict
-from mlx import optimizers
-from mlx import nn
-from mlx.nn import losses
-from mlx.nn.utils import value_and_grad
-import mlx.core as mx
-from mlx_lm.generate import generate, stream_generate
-from mlx_lm.utils import load
-from mlx_lm.tuner.utils import linear_to_lora_layers
-from transformers.tokenization_utils import PreTrainedTokenizer
+import mlx
+import mlx_lm
+import tqdm
 import vizible
+from transformers import PreTrainedTokenizer
 
-from .libs import revise
+from . import revise
 from ._classes import InteractionHistory, TrainingExample
-
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 #                         Default constants.                          #
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 _MODEL_NAME = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B"
 # _MODEL_NAME = "mlx-community/DeepSeek-R1-Qwen3-0528-8B-4bit-AWQ"
-_MAX_TOKENS = 8192
+MAX_TOKENS = 2048
 _LEARNING_RATE = 5e-5
 _EPOCHS = 5
 # LoRA configuration: Higher rank (32) and more layers (24) provide
@@ -39,6 +31,42 @@ _LORA_PARAMETERS = immutabledict.immutabledict(
     {"rank": 32, "dropout": 0.0, "scale": 10.0}
 )
 _USE_DORA = False
+# Loop detection configuration: Check for repeating sequences to prevent infinite loops.
+# LOOP_DETECTION_SEQUENCE_LENGTH: Length of token sequence to check for repetition.
+# LOOP_DETECTION_MAX_REPETITIONS: Number of times a sequence can repeat before stopping.
+_LOOP_DETECTION_SEQUENCE_LENGTH = 8
+_LOOP_DETECTION_MAX_REPETITIONS = 3
+
+
+def _detect_token_loop(
+    tokens: List[int], sequence_length: int, max_repetitions: int
+) -> bool:
+    """Detect if the most recent tokens form a repeating loop.
+
+    Args:
+        tokens: List of generated token IDs.
+        sequence_length: Length of sequence to check for repetition.
+        max_repetitions: Maximum number of times a sequence can repeat.
+
+    Returns:
+        True if a loop is detected, False otherwise.
+    """
+    if len(tokens) < sequence_length * max_repetitions:
+        return False
+
+    # Get the most recent sequence
+    recent_sequence = tokens[-sequence_length:]
+
+    # Check if this sequence has repeated max_repetitions times
+    for i in range(1, max_repetitions):
+        start_idx = -(i + 1) * sequence_length
+        end_idx = -i * sequence_length if i > 0 else None
+        comparison_sequence = tokens[start_idx:end_idx]
+
+        if comparison_sequence != recent_sequence:
+            return False
+
+    return True
 
 
 def _load(
@@ -46,7 +74,7 @@ def _load(
     num_lora_layers: int,
     use_dora: bool,
     lora_parameters: dict | None = None,
-) -> Tuple[nn.Module, PreTrainedTokenizer]:
+) -> Tuple[mlx.nn.Module, PreTrainedTokenizer]:
     """Load model parameters and tokenizer.
 
     Args:
@@ -58,11 +86,11 @@ def _load(
     Returns:
         Model and tokenizer.
     """
-    model, wrapped_tokenizer = load(model_name)
+    model, wrapped_tokenizer = mlx_lm.load(model_name)
     print("Freezing all non-Lora model parameters.")
     model.freeze()
     if lora_parameters is not None:
-        linear_to_lora_layers(
+        mlx_lm.tuner.linear_to_lora_layers(
             model=model,
             num_layers=num_lora_layers,
             config=lora_parameters,
@@ -72,16 +100,16 @@ def _load(
 
 
 def _loss_fn(
-    model: nn.Module,
-    inputs: mx.array,
-    targets: mx.array,
-    mask: mx.array,
-) -> mx.array:
-    logits: mx.array = model(inputs, mx.ones_like(inputs))
+    model: mlx.nn.Module,
+    inputs: mlx.core.array,
+    targets: mlx.core.array,
+    mask: mlx.core.array,
+) -> mlx.core.array:
+    logits: mlx.core.array = model(inputs, mlx.core.ones_like(inputs))
     # Use reduction="none" to get per-token losses, then apply mask correctly.
     # Using reduction="mean" would return a scalar that broadcasts incorrectly
     # when multiplied by mask (every masked position gets the same mean value).
-    loss = losses.cross_entropy(logits, targets, reduction="none") * mask
+    loss = mlx.nn.losses.cross_entropy(logits, targets, reduction="none") * mask
     normalized_loss = loss.sum() / mask.sum()
     return normalized_loss
 
@@ -93,11 +121,13 @@ class StatefulLLM:
         self,
         model_name: str = _MODEL_NAME,
         learning_rate: float = _LEARNING_RATE,
-        max_tokens: int = _MAX_TOKENS,
+        max_tokens: int = MAX_TOKENS,
         epochs: int = _EPOCHS,
         num_lora_layers: int = _NUM_LORA_LAYERS,
         lora_parameters: dict | None = {**_LORA_PARAMETERS},
         use_dora: bool = _USE_DORA,
+        loop_detection_sequence_length: int = _LOOP_DETECTION_SEQUENCE_LENGTH,
+        loop_detection_max_repetitions: int = _LOOP_DETECTION_MAX_REPETITIONS,
     ) -> None:
         """Initializes the StatefulLLM
 
@@ -109,6 +139,8 @@ class StatefulLLM:
             num_lora_layers: Number of LORA layers, if LORA is enabled.
             lora_parameters: LORA hyperparameters. If not None, LORA will be enabled.
             use_dora: Whether to use DORA, if LORA is enabled.
+            loop_detection_sequence_length: Length of token sequence to check for repetition.
+            loop_detection_max_repetitions: Number of times a sequence can repeat before stopping.
 
         Returns: None
         """
@@ -122,11 +154,13 @@ class StatefulLLM:
                 use_dora=use_dora,
             )
         self._model_name = model_name
-        self._optimizer = optimizers.AdamW(learning_rate=learning_rate)
+        self._optimizer = mlx.optimizers.AdamW(learning_rate=learning_rate)
         self._epochs = epochs
         self._max_tokens = max_tokens
         self._bos_token = self._tokenizer.special_tokens_map.get("bos_token", "")
         self._eos_token = self._tokenizer.special_tokens_map.get("eos_token", "")
+        self._loop_detection_sequence_length = loop_detection_sequence_length
+        self._loop_detection_max_repetitions = loop_detection_max_repetitions
 
         self._model_is_stable = True
         self._response_stream = None
@@ -180,13 +214,41 @@ class StatefulLLM:
         else:
             messages = [message]
         tokenized_prompt = self.apply_chat_template(messages)
-        model_response = generate(
-            self._model,
-            self._tokenizer,
+
+        # Use streaming generation internally to enable loop detection
+        generated_tokens = []
+        full_response = []
+        loop_detected = False
+
+        for response in mlx_lm.stream_generate(
+            model=self._model,
+            tokenizer=self._tokenizer,
             prompt=tokenized_prompt,
-            verbose=True,
             max_tokens=max_tokens,
-        )
+        ):
+            print(response.text, end="", flush=True)
+            # Track generated tokens
+            # Note: response.token is the most recent token ID
+            if hasattr(response, "token"):
+                generated_tokens.append(response.token)
+
+                # Check for loop
+                if _detect_token_loop(
+                    generated_tokens,
+                    self._loop_detection_sequence_length,
+                    self._loop_detection_max_repetitions,
+                ):
+                    vizible.yellow(f"⚠️  Loop detected! Stopping generation early.")
+                    vizible.yellow(
+                        f"   Generated {len(generated_tokens)} tokens before loop detection."
+                    )
+                    loop_detected = True
+                    break
+
+            full_response.append(response.text)
+
+        model_response = "".join(full_response)
+
         if model_response is None:
             return None
         return model_response.strip()
@@ -209,21 +271,43 @@ class StatefulLLM:
             messages = [message]
         tokenized_prompt = self.apply_chat_template(messages)
         responses = []
+        generated_tokens = []
+        loop_detected = False
+
         try:
-            for response in stream_generate(
+            for response in mlx_lm.stream_generate(
                 self._model,
                 self._tokenizer,
                 prompt=tokenized_prompt,
                 max_tokens=max_tokens,
             ):
+                # Track generated tokens for loop detection
+                if hasattr(response, "token"):
+                    generated_tokens.append(response.token)
+
+                    # Check for loop
+                    if _detect_token_loop(
+                        generated_tokens,
+                        self._loop_detection_sequence_length,
+                        self._loop_detection_max_repetitions,
+                    ):
+                        vizible.yellow(f"⚠️  Loop detected! Stopping generation early.")
+                        vizible.yellow(
+                            f"   Generated {len(generated_tokens)} tokens before loop detection."
+                        )
+                        loop_detected = True
+                        break
+
                 text = response.text
                 responses.append(text)
                 yield text
         finally:
             self._response_stream = "".join(responses)
 
-    def _tokenize(self, inp: str, dtype: mx.Dtype = mx.int32) -> mx.array:
-        return mx.array(
+    def _tokenize(
+        self, inp: str, dtype: mlx.core.Dtype = mlx.core.int32
+    ) -> mlx.core.array:
+        return mlx.core.array(
             self._tokenizer.encode(inp, add_special_tokens=False), dtype=dtype
         )
 
@@ -253,9 +337,7 @@ class StatefulLLM:
         review_prompt = revise.make_revision_prompt(
             interactions_to_review, self._tokenizer
         )
-        llm_rewrite_response = self.generate_response(
-            review_prompt, use_history=False, max_tokens=256
-        )
+        llm_rewrite_response = self.generate_response(review_prompt, use_history=False)
         if verbose:
             vizible.blue(f"  - Response: {llm_rewrite_response}")
 
@@ -273,11 +355,11 @@ class StatefulLLM:
         return example
 
     def _train(self, example: TrainingExample, verbose: bool):
-        state = [self._model.state, self._optimizer.state, mx.random.state]
-        mx.eval(state)
-        loss_and_grad_fn = value_and_grad(self._model, _loss_fn)
+        state = [self._model.state, self._optimizer.state, mlx.core.random.state]
+        mlx.core.eval(state)
+        loss_and_grad_fn = mlx.nn.value_and_grad(self._model, _loss_fn)
 
-        @functools.partial(mx.compile, inputs=state, outputs=state)
+        @functools.partial(mlx.core.compile, inputs=state, outputs=state)
         def _step(inputs, labels, mask):
             loss, grads = loss_and_grad_fn(self._model, inputs, labels, mask)
             self._optimizer.update(self._model, grads)
@@ -287,18 +369,18 @@ class StatefulLLM:
         losses = []
 
         if verbose:
-            vizible.green(f"During training: {mx.metal.device_info() = }")
-        max_recommended_working_set_size = mx.metal.device_info()[
+            vizible.green(f"During training: {mlx.core.metal.device_info() = }")
+        max_recommended_working_set_size = mlx.core.metal.device_info()[
             "max_recommended_working_set_size"
         ]
         assert isinstance(max_recommended_working_set_size, int)
 
-        mx.set_wired_limit(max_recommended_working_set_size)
-        max_buffer_length = mx.metal.device_info()["max_buffer_length"]
+        mlx.core.set_wired_limit(max_recommended_working_set_size)
+        max_buffer_length = mlx.core.metal.device_info()["max_buffer_length"]
         assert isinstance(max_buffer_length, int)
 
-        mx.set_cache_limit(max_buffer_length)
-        world = mx.distributed.init()
+        mlx.core.set_cache_limit(max_buffer_length)
+        world = mlx.core.distributed.init()
         world_size = world.size()
         rank = world.rank()
         if world_size > 1:
@@ -309,7 +391,7 @@ class StatefulLLM:
             range(self._epochs), desc="Training", total=self._epochs
         ):
             loss = _step(example.input, example.label, example.mask)
-            mx.eval(state, loss)
+            mlx.core.eval(state, loss)
             if verbose:
                 vizible.green(f"Epoch: {epoch}\tLoss: {loss = }")
             losses.append(loss)

@@ -1,20 +1,19 @@
 """Evaluation harness for running experiments."""
 
+import dataclasses
 import random
 import re
 import time
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from ... import _llm
-from ...libs import revise
-from ..._classes import InteractionHistory
-
+from .._classes import InteractionHistory
+from .._llm import StatefulLLM
+from ..revise import make_collated_training_example
 from .dataset import TriviaDataset
 
 
-@dataclass
+@dataclasses.dataclass
 class EvaluationConfig:
     """Configuration for an evaluation run."""
 
@@ -27,7 +26,7 @@ class EvaluationConfig:
     max_tokens: int | None = None  # Use model default if None
 
 
-@dataclass
+@dataclasses.dataclass
 class ItemResult:
     """Result for a single trivia item."""
 
@@ -45,14 +44,14 @@ class ItemResult:
     training_time_seconds: float = 0.0
 
 
-@dataclass
+@dataclasses.dataclass
 class EvaluationResult:
     """Complete results from an evaluation run."""
 
     config: EvaluationConfig
     dataset_name: str
     timestamp: str
-    items: list[ItemResult] = field(default_factory=list)
+    items: list[ItemResult] = dataclasses.field(default_factory=list)
     total_time_seconds: float = 0.0
 
     # Computed metrics
@@ -193,17 +192,17 @@ def contains_key_terms(response: str, key_terms: list[str]) -> bool:
 class EvaluationHarness:
     """Runs evaluation experiments on a dataset."""
 
-    def __init__(self, model: _llm.StatefulLLM | None = None):
+    def __init__(self, model: StatefulLLM | None = None):
         """Initialize harness with optional pre-loaded model."""
         self._model = model
         self._model_loaded = model is not None
 
     @property
-    def model(self) -> _llm.StatefulLLM:
+    def model(self) -> StatefulLLM:
         """Lazy-load model on first access."""
         if self._model is None:
             print("Loading model...")
-            self._model = _llm.StatefulLLM()
+            self._model = StatefulLLM()
             self._model._model_is_stable = True
             self._model_loaded = True
         return self._model
@@ -306,7 +305,7 @@ class EvaluationHarness:
                 ),
             ]
             valid_revision = f"[[0]] {item.correct_answer} [[/0]]"
-            example = revise.make_collated_training_example(
+            example = make_collated_training_example(
                 valid_revision, interactions, self.model._tokenizer
             )
 

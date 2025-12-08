@@ -12,8 +12,6 @@ import unittest
 import mlx.core as mx
 
 import adaptible
-from adaptible._src.libs import revise
-
 
 # Module-level shared model instance - loaded once for all tests
 _shared_model = None
@@ -167,7 +165,9 @@ class RevisionQualityTest(unittest.TestCase):
             ),
         ]
 
-        prompt = revise.make_revision_prompt(interactions, self.model._tokenizer)
+        prompt = adaptible.revise.make_revision_prompt(
+            interactions, self.model._tokenizer
+        )
 
         # Prompt should contain the user inputs
         self.assertIn("2+2", prompt)
@@ -193,7 +193,7 @@ class RevisionQualityTest(unittest.TestCase):
         # Simulate a valid model revision response
         valid_revision = "[[0]] The capital of France is Paris. [[/0]]"
 
-        example = revise.make_collated_training_example(
+        example = adaptible.revise.make_collated_training_example(
             valid_revision, interactions, self.model._tokenizer
         )
 
@@ -252,7 +252,7 @@ class EndToEndSelfCorrectionTest(unittest.TestCase):
             mask_sum = float(example.mask.sum())
             self.assertGreater(mask_sum, 0, "Mask should have non-zero elements")
 
-        except adaptible.InvalidRevisionError:
+        except adaptible.revise.InvalidRevisionError:
             # This is expected - the model may produce invalid output
             # The important thing is that validation caught it
             pass
@@ -291,10 +291,10 @@ class EndToEndSelfCorrectionTest(unittest.TestCase):
         valid_revision = "[[0]] The capital of France is Paris. [[/0]]"
 
         # Validate it
-        revise.validate_revision_response(valid_revision, num_interactions=1)
+        adaptible.revise.validate_revision_response(valid_revision, num_interactions=1)
 
         # Create training example
-        example = revise.make_collated_training_example(
+        example = adaptible.revise.make_collated_training_example(
             valid_revision, interactions, self.model._tokenizer
         )
 
@@ -319,32 +319,32 @@ class ValidationTest(unittest.TestCase):
 
     def test_missing_markers_rejected(self):
         """Revision without markers should be rejected."""
-        with self.assertRaises(adaptible.InvalidRevisionError):
-            revise.validate_revision_response(
+        with self.assertRaises(adaptible.revise.InvalidRevisionError):
+            adaptible.revise.validate_revision_response(
                 "I think the response should be more polite.",
                 num_interactions=2,
             )
 
     def test_out_of_bounds_index_rejected(self):
         """Turn index outside valid range should be rejected."""
-        with self.assertRaises(adaptible.InvalidRevisionError):
-            revise.validate_revision_response(
+        with self.assertRaises(adaptible.revise.InvalidRevisionError):
+            adaptible.revise.validate_revision_response(
                 "[[5]] This is a revision [[/5]]",
                 num_interactions=2,  # Only turns 0 and 1 are valid
             )
 
     def test_missing_closing_marker_rejected(self):
         """Revision without closing marker should be rejected."""
-        with self.assertRaises(adaptible.InvalidRevisionError):
-            revise.validate_revision_response(
+        with self.assertRaises(adaptible.revise.InvalidRevisionError):
+            adaptible.revise.validate_revision_response(
                 "[[0]] This revision has no end",
                 num_interactions=2,
             )
 
     def test_too_short_content_rejected(self):
         """Revision with very short content should be rejected."""
-        with self.assertRaises(adaptible.InvalidRevisionError):
-            revise.validate_revision_response(
+        with self.assertRaises(adaptible.revise.InvalidRevisionError):
+            adaptible.revise.validate_revision_response(
                 "[[0]] Hi [[/0]]",  # Only 2 chars of content
                 num_interactions=2,
                 min_content_length=10,
@@ -352,8 +352,8 @@ class ValidationTest(unittest.TestCase):
 
     def test_garbage_patterns_rejected(self):
         """Revision with garbage/repetitive patterns should be rejected."""
-        with self.assertRaises(adaptible.InvalidRevisionError):
-            revise.validate_revision_response(
+        with self.assertRaises(adaptible.revise.InvalidRevisionError):
+            adaptible.revise.validate_revision_response(
                 "[[0]] [[1]][[2]][[3]][[4]] some garbage [[/0]]",
                 num_interactions=5,
             )
@@ -361,7 +361,7 @@ class ValidationTest(unittest.TestCase):
     def test_valid_revision_accepted(self):
         """A properly formatted revision should pass validation."""
         # Should not raise
-        revise.validate_revision_response(
+        adaptible.revise.validate_revision_response(
             "[[0]] This is a properly formatted and sufficiently long revision response. [[/0]]",
             num_interactions=2,
         )
@@ -373,7 +373,7 @@ class ThinkTagStrippingTest(unittest.TestCase):
     def test_think_tags_removed(self):
         """Think tags and their content should be stripped."""
         text = "<think>Let me think about this...</think> The answer is 42."
-        result = revise.strip_think_tags(text)
+        result = adaptible.revise.strip_think_tags(text)
         self.assertEqual(result, "The answer is 42.")
 
     def test_multiline_think_tags_removed(self):
@@ -382,13 +382,13 @@ class ThinkTagStrippingTest(unittest.TestCase):
         First I'll consider option A.
         Then option B.
         </think> I recommend option B."""
-        result = revise.strip_think_tags(text)
+        result = adaptible.revise.strip_think_tags(text)
         self.assertEqual(result, "I recommend option B.")
 
     def test_no_think_tags_unchanged(self):
         """Text without think tags should be unchanged."""
         text = "Just a normal response."
-        result = revise.strip_think_tags(text)
+        result = adaptible.revise.strip_think_tags(text)
         self.assertEqual(result, "Just a normal response.")
 
 

@@ -15,13 +15,13 @@ Run with:
 
 import inspect
 import unittest
+from typing import List, cast
 
 import mlx.core as mx
-from mlx.nn import losses
-from typing import cast, List
+import mlx.nn
 
-from adaptible._src.libs import revise
 from adaptible._src import _llm
+from adaptible._src.revise import make_collated_training_example
 
 
 class MaskSlicingBugTest(unittest.TestCase):
@@ -90,7 +90,9 @@ class LossReductionBugTest(unittest.TestCase):
         mask = mx.array([[0, 0, 0, 0, 0, 1, 1, 1]])
 
         # BUGGY: reduction="mean" returns scalar, then * mask broadcasts wrong
-        loss_buggy = losses.cross_entropy(logits, targets, reduction="mean") * mask
+        loss_buggy = (
+            mlx.nn.losses.cross_entropy(logits, targets, reduction="mean") * mask
+        )
         # This creates a tensor of shape (1, 8) where EVERY position has the same
         # mean loss value (broadcast from scalar), then masked
         # The .sum() / mask.sum() gives wrong normalization
@@ -101,7 +103,7 @@ class LossReductionBugTest(unittest.TestCase):
         # 3. Each masked position gets the FULL mean, not its individual loss
 
         # CORRECT: reduction="none" gives per-token losses
-        loss_per_token = losses.cross_entropy(logits, targets, reduction="none")
+        loss_per_token = mlx.nn.losses.cross_entropy(logits, targets, reduction="none")
         # Shape: (1, 8) - one loss per position
 
         # Then apply mask and normalize correctly
@@ -152,7 +154,7 @@ class LossReductionBugTest(unittest.TestCase):
         mask_wrong_only = mx.array([[1, 1, 1, 0, 0]], dtype=mx.float32)
 
         # Compute losses correctly
-        loss_per_token = losses.cross_entropy(logits, targets, reduction="none")
+        loss_per_token = mlx.nn.losses.cross_entropy(logits, targets, reduction="none")
 
         loss_correct_only = (
             loss_per_token * mask_correct_only
@@ -225,7 +227,7 @@ class FixVerificationTest(unittest.TestCase):
 
     def test_mask_slicing_fix_applied(self):
         """Verify make_collated_training_example uses mask[1:]."""
-        source = inspect.getsource(revise.make_collated_training_example)
+        source = inspect.getsource(make_collated_training_example)
         # The fix should have mask=mask[1:] not mask=mask
         self.assertIn("mask[1:]", source, "Mask slicing fix not applied!")
         # Should NOT have the buggy version

@@ -5,10 +5,10 @@ import logging
 import socket
 import sys
 
-from fastapi import FastAPI
 import uvicorn
+from fastapi import FastAPI
 
-from ._api import Adaptible
+from .._api import Adaptible
 
 logging.basicConfig(
     level=logging.INFO,

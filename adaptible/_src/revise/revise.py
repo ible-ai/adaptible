@@ -1,6 +1,5 @@
 """Utilities for self-reflective model revisions."""
 
-import copy
 import re
 from typing import Sequence, Tuple
 
@@ -274,9 +273,7 @@ def make_collated_training_example(
     messages = [{"role": "user", "content": interaction_to_revise.user_input}]
 
     # Use add_generation_prompt=True to match inference format exactly
-    prompt_prefix = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    prompt_prefix = tokenizer.apply_chat_template(messages, False, True)
 
     def _tokenize(text: str, dtype: mx.Dtype = mx.int32) -> mx.array:
         return mx.array(tokenizer.encode(text, add_special_tokens=False), dtype=dtype)
@@ -285,9 +282,12 @@ def make_collated_training_example(
     revision = _tokenize(rewritten_response + eos_tag)
     tokenized_rewritten_dialog = mx.concat([dialog_pre_revision, revision])
     mask = mx.concat([mx.zeros_like(dialog_pre_revision), mx.ones_like(revision)])
+    # Slice mask to align with input/label dimensions:
+    # input has N-1 tokens (sequence[:-1]), label has N-1 tokens (sequence[1:])
+    # mask must also have N-1 tokens, aligned with labels (what we're predicting)
     training_example = TrainingExample(
         input=tokenized_rewritten_dialog[:-1],
         label=tokenized_rewritten_dialog[1:],
-        mask=mask,
+        mask=mask[1:],
     )
     return _collate_fn([training_example], padding_token)

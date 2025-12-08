@@ -1,15 +1,38 @@
-"""Adaptible - LLMs that can wander."""
+"""Core components for stateful LLMs."""
 
-from ._api import Adaptible
-from ._api import ModelProtocol
-from ._classes import InteractionHistory
-from ._classes import InteractionRequest
-from ._classes import InteractionResponse
-from ._classes import ReviewResponse
-from ._classes import SyncResponse
-from ._classes import TrainingExample
+from ._api import Adaptible, ModelProtocol
+from ._classes import (
+    InteractionHistory,
+    InteractionRequest,
+    InteractionResponse,
+    ReviewResponse,
+    SyncResponse,
+    TrainingExample,
+)
 from ._llm import StatefulLLM
-from ._server import MutableHostedLLM
-from .libs import revise
-from .libs import InvalidRevisionError
-from .libs import REWRITE_INSTRUCTIONS
+from .revise import (
+    REWRITE_INSTRUCTIONS,
+    InvalidRevisionError,
+    make_collated_training_example,
+    make_revision_prompt,
+    strip_think_tags,
+    validate_revision_response,
+)
+
+__all__ = [
+    "Adaptible",
+    "ModelProtocol",
+    "InteractionHistory",
+    "InteractionRequest",
+    "InteractionResponse",
+    "ReviewResponse",
+    "SyncResponse",
+    "TrainingExample",
+    "StatefulLLM",
+    "InvalidRevisionError",
+    "make_collated_training_example",
+    "make_revision_prompt",
+    "REWRITE_INSTRUCTIONS",
+    "strip_think_tags",
+    "validate_revision_response",
+]

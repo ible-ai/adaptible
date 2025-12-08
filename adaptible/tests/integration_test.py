@@ -15,18 +15,18 @@ Run with:
 Generates an HTML report at: /tmp/adaptible_test_report.html
 """
 
-from typing import Any
 import html
 import json
 import re
 import unittest
+import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
-import webbrowser
+from typing import Any
+
+import vizible
 
 import adaptible
-from adaptible import revise
-import vizible
 
 # Global report data collector
 REPORT_DATA: dict[str, Any] = {
@@ -452,7 +452,7 @@ class RealResponseCorrectionTest(unittest.TestCase):
                 ),
             ]
             valid_revision = f"[[0]] {task.correct_answer} [[/0]]"
-            example = revise.make_collated_training_example(
+            example = adaptible.revise.make_collated_training_example(
                 valid_revision, interactions, self.model._tokenizer
             )
 
@@ -541,9 +541,9 @@ class ValidationPrerequisiteTest(unittest.TestCase):
 
         for i, garbage in enumerate(garbage_outputs):
             try:
-                revise.validate_revision_response(garbage, num_interactions=2)
+                adaptible.revise.validate_revision_response(garbage, num_interactions=2)
                 print(f"✗ #{i}: Should have been rejected: {garbage[:40]}...")
-            except adaptible.InvalidRevisionError as e:
+            except adaptible.revise.InvalidRevisionError as e:
                 print(f"✓ #{i}: Correctly rejected - {str(e)[:50]}...")
 
     def test_validation_accepts_good_revisions(self):
@@ -557,7 +557,9 @@ class ValidationPrerequisiteTest(unittest.TestCase):
         print("\nGood revisions:")
         for revision in good_revisions:
             try:
-                revise.validate_revision_response(revision, num_interactions=2)
+                adaptible.revise.validate_revision_response(
+                    revision, num_interactions=2
+                )
                 print(f"✓ Accepted: {revision[:40]}...")
             except adaptible.InvalidRevisionError as e:
                 print(f"✗ Rejected (unexpected): {str(e)[:50]}...")

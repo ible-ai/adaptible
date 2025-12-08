@@ -1,18 +1,18 @@
 """Standard Interaction Logic for a Stateful LLM"""
 
 import asyncio
-from asyncio import log
 import collections
 import os
-import time
 import threading
+import time
+from asyncio import log
 from typing import Any, List, Protocol
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse
 import tqdm
 import vizible
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from ._classes import (
     InteractionHistory,
