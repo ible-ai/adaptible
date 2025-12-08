@@ -203,6 +203,7 @@ The node handles several failure modes gracefully:
 ```
 autonomous/
 ├── __init__.py     # Public exports
+├── __main__.py     # CLI entrypoint
 ├── node.py         # AutonomousNode implementation
 └── README.md       # This file
 ```

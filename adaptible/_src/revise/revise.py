@@ -273,7 +273,9 @@ def make_collated_training_example(
     messages = [{"role": "user", "content": interaction_to_revise.user_input}]
 
     # Use add_generation_prompt=True to match inference format exactly
-    prompt_prefix = tokenizer.apply_chat_template(messages, False, True)
+    prompt_prefix = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
 
     def _tokenize(text: str, dtype: mx.Dtype = mx.int32) -> mx.array:
         return mx.array(tokenizer.encode(text, add_special_tokens=False), dtype=dtype)

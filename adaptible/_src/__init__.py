@@ -1,5 +1,6 @@
 """Core components for stateful LLMs."""
 
+from . import autonomous, eval, local, revise
 from ._api import Adaptible, ModelProtocol
 from ._classes import (
     InteractionHistory,
@@ -35,4 +36,8 @@ __all__ = [
     "REWRITE_INSTRUCTIONS",
     "strip_think_tags",
     "validate_revision_response",
+    "autonomous",
+    "eval",
+    "local",
+    "revise",
 ]

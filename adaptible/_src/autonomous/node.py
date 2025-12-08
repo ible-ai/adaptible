@@ -64,6 +64,7 @@ class NodeState:
             total_searches=self.total_searches,
             started_at=self.started_at,
         )
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(dataclasses.asdict(trimmed_state), indent=2))
 
     @classmethod

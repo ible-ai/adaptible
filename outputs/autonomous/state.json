@@ -1,0 +1,125 @@
+{
+  "learning_history": [
+    {
+      "timestamp": "2025-12-08T11:50:16.228034",
+      "question": "How many leaders are from the National Sector?",
+      "old_answer": null,
+      "new_answer": "There are 15 leaders from the National Sector.",
+      "source": "Current World Leaders \u2013 World Leaders Foundation",
+      "source_url": "https://wlf.org.in/current-world-leaders/",
+      "event_type": "new"
+    },
+    {
+      "timestamp": "2025-12-08T12:11:53.698939",
+      "question": "NBCNews.com provides the latest top news stories.",
+      "old_answer": null,
+      "new_answer": "NBCNews.com offers breaking headlines and video updates.",
+      "source": "Latest News: Breaking Headlines and Video on Today's Top Stories",
+      "source_url": "https://www.nbcnews.com/latest-stories",
+      "event_type": "new"
+    },
+    {
+      "timestamp": "2025-12-08T12:11:53.698939",
+      "question": "What is the main focus of the content?",
+      "old_answer": null,
+      "new_answer": "The main focus is to provide top news stories from The Associated Press.",
+      "source": "Top News: US & International Top News Stories Today | AP News",
+      "source_url": "https://apnews.com/hub/ap-top-news",
+      "event_type": "new"
+    },
+    {
+      "timestamp": "2025-12-08T12:17:32.700745",
+      "question": "Has there been any major news affecting the stock market in the US today?",
+      "old_answer": null,
+      "new_answer": "Yes, a major tech company announced earnings, which is expected to impact the stock market.",
+      "source": "Stock Market Data - US Markets, World Markets, and Stock ...",
+      "source_url": "https://www.cnn.com/markets/",
+      "event_type": "new"
+    },
+    {
+      "timestamp": "2025-12-08T12:17:32.700745",
+      "question": "Stock market news is broken and updated every 2 days.",
+      "old_answer": null,
+      "new_answer": "The stock market news is broken and updated every 2 days.",
+      "source": "U.S. Stock Market Headlines | Breaking Stock Market News ...",
+      "source_url": "https://www.reuters.com/markets/us/",
+      "event_type": "new"
+    },
+    {
+      "timestamp": "2025-12-08T12:27:40.209505",
+      "question": "What are the player statistics for the match?",
+      "old_answer": null,
+      "new_answer": "In the football match, Player X scored an average of 1.5 goals per game, and Player Y contributed with 0.8 goals.",
+      "source": "Live Sports Scores: Instant Updates for All Major Events",
+      "source_url": "https://www.sports-addict.net/en-us/scores/",
+      "event_type": "new"
+    },
+    {
+      "timestamp": "2025-12-08T12:37:00.675861",
+      "question": "If you can't watch a movie during a certain week, what does it mean?",
+      "old_answer": null,
+      "new_answer": "It means the movie is no longer available and will be replaced by another recently released one.",
+      "source": "Moviesda Watch Recently Released Movies For Free Online \u2013",
+      "source_url": "https://dailynewsvibes.com/moviesda-watch-recently-released-movies-for-free-online/",
+      "event_type": "new"
+    },
+    {
+      "timestamp": "2025-12-08T12:37:00.675861",
+      "question": "What is the release date of the movies listed in \"New Movies (2025)\"?",
+      "old_answer": null,
+      "new_answer": "The movies are released in the year 2025.",
+      "source": "New Movies (2025) - Recently Released Popular Movies List",
+      "source_url": "https://www.91mobiles.com/entertainment/new-movies",
+      "event_type": "new"
+    },
+    {
+      "timestamp": "2025-12-08T12:48:15.919959",
+      "question": "What is the latest software update available for PCMag?",
+      "old_answer": null,
+      "new_answer": "PCMag has announced a new AI system that enhances user experience across various applications.",
+      "source": "The Latest News in Technology | PCMag",
+      "source_url": "https://www.pcmag.com/news",
+      "event_type": "new"
+    },
+    {
+      "timestamp": "2025-12-08T12:58:22.733692",
+      "question": "The Moon has been the primary focus of recent space exploration.",
+      "old_answer": null,
+      "new_answer": "Mars remains a long-term goal for many space agencies and private companies.",
+      "source": "Space News: The Final Frontier of Exploration and Innovation",
+      "source_url": "https://www.spacedaily.com/reports/Space_News_The_Final_Frontier_of_Exploration_and_Innovation_999.html",
+      "event_type": "new"
+    },
+    {
+      "timestamp": "2025-12-08T12:58:22.733692",
+      "question": "Several missions are seeking to increase our knowledge of the Moon's makeup.",
+      "old_answer": null,
+      "new_answer": "Yes, several missions are seeking to increase our knowledge of the Moon's makeup.",
+      "source": "Exploring the Latest Space News: Discoveries, Missions, and",
+      "source_url": "https://techvilly.com/exploring-the-latest-space-news-discoveries-missions-and-developments/",
+      "event_type": "new"
+    },
+    {
+      "timestamp": "2025-12-08T12:58:22.733692",
+      "question": "Several missions are also seeking to increase our knowledge of the Moon's past.",
+      "old_answer": null,
+      "new_answer": "Yes, several missions are also seeking to increase our knowledge of the Moon's past.",
+      "source": "Exploring the Latest Space News: Discoveries, Missions, and",
+      "source_url": "https://techvilly.com/exploring-the-latest-space-news-discoveries-missions-and-developments/",
+      "event_type": "new"
+    }
+  ],
+  "topics_explored": [
+    "current world leaders",
+    "recent scientific discoveries",
+    "today's major news events",
+    "current stock market status",
+    "recent sports results",
+    "recently released movies",
+    "current technology announcements",
+    "recent space exploration news"
+  ],
+  "total_updates": 12,
+  "total_searches": 8,
+  "started_at": "2025-12-08T11:50:16.228002"
+}

@@ -6,13 +6,23 @@ from typing import AsyncIterable, List, Tuple, cast
 
 import immutabledict
 import mlx
-import mlx_lm
+import mlx.core
+import mlx.nn
+import mlx.optimizers
+import mlx_lm.tuner
+import mlx_lm.utils
 import tqdm
 import vizible
-from transformers import PreTrainedTokenizer
+from mlx_lm.generate import stream_generate as mlx_lm__stream_generate
+from mlx_lm.utils import load as mlx_lm__load
+from transformers.tokenization_utils import PreTrainedTokenizer
 
-from . import revise
 from ._classes import InteractionHistory, TrainingExample
+from .revise import (
+    make_collated_training_example,
+    make_revision_prompt,
+    validate_revision_response,
+)
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 #                         Default constants.                          #
@@ -86,11 +96,11 @@ def _load(
     Returns:
         Model and tokenizer.
     """
-    model, wrapped_tokenizer = mlx_lm.load(model_name)
+    model, wrapped_tokenizer = mlx_lm__load(model_name)
     print("Freezing all non-Lora model parameters.")
     model.freeze()
     if lora_parameters is not None:
-        mlx_lm.tuner.linear_to_lora_layers(
+        mlx_lm.tuner.utils.linear_to_lora_layers(
             model=model,
             num_layers=num_lora_layers,
             config=lora_parameters,
@@ -220,7 +230,7 @@ class StatefulLLM:
         full_response = []
         loop_detected = False
 
-        for response in mlx_lm.stream_generate(
+        for response in mlx_lm__stream_generate(
             model=self._model,
             tokenizer=self._tokenizer,
             prompt=tokenized_prompt,
@@ -238,8 +248,8 @@ class StatefulLLM:
                     self._loop_detection_sequence_length,
                     self._loop_detection_max_repetitions,
                 ):
-                    vizible.yellow(f"⚠️  Loop detected! Stopping generation early.")
-                    vizible.yellow(
+                    vizible.red(f"⚠️  Loop detected! Stopping generation early.")
+                    vizible.red(
                         f"   Generated {len(generated_tokens)} tokens before loop detection."
                     )
                     loop_detected = True
@@ -275,7 +285,7 @@ class StatefulLLM:
         loop_detected = False
 
         try:
-            for response in mlx_lm.stream_generate(
+            for response in mlx_lm__stream_generate(
                 self._model,
                 self._tokenizer,
                 prompt=tokenized_prompt,
@@ -291,8 +301,8 @@ class StatefulLLM:
                         self._loop_detection_sequence_length,
                         self._loop_detection_max_repetitions,
                     ):
-                        vizible.yellow(f"⚠️  Loop detected! Stopping generation early.")
-                        vizible.yellow(
+                        vizible.red(f"⚠️  Loop detected! Stopping generation early.")
+                        vizible.red(
                             f"   Generated {len(generated_tokens)} tokens before loop detection."
                         )
                         loop_detected = True
@@ -334,22 +344,20 @@ class StatefulLLM:
             interactions_to_review.append(interaction_history[idx])
 
         # 1. Have the model re-evaluate its past responses and try to improve upon one of its turns.
-        review_prompt = revise.make_revision_prompt(
-            interactions_to_review, self._tokenizer
-        )
+        review_prompt = make_revision_prompt(interactions_to_review, self._tokenizer)
         llm_rewrite_response = self.generate_response(review_prompt, use_history=False)
         if verbose:
             vizible.blue(f"  - Response: {llm_rewrite_response}")
 
         # 2. Validate the revision response before using it for training.
-        revise.validate_revision_response(
+        validate_revision_response(
             llm_rewrite_response,
             num_interactions=len(interactions_to_review),
         )
 
         # 3. Prepare training data to train the model on how it should have responded in this
         #    situation.
-        example = revise.make_collated_training_example(
+        example = make_collated_training_example(
             llm_rewrite_response, interactions_to_review, self._tokenizer
         )
         return example

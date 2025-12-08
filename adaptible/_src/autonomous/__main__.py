@@ -21,10 +21,11 @@ Examples:
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import vizible
 from absl import app, flags
 from ddgs import DDGS
 
-from . import AutonomousNode
+from .node import AutonomousNode
 
 _DEFAULT_TOPICS = (
     "current world leaders",
@@ -40,12 +41,13 @@ _CYCLES = flags.DEFINE_integer("cycles", 1, "Number of exploration cycles (defau
 _TOPICS = flags.DEFINE_multi_string(
     "topics", _DEFAULT_TOPICS, "Specific topic to explore (optional)"
 )
-_STATE_PATH = flags.DEFINE_string(
-    "state_path", "autonomous_node_state.json", "Path to save node state"
+_OUTPUT_PATH = flags.DEFINE_string(
+    "output_path", "outputs/autonomous/state.json", "Path to save node state"
 )
 
 
 def main(_):
+    vizible.blue("\n--- Starting Autonomous Learning Node ---")
     ddgs = DDGS()
 
     def search(query: str) -> Sequence[Mapping[str, Any]]:
@@ -72,7 +74,7 @@ def main(_):
     # Create the node with mock search
     node = AutonomousNode(
         search_fn=search,
-        state_path=_STATE_PATH.value,
+        state_path=_OUTPUT_PATH.value,
         seed_topics=_TOPICS.value,
     )
 
