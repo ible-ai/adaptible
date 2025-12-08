@@ -1,5 +1,6 @@
 """Adaptible - LLMs that can wander."""
 
+from . import eval
 from . import local
 from ._src import Adaptible
 from ._src import InteractionHistory

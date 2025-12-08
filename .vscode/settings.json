@@ -1,0 +1,19 @@
+// settings.json example for Python formatting
+{
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.black-formatter",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit" // Or true, use "explicit" for better control
+        }
+    },
+    "python.testing.unittestArgs": [
+        "-v",
+        "-s",
+        "./adaptible",
+        "-p",
+        "*_test.py"
+    ],
+    "python.testing.pytestEnabled": false,
+    "python.testing.unittestEnabled": true
+}

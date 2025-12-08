@@ -2,6 +2,12 @@
 
 Stateful LLM serving instances that self-reflect and learn from their mistakes during idle time.
 
+## Vision
+
+Self-improvement is itself a learnable trait. Different model instances undergoing online learning arrive at different end states—some become stronger self-learners than others. Adaptible explores this phenomenon by creating multiple instances that self-update, releasing them into production, and pruning the weaker learners while propagating successful ones.
+
+The core hypothesis: by diversifying training bets autonomously and greedily sampling from winners, we create an evolutionary bottleneck that selects for models adept at self-improvement. The goal isn't just a model that learns—it's discovering which models *learn to learn*.
+
 ## What it does
 
 Adaptible wraps an LLM in a server that:
@@ -10,7 +16,7 @@ Adaptible wraps an LLM in a server that:
 3. During idle periods, asks the model to critique and revise its past responses
 4. Fine-tunes the model on those revisions using LoRA
 
-The goal is online learning: models that improve through use without full retraining.
+This enables online learning: models that improve through use without full retraining.
 
 ## Requirements
 
@@ -108,6 +114,54 @@ curl http://127.0.0.1:8000/sync
 4. The model is fine-tuned on the improved response using LoRA
 5. Training only updates the revision; original knowledge is preserved via masking
 
+## Evaluation Framework
+
+Adaptible includes a comprehensive evaluation harness for measuring self-correction effectiveness.
+
+### Command line
+
+```bash
+# Run evaluation with default settings
+python -m adaptible.eval
+
+# Run with options
+python -m adaptible.eval \
+  --subset 20 \
+  --shuffle \
+  --category geography \
+  --iterations 25
+```
+
+### Programmatic usage
+
+```python
+import adaptible.eval as eval
+
+# Load the built-in dataset (100+ trivia questions)
+dataset = eval.generate_default_dataset()
+
+# Configure the experiment
+config = eval.EvaluationConfig(
+    name="my_experiment",
+    training_iterations=25,
+    train_ratio=0.8,
+    shuffle=True,
+)
+
+# Run evaluation
+harness = eval.EvaluationHarness()
+result = harness.run(dataset, config)
+
+# Generate HTML report
+eval.generate_html_report(result, "/tmp/report.html")
+```
+
+The evaluation:
+- Uses 100+ trivia questions across 6 categories (geography, science, history, math, language, miscellaneous)
+- Splits data into train/holdout sets to measure generalization
+- Measures baseline accuracy, improvement rate, retention rate, and holdout accuracy
+- Generates an HTML report with detailed per-item results
+
 ## Configuration
 
 `StatefulLLM` accepts these parameters:
@@ -118,8 +172,8 @@ curl http://127.0.0.1:8000/sync
 | `learning_rate`   | `5e-5`                                        | Training learning rate       |
 | `max_tokens`      | `128`                                         | Max tokens per response      |
 | `epochs`          | `5`                                           | Training epochs per revision |
-| `num_lora_layers` | `16`                                          | Number of LoRA layers        |
-| `lora_parameters` | `{"rank": 8, "dropout": 0.0, "scale": 20.0}`  | LoRA config                  |
+| `num_lora_layers` | `24`                                          | Number of LoRA layers        |
+| `lora_parameters` | `{"rank": 32, "dropout": 0.0, "scale": 10.0}` | LoRA config                  |
 
 ## Limitations
 
@@ -131,47 +185,22 @@ curl http://127.0.0.1:8000/sync
 
 ```
 .
-├── CNAME
-├── README.md
 ├── adaptible
-│   ├── __init__.py                    # Public API
-│   ├── _src
-│   │   ├── __init__.py
-│   │   ├── _api.py                    # FastAPI routes
-│   │   ├── _classes.py                # Data models
-│   │   ├── _llm.py                    # StatefulLLM class
-│   │   ├── _server.py                 # Server entry point
-│   │   ├── libs
-│   │   │   ├── __init__.py
-│   │   │   ├── revise.py              # Revision prompt + data
-│   │   │   └── revise_test.py
-│   │   ├── static
-│   │   │   ├── README.md
-│   │   │   ├── crop.sh
-│   │   │   ├── gemini.png
-│   │   │   ├── gemini_2.png
-│   │   │   ├── gemini_2_cropped.png
-│   │   │   ├── gemini_3.png
-│   │   │   ├── gemini_3_cropped.png
-│   │   │   ├── gemini_cropped.png
-│   │   │   ├── gemini_cropped_transparent_bg.png
-│   │   │   └── index.html
-│   │   └── tests
-│   │       ├── __init__.py
-│   │       ├── api_test.py
-│   │       ├── classes_test.py
-│   │       ├── llm_test.py
-│   │       └── server_test.py
-│   └── local.py
-├── directory-structure.md
-├── dist
-├── examples
-│   ├── online_learning_demo.py
-│   └── server_demo.py
-├── pyproject.toml
-└── uv.lock
+│   ├── __init__.py                    # Public API
+│   ├── eval/                          # Evaluation framework (public)
+│   │   ├── __init__.py                # EvaluationHarness, TriviaDataset, etc.
+│   │   └── __main__.py                # CLI entry point
+│   ├── local.py                       # Local server runner
+│   └── _src/                          # Internal implementation
+│       ├── _api.py                    # FastAPI routes
+│       ├── _classes.py                # Data models
+│       ├── _llm.py                    # StatefulLLM class
+│       ├── _server.py                 # Server entry point
+│       ├── libs/                      # Internal libraries
+│       └── tests/                     # Tests and eval implementation
+├── examples/
+└── pyproject.toml
 ```
-**Originally generated with `brew install tree && tree . >> directory-structure.md`.**
 
 ## Running Tests
 
