@@ -1,0 +1,45 @@
+======================================================================
+TRAINING BUG DEMONSTRATION
+======================================================================
+
+1. MASK SLICING BUG
+----------------------------------------------------------------------
+
+The mask in make_collated_training_example has 8 elements but
+input/label have 7 elements after slicing. This causes misalignment.
+
+Current code:
+    input = sequence[:-1]   # 7 elements
+    label = sequence[1:]    # 7 elements
+    mask = mask             # 8 elements (BUG!)
+
+Fixed code:
+    input = sequence[:-1]   # 7 elements
+    label = sequence[1:]    # 7 elements
+    mask = mask[1:]         # 7 elements (FIXED)
+
+
+2. LOSS REDUCTION BUG
+----------------------------------------------------------------------
+
+The loss function uses reduction="mean" which returns a scalar,
+then multiplies by mask. This broadcasts incorrectly.
+
+Current code:
+    loss = cross_entropy(logits, targets, reduction="mean") * mask
+    # scalar * mask broadcasts: every masked position gets same loss value
+
+Fixed code:
+    loss = cross_entropy(logits, targets, reduction="none") * mask
+    # per-token losses * mask: each position gets its own loss value
+
+Loss on correct positions: 0.000408
+Loss on wrong positions: 10.000408
+Buggy loss: 5.132861
+Correct loss: 5.466689
+
+======================================================================
+FIX VERIFICATION
+======================================================================
+
+✓ All fixes verified in codebase!

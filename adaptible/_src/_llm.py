@@ -78,7 +78,10 @@ def _loss_fn(
     mask: mx.array,
 ) -> mx.array:
     logits: mx.array = model(inputs, mx.ones_like(inputs))
-    loss = losses.cross_entropy(logits, targets, reduction="mean") * mask
+    # Use reduction="none" to get per-token losses, then apply mask correctly.
+    # Using reduction="mean" would return a scalar that broadcasts incorrectly
+    # when multiplied by mask (every masked position gets the same mean value).
+    loss = losses.cross_entropy(logits, targets, reduction="none") * mask
     normalized_loss = loss.sum() / mask.sum()
     return normalized_loss
 
