@@ -27,15 +27,29 @@ from ddgs import DDGS
 
 from .node import AutonomousNode
 
+# Specific factual queries - use "current" or 2025 to ensure we're testing
+# information beyond the model's training cutoff
 _DEFAULT_TOPICS = (
-    "current world leaders",
-    "recent scientific discoveries",
-    "today's major news events",
-    "current stock market status",
-    "recent sports results",
-    "recently released movies",
-    "current technology announcements",
-    "recent space exploration news",
+    # Politics / Leaders (current = dynamic)
+    "Who is the current president of the United States?",
+    "Who is the current prime minister of the United Kingdom?",
+    "Who is the current chancellor of Germany?",
+    # Sports (2025 = beyond training cutoff)
+    "Who won Super Bowl 2025?",
+    "Who won the 2025 NBA Finals?",
+    "Who won the 2025 World Series?",
+    # Entertainment (2025)
+    "What movie won Best Picture at the 2025 Oscars?",
+    "What is the highest grossing movie of 2025?",
+    # Current events / prices (dynamic)
+    "What is the current price of Bitcoin?",
+    "What is the current price of Tesla stock?",
+    # Tech (latest = dynamic)
+    "What is the latest iPhone model?",
+    "What is the latest version of iOS?",
+    # Recent deaths / status (things that changed recently)
+    "Is Jimmy Carter still alive?",
+    "Is Pope Francis still the Pope?",
 )
 _CYCLES = flags.DEFINE_integer("cycles", 1, "Number of exploration cycles (default: 1)")
 _TOPICS = flags.DEFINE_multi_string(
@@ -48,7 +62,7 @@ _OUTPUT_PATH = flags.DEFINE_string(
 
 def main(_):
     vizible.blue("\n--- Starting Autonomous Learning Node ---")
-    ddgs = DDGS()
+    ddgs_client = DDGS()
 
     def search(query: str) -> Sequence[Mapping[str, Any]]:
         """Web searcher.
@@ -60,11 +74,20 @@ def main(_):
             List of search results with title, snippet, and url.
         """
         to_return = []
-        for result in ddgs.text(query, max_results=5):
+        news_results = ddgs_client.news(query, max_results=2)
+        text_results = ddgs_client.text(query, max_results=2)
+        seen_urls = set()
+        for result in [*news_results, *text_results]:
+            vizible.blue(", ".join(list(result.keys())))
+            result = {**result}
+            url = result.get("href") or result.get("url")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
             to_return.append(
                 {
                     "title": result["title"],
-                    "url": result["href"],
+                    "url": url,
                     "snippet": result["body"],
                 }
             )
@@ -84,14 +107,15 @@ def main(_):
     print()
 
     # Run exploration
-    if topics := _TOPICS.value:
-        print(f"Exploring topic: {topics}")
-        results = []
-        for topic in topics:
-            results.append(node.explore_once(topic))
+    topics = _TOPICS.value
+    if not topics:
+        topics = [None] * _CYCLES.value
+    print(f"Exploring topic: {topics}")
+    results = []
+    for topic in topics:
+        results.append(node.explore_once(topic))
 
-    else:
-        results = node.run(cycles=_CYCLES.value, verbose=True)
+    results = node.run(topics=topics, verbose=True)
 
     # Summary
     print()

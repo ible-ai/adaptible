@@ -2,6 +2,7 @@
 
 import functools
 import threading
+from pathlib import Path
 from typing import AsyncIterable, List, Tuple, cast
 
 import immutabledict
@@ -10,11 +11,12 @@ import mlx.core
 import mlx.nn
 import mlx.optimizers
 import mlx_lm.tuner
-import mlx_lm.utils
 import tqdm
 import vizible
-from mlx_lm.generate import stream_generate as mlx_lm__stream_generate
-from mlx_lm.utils import load as mlx_lm__load
+from mlx_lm.generate import stream_generate
+from mlx_lm.utils import load
+from mlx_lm.utils import save_model
+from mlx_lm.utils import load_model
 from transformers.tokenization_utils import PreTrainedTokenizer
 
 from ._classes import InteractionHistory, TrainingExample
@@ -27,9 +29,15 @@ from .revise import (
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 #                         Default constants.                          #
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# _MODEL_NAME = "lmstudio-community/Qwen3-4B-Thinking-2507-MLX-8bit"
+# _MODEL_NAME = "lmstudio-community/Qwen3-4B-Instruct-2507-MLX-8bit"
 _MODEL_NAME = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B"
 # _MODEL_NAME = "mlx-community/DeepSeek-R1-Qwen3-0528-8B-4bit-AWQ"
 MAX_TOKENS = 2048
+MODEL_PATH = Path(
+    "/Users/erichansen/Code/public/adaptible-1/adaptible/outputs/autonomous/checkpoint"
+)
+# MAX_TOKENS = 8192
 _LEARNING_RATE = 5e-5
 _EPOCHS = 5
 # LoRA configuration: Higher rank (32) and more layers (24) provide
@@ -84,6 +92,7 @@ def _load(
     num_lora_layers: int,
     use_dora: bool,
     lora_parameters: dict | None = None,
+    model_path: Path | None = None,
 ) -> Tuple[mlx.nn.Module, PreTrainedTokenizer]:
     """Load model parameters and tokenizer.
 
@@ -92,11 +101,16 @@ def _load(
         num_lora_layers: Number of LORA layers, if LORA is enabled.
         use_dora: Whether to use DORA, if LORA is enabled.
         lora_parameters: LORA hyperparameters. If not None, LORA will be enabled.
+        model_path: Optional path to saved checkpoint.
 
     Returns:
         Model and tokenizer.
     """
-    model, wrapped_tokenizer = mlx_lm__load(model_name)
+    if model_path is not None and model_path.exists():
+        _, wrapped_tokenizer = load(model_name)
+        model = load_model(model_path)
+    else:
+        model, wrapped_tokenizer = load(model_name)
     print("Freezing all non-Lora model parameters.")
     model.freeze()
     if lora_parameters is not None:
@@ -138,6 +152,7 @@ class StatefulLLM:
         use_dora: bool = _USE_DORA,
         loop_detection_sequence_length: int = _LOOP_DETECTION_SEQUENCE_LENGTH,
         loop_detection_max_repetitions: int = _LOOP_DETECTION_MAX_REPETITIONS,
+        model_path: Path | None = MODEL_PATH,
     ) -> None:
         """Initializes the StatefulLLM
 
@@ -162,7 +177,9 @@ class StatefulLLM:
                 num_lora_layers=num_lora_layers,
                 lora_parameters=lora_parameters,
                 use_dora=use_dora,
+                model_path=model_path,
             )
+        self._model_path = model_path
         self._model_name = model_name
         self._optimizer = mlx.optimizers.AdamW(learning_rate=learning_rate)
         self._epochs = epochs
@@ -230,7 +247,7 @@ class StatefulLLM:
         full_response = []
         loop_detected = False
 
-        for response in mlx_lm__stream_generate(
+        for response in stream_generate(
             model=self._model,
             tokenizer=self._tokenizer,
             prompt=tokenized_prompt,
@@ -260,7 +277,7 @@ class StatefulLLM:
         model_response = "".join(full_response)
 
         if model_response is None:
-            return None
+            return ""
         return model_response.strip()
 
     async def stream_response(
@@ -285,7 +302,7 @@ class StatefulLLM:
         loop_detected = False
 
         try:
-            for response in mlx_lm__stream_generate(
+            for response in stream_generate(
                 self._model,
                 self._tokenizer,
                 prompt=tokenized_prompt,
@@ -432,6 +449,9 @@ class StatefulLLM:
 
         # Train the model on the new, improved examples (backward-pass)
         self._train(example, verbose)
+        if self._model_path is not None:
+            self._model_path.parent.mkdir(parents=True, exist_ok=True)
+            save_model(self._model_path, self._model)
 
         self._model_is_stable = True
         return True

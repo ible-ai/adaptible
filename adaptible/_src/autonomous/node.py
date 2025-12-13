@@ -9,15 +9,17 @@ weight updates via LoRA fine-tuning.
 
 import dataclasses
 import json
+import textwrap
 import random
-import time
+import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, List
+import vizible
 
 from .._classes import InteractionHistory, TrainingExample
-from .._llm import MAX_TOKENS, StatefulLLM
+from .._llm import MAX_TOKENS, StatefulLLM, MODEL_PATH
 from ..revise import make_collated_training_example
 
 
@@ -27,11 +29,14 @@ class LearningEvent:
 
     timestamp: str
     question: str
-    old_answer: str | None
-    new_answer: str
+    before_training_answer: str | None
+    after_training_answer: str | None
     source: str
     source_url: str | None
     event_type: str  # "new", "correction", "reinforcement"
+    verified_answer: str | None  # Ground truth from source
+    confidence_before_training: float
+    confidence_after_training: float
 
 
 @dataclasses.dataclass
@@ -70,7 +75,7 @@ class NodeState:
     @classmethod
     def load(cls, path: Path) -> "NodeState":
         """Load state from JSON."""
-        if not path.exists():
+        if not path.exists() or not path.read_text():
             return cls(started_at=datetime.now().isoformat())
         data = json.loads(path.read_text())
         state = cls(
@@ -118,6 +123,7 @@ class AutonomousNode:
         seed_topics: Sequence[str],
         model: StatefulLLM | None = None,
         state_path: Path | str = Path("autonomous_node_state.json"),
+        model_path: Path | None = MODEL_PATH,
         training_iterations: int = 25,
         max_tokens: int = MAX_TOKENS,
     ):
@@ -134,6 +140,7 @@ class AutonomousNode:
         """
         self.search = search_fn
         self._model = model
+        self._model_path = model_path
         self.state_path = Path(state_path)
         self.state = NodeState.load(self.state_path)
         self.training_iterations = training_iterations
@@ -146,7 +153,7 @@ class AutonomousNode:
         """Lazy-load model on first access."""
         if self._model is None:
             print("Loading model...")
-            self._model = StatefulLLM()
+            self._model = StatefulLLM(model_path=self._model_path)
             self._model._model_is_stable = True
         return self._model
 
@@ -165,13 +172,13 @@ class AutonomousNode:
         return response or ""
 
     def _train_on_correction(
-        self, question: str, old_answer: str, correct_answer: str
+        self, question: str, before_training_answer: str, correct_answer: str
     ) -> bool:
         """Train the model on a correction using Adaptible's training pipeline.
 
         Args:
             question: The question that was asked.
-            old_answer: The model's original (incorrect) response.
+            before_training_answer: The model's original (incorrect) response.
             correct_answer: The correct answer to train on.
 
         Returns:
@@ -182,7 +189,7 @@ class AutonomousNode:
             InteractionHistory(
                 idx=0,
                 user_input=question,
-                llm_response=old_answer,
+                llm_response=before_training_answer,
                 reviewed=False,
                 timestamp=0.0,
             ),
@@ -214,89 +221,255 @@ class AutonomousNode:
             snippet = result.get("snippet", result.get("description", ""))
             url = result.get("url", result.get("link", ""))
 
-            if not snippet:
+            if not snippet or len(snippet) < 50:
                 continue
 
-            # Ask the model to extract factual claims
-            extraction_prompt = f"""From this search result about "{topic}", extract 1-2 specific factual claims as question-answer pairs.
+            # Few-shot examples to teach the format
+            extraction_prompt = textwrap.dedent(
+                f"""
+            You are responsible for parsing factual information from an arbitrary source. Here are some rules for you to follow:
+            
+                * The factual information you provide must, by nature, state a fact.
+                * If there are no facts to discern from the media provided, simply say "NO CLAIM".
+                * If there is factual information to extract, present it in the form of "Q: <question>\nA: <answer>".
 
-Title: {title}
-Content: {snippet}
+            <EXAMPLES>
+            Here are some examples for you to get the gist of the task from:
 
-Format each as:
-Q: [specific factual question]
-A: [factual answer from the content]
+            Example 1:
+            Title: Apple Reports Q4 2024 Earnings
+            Content: Apple Inc. reported revenue of $94.9 billion for Q4 2024, up 6% year over year.
+            Q: What was Apple's Q4 2024 revenue?
+            A: Apple reported revenue of $94.9 billion for Q4 2024.
 
-Only extract claims that are clearly stated in the content. Be specific and concise."""
+            Example 2:
+            Title: NASA Mars Mission Update
+            Content: NASA's Perseverance rover has collected 23 rock samples from Mars since landing in 2021.
+            Q: How many rock samples has NASA's Perseverance rover collected?
+            A: Perseverance has collected 23 rock samples from Mars.
 
-            response = self._ask(extraction_prompt)
+            Example 3:
+            Title: World Leaders Meet at Summit
+            Content: Leaders from 50 countries gathered in Geneva to discuss climate policy and economic cooperation.
+            Q: Where did the world leaders meet?
+            A: Leaders from 50 countries gathered in Geneva.
 
-            # Parse Q&A pairs from response
-            lines = response.strip().split("\n")
-            current_q = None
-            for line in lines:
+            Example 4:
+            Title: Alakazam is coming to you
+            Content: Sometimes the wildest things aren't so out-of-reach :)
+            Q: NO CLAIM
+
+            </EXAMPLES>
+            
+            Now extract from this:
+            Title: {title}
+            Content: {snippet}
+            Q:
+            """
+            ).strip()
+
+            grounded_response = self._ask(extraction_prompt)
+
+            if "</EXAMPLES>" in grounded_response:
+                grounded_response = grounded_response.split("</EXAMPLES>")[-1].strip()
+
+            # Extract after </think> if present
+            if "</think>" in grounded_response:
+                grounded_response = grounded_response.split("</think>")[-1].strip()
+
+            # Skip if model said no claim
+            if "NO CLAIM" in grounded_response.upper():
+                continue
+
+            # Parse Q&A - the prompt ends with "Q:" so response starts with the question
+            # Handle both "Q: question\nA: answer" and "question\nA: answer" formats
+            extracted_question = None
+
+            for line in grounded_response.split("\n"):
                 line = line.strip()
-                if line.startswith("Q:"):
-                    current_q = line[2:].strip()
-                elif line.startswith("A:") and current_q:
-                    answer = line[2:].strip()
-                    if current_q and answer and len(answer) > 5:
+                if not line:
+                    continue
+
+                # First non-empty line is the question (prompt ended with "Q:")
+                if extracted_question is None and line.startswith("Q:"):
+                    # Strip "Q:" prefix if model included it
+                    extracted_question = line[len("Q:") :].strip()
+                if line.startswith("A:"):
+                    extracted_answer = line[len("A:") :].strip()
+                    if extracted_question and extracted_answer:
                         claims.append(
                             Claim(
-                                question=current_q,
-                                answer=answer,
+                                question=extracted_question,
+                                answer=extracted_answer,
                                 source=title,
                                 url=url,
                             )
                         )
-                    current_q = None
+                        break  # Only extract one claim per snippet
 
         return claims
 
-    def _check_belief(self, question: str) -> tuple[str, float]:
+    def _maybe_generate_response_and_score(self, question: str) -> tuple[str, float]:
         """Ask the model what it currently believes about a question.
 
         Returns:
             Tuple of (answer, confidence) where confidence is 0-1.
         """
-        prompt = f"""Answer this question based only on what you know. If you don't know or are uncertain, say "I don't know."
+        prompt = textwrap.dedent(
+            f"""
+        You are an AI agent responsible for responding to a user query with a grounded, factual response. Here are some basic rules to follow:
 
-Question: {question}
+            * You will be provided a user query labeled as "QUERY: <user query>".
+            * You are to provide a response to the user query that satisfies the user intent. For information-seeking queries, you should provide a factually-supported answer based on the content of the user query.
+            * You MUST estimate an estimate of how confident you are that your response is correct and satisfies the user query by providing one the following labels: "HIGH", "MEDIUM", or "LOW". "LOW" == you are completely guessing. "MEDIUM" == you are somewhat sure. "HIGH" == you are confident in your response.
+            * Your answer must be formatted as RESPONSE: <your response>\nCONFIDENCE: <your confidence in your response/your confidence in your ability to answer the user query.
 
-Give a brief, direct answer."""
+        <EXAMPLES>
+        Here are some examples for you to get the gist of the task from:
 
-        response = self._ask(prompt)
+        Example 1:
+        QUERY: How many Pandas are there in the world?
+        RESPONSE: There are 5 million pandas in the world.
+        CONFIDENCE: LOW. I have no idea how many Pandas there are in the world.
 
-        # Estimate confidence based on response
-        response_lower = response.lower()
-        if any(
-            x in response_lower
-            for x in ["i don't know", "uncertain", "not sure", "cannot"]
-        ):
-            confidence = 0.2
-        elif any(x in response_lower for x in ["i think", "probably", "might be"]):
-            confidence = 0.5
+        Example 2:
+        QUERY: Who invented the telephone?
+        RESPONSE: Alexander Graham Bell patented the first telephone.
+        CONFIDENCE: HIGH. I know for a fact that Bell invented the first telephone. I think it was around 1876 that he patented it.
+
+        Example 3:
+        QUERY: How many soccer players play on the field at a time?
+        RESPONSE: 11 per-side so 22 in total.
+        CONFIDENCE: HIGH. Even though there are variant to soccer, such as indoor soccer, where there are fewer than eleven players per side, there was no indication that the user meant anything other than "vanilla" soccer. For "vanilla" soccer, there are always eleven players on the field per side, which sums to 22 in total.
+
+        </EXAMPLES>
+
+        QUERY: {question}
+        RESPONSE: 
+        """
+        ).strip()
+
+        judgement_response = self._ask(prompt)
+
+        if "</EXAMPLES>" in judgement_response:
+            judgement_response = judgement_response.split("</EXAMPLES>")[-1].strip()
+
+        # Extract after </think> if present
+        if "</think>" in judgement_response:
+            judgement_response = judgement_response.split("</think>")[-1].strip()
+
+        matches = re.findall(
+            r"^.*RESPONSE:(.*)CONFIDENCE:(.*)$", judgement_response, re.DOTALL
+        )
+        if matches:
+            response, confidence = matches[0]
         else:
-            confidence = 0.8
+            matches = re.findall(r"^.*RESPONSE:(.*)$", judgement_response, re.DOTALL)
+            response = matches[0]
+            confidence = "NOT FOUND"
+        vizible.blue(f"{response = }")
+        vizible.blue(f"{confidence = }")
 
-        return response, confidence
+        # Parse confidence - just look for the keywords anywhere in response
+        if "LOW" in confidence:
+            confidence_score = 0.3
+        elif "MEDIUM" in confidence:
+            confidence_score = 0.6
+        elif "HIGH" in confidence:
+            confidence_score = 0.9
+        else:
+            confidence_score = 0.5
 
-    def _beliefs_conflict(self, belief: str, new_info: str, question: str) -> bool:
-        """Check if current belief conflicts with new information."""
-        if "i don't know" in belief.lower():
-            return True  # Knowledge gap counts as needing update
+        return response, confidence_score
 
-        prompt = f"""Do these two answers to the same question conflict or contradict each other?
+    def _beliefs_conflict(
+        self, belief: str, new_info: str, question: str, confidence: float
+    ) -> bool:
+        """Check if model's belief matches the ground truth from a verified source.
 
-Question: {question}
+        The key insight: new_info is GROUND TRUTH from a real source.
+        The model's belief should be updated if it doesn't match the source.
+        """
+        # If model has no confidence, it's a knowledge gap - train on it
+        if confidence <= 0.2:
+            return True
 
-Answer 1: {belief}
-Answer 2: {new_info}
+        # Frame this as: does the model's answer match the verified fact?
+        # The SOURCE is ground truth, the model should learn from it
+        prompt = textwrap.dedent(
+            f"""
+        You are a fact-checker. Your job is to compare a potentially-incorrect statement to a known ground truth fact and decide if the statement is supported by the ground truth or not. Here are some basic rules:
+        
+            * A query, which was used to solicit the potentially-incorrect statement, will be labeled as "QUERY".
+            * The factual, ground truth information will be labeled as "VERIFIED SOURCE (ground truth)".
+            * The potentially-incorrect statement will be labeled as "POTENTIALLY-INCORRECT STATEMENT".
+            * If the model's answer contains different information than the verified source, it needs correction.
+            * If the model's answer matches or is consistent with the source, no correction needed.
 
-Reply with only "YES" if they conflict/contradict, or "NO" if they are compatible or say the same thing."""
+        <EXAMPLES>
+        Here are some examples for you to get the gist of how to complete the task:
 
-        response = self._ask(prompt)
-        return "YES" in response.upper()
+        Example 1.
+        QUERY: "What is the captial of France?"
+        VERIFIED SOURCE (ground truth): "The capital of France is Paris."
+        POTENTIALLY-INCORRECT STATEMENT: "Paris is the capital of France."
+        NEEDS CORRECTION: NO
+
+        Example 2:
+        QUERY: "What is the current price of Apple stock?"
+        VERIFIED SOURCE (ground truth): "Apple stock closed at $189.50."
+        POTENTIALLY-INCORRECT STATEMENT: "Apple stock is around $150."
+        NEEDS CORRECTION: YES
+
+        Example 3:
+        QUERY: "Where can I see scores from the latest NFL games?"
+        VERIFIED SOURCE (ground truth): "You can follow scores on Flashscore.com."
+        POTENTIALLY-INCORRECT STATEMENT: "You can follow scores on ESPN or the official website."
+        NEEDS CORRECTION: YES
+
+        </EXAMPLES>
+        Now it's your turn!
+
+        QUERY: {question}
+        VERIFIED SOURCE (ground truth): {new_info}
+        POTENTIALLY-INCORRECT STATEMENT: {belief}
+        NEEDS CORRECTION:
+        """
+        ).strip()
+
+        correction_judgement_response = self._ask(prompt)
+
+        if "</EXAMPLES>" in correction_judgement_response:
+            correction_judgement_response = correction_judgement_response.split(
+                "</EXAMPLES>"
+            )[-1].strip()
+
+        # Extract the part after </think> if present
+        if "</think>" in correction_judgement_response:
+            correction_judgement_response = correction_judgement_response.split(
+                "</think>"
+            )[-1].strip()
+
+        # The response should start with YES or NO directly
+        correction_judgement_response_upper = (
+            correction_judgement_response.strip().upper()
+        )
+        if correction_judgement_response_upper.startswith(
+            "YES"
+        ) or correction_judgement_response_upper.startswith(" YES"):
+            return True
+        if correction_judgement_response_upper.startswith(
+            "NO"
+        ) or correction_judgement_response_upper.startswith(" NO"):
+            return False
+
+        # Fallback: look for YES/NO anywhere
+        if (
+            "YES" in correction_judgement_response_upper
+            and "NO" not in correction_judgement_response_upper
+        ):
+            return True
+        return False
 
     def _pick_topic(self) -> str:
         """Pick a topic to explore."""
@@ -331,7 +504,6 @@ Reply with only "YES" if they conflict/contradict, or "NO" if they are compatibl
         if not search_results:
             result.error = "No search results"
             return result
-
         # Extract claims from search results
         claims = self._extract_claims(search_results, topic)
         result.claims_found = len(claims)
@@ -341,33 +513,48 @@ Reply with only "YES" if they conflict/contradict, or "NO" if they are compatibl
             result.beliefs_checked += 1
 
             # Check current belief
-            current_belief, confidence = self._check_belief(claim.question)
+            maybe_generated_response_before_training, confidence_before_training = (
+                self._maybe_generate_response_and_score(claim.question)
+            )
 
             # Check for conflict
-            if self._beliefs_conflict(current_belief, claim.answer, claim.question):
-                event_type = "new" if confidence < 0.3 else "correction"
+            # if True:
+            if self._beliefs_conflict(
+                maybe_generated_response_before_training,
+                claim.answer,
+                claim.question,
+                confidence_before_training,
+            ):
+                event_type = "new" if confidence_before_training < 0.3 else "correction"
 
                 # Train on the correction
-                success = self._train_on_correction(
-                    claim.question, current_belief, claim.answer
+                _ = self._train_on_correction(
+                    claim.question,
+                    maybe_generated_response_before_training,
+                    claim.answer,
+                )
+                maybe_generated_response_after_training, confidence_after_training = (
+                    self._maybe_generate_response_and_score(claim.question)
                 )
 
-                if success:
-                    result.updates_made += 1
-                    self.state.total_updates += 1
+                result.updates_made += 1
+                self.state.total_updates += 1
 
-                    # Record the learning event
-                    event = LearningEvent(
-                        timestamp=timestamp,
-                        question=claim.question,
-                        old_answer=current_belief if confidence >= 0.3 else None,
-                        new_answer=claim.answer,
-                        source=claim.source,
-                        source_url=claim.url,
-                        event_type=event_type,
-                    )
-                    self.state.learning_history.append(event)
-                    result.events.append(event)
+                # Record the learning event
+                event = LearningEvent(
+                    timestamp=timestamp,
+                    question=claim.question,
+                    before_training_answer=maybe_generated_response_before_training,
+                    after_training_answer=maybe_generated_response_after_training,
+                    source=claim.source,
+                    source_url=claim.url,
+                    event_type=event_type,
+                    verified_answer=claim.answer,
+                    confidence_before_training=confidence_before_training,
+                    confidence_after_training=confidence_after_training,
+                )
+                self.state.learning_history.append(event)
+                result.events.append(event)
 
         # Track explored topic
         if topic not in self.state.topics_explored:
@@ -380,8 +567,7 @@ Reply with only "YES" if they conflict/contradict, or "NO" if they are compatibl
 
     def run(
         self,
-        cycles: int = 10,
-        delay_seconds: float = 1.0,
+        topics: Sequence[str | None],
         verbose: bool = True,
     ) -> Sequence[ExplorationResult]:
         """Run multiple exploration cycles.
@@ -396,13 +582,13 @@ Reply with only "YES" if they conflict/contradict, or "NO" if they are compatibl
         """
         results = []
 
-        for i in range(cycles):
+        for idx, topic in enumerate(topics):
             if verbose:
-                print(f"\n{'='*60}")
-                print(f"Cycle {i+1}/{cycles}")
-                print("=" * 60)
+                vizible.magenta(f"\n{'='*60}")
+                vizible.magenta(f"Cycle {idx+1}/{len(topics)}")
+                vizible.magenta("=" * 60)
 
-            result = self.explore_once()
+            result = self.explore_once(topic)
             results.append(result)
 
             if verbose:
@@ -412,17 +598,14 @@ Reply with only "YES" if they conflict/contradict, or "NO" if they are compatibl
                 print(f"Updates made: {result.updates_made}")
 
                 if result.error:
-                    print(f"Error: {result.error}")
+                    vizible.red(f"Error: {result.error}")
 
                 for event in result.events:
-                    print(f"\n  [{event.event_type.upper()}]")
-                    print(f"  Q: {event.question}")
-                    if event.old_answer:
-                        print(f"  Old: {event.old_answer[:80]}...")
-                    print(f"  New: {event.new_answer[:80]}...")
-
-            if i < cycles - 1:
-                time.sleep(delay_seconds)
+                    vizible.blue(f"\n  [{event.event_type.upper()}]")
+                    vizible.blue(f"  Q: {event.question}")
+                    if event.before_training_answer:
+                        vizible.cyan(f"  Old: {event.before_training_answer}...")
+                    vizible.green(f"  New: {event.after_training_answer}...")
 
         # Mark model as stable after run
         self.model._model_is_stable = True
@@ -440,7 +623,7 @@ Reply with only "YES" if they conflict/contradict, or "NO" if they are compatibl
         """
         results = {}
         for q in questions:
-            answer, confidence = self._check_belief(q)
+            answer, confidence = self._maybe_generate_response_and_score(q)
             results[q] = {
                 "answer": answer,
                 "confidence": confidence,
