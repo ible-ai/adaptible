@@ -1,14 +1,26 @@
 """Evaluation harness for running experiments."""
 
 import dataclasses
+import json
 import random
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from .._classes import InteractionHistory
 from .._llm import StatefulLLM
+from ..db import (
+    Database,
+    Example,
+    Experiment,
+    ExperimentType,
+    Phase,
+    Response,
+    SourceType,
+    TrainingEvent,
+)
 from ..revise import make_collated_training_example
 from .dataset import TriviaDataset
 
@@ -192,10 +204,27 @@ def contains_key_terms(response: str, key_terms: list[str]) -> bool:
 class EvaluationHarness:
     """Runs evaluation experiments on a dataset."""
 
-    def __init__(self, model: StatefulLLM | None = None):
-        """Initialize harness with optional pre-loaded model."""
+    def __init__(
+        self,
+        model: StatefulLLM | None = None,
+        db: Database | None = None,
+        db_path: Path | str | None = None,
+    ):
+        """Initialize harness with optional pre-loaded model and database.
+
+        Args:
+            model: Pre-loaded StatefulLLM. If None, will be loaded on first use.
+            db: Pre-initialized Database. If None, will be created using db_path.
+            db_path: Path to SQLite database. If None, uses default location.
+        """
         self._model = model
         self._model_loaded = model is not None
+        if db is not None:
+            self._db = db
+        elif db_path is not None:
+            self._db = Database(db_path)
+        else:
+            self._db = Database()  # Use default path
 
     @property
     def model(self) -> StatefulLLM:
@@ -220,6 +249,9 @@ class EvaluationHarness:
         2. Split into train/holdout sets
         3. Train on training items sequentially
         4. Get post-training responses for all items
+
+        All results are persisted to the database in addition to being
+        returned as an EvaluationResult.
         """
         if config is None:
             config = EvaluationConfig()
@@ -230,6 +262,30 @@ class EvaluationHarness:
             dataset_name=dataset.name,
             timestamp=datetime.now().isoformat(),
         )
+
+        # Create experiment record in database
+        experiment = Experiment(
+            id=None,
+            name=config.name,
+            experiment_type=ExperimentType.EVAL,
+            config_json=json.dumps(
+                {
+                    "name": config.name,
+                    "training_iterations": config.training_iterations,
+                    "epochs_per_call": config.epochs_per_call,
+                    "shuffle": config.shuffle,
+                    "seed": config.seed,
+                    "train_ratio": config.train_ratio,
+                    "max_tokens": config.max_tokens,
+                    "dataset_name": dataset.name,
+                    "dataset_version": dataset.version,
+                }
+            ),
+            model_checkpoint=None,
+            started_at=datetime.now(),
+            completed_at=None,
+        )
+        experiment_id = self._db.insert_experiment(experiment)
 
         # Prepare item ordering
         indices = list(range(len(dataset)))
@@ -245,13 +301,36 @@ class EvaluationHarness:
             print(f"Dataset: {dataset.name} ({len(dataset)} items)")
             print(f"Train: {train_count}, Holdout: {len(dataset) - train_count}")
             print(f"Config: {config.name}")
+            print(f"Experiment ID: {experiment_id}")
             print()
+
+        # Insert all examples into database and map item_id -> example_id
+        example_ids: dict[str, int] = {}
+        for item in dataset:
+            db_example = Example(
+                id=None,
+                canonical_id=item.id,  # Use the trivia item ID as canonical
+                question=item.question,
+                ground_truth_answer=item.correct_answer,
+                key_terms=item.key_terms if item.key_terms else None,
+                category=item.category,
+                difficulty=item.difficulty,
+                source_type=SourceType.STATIC_TRIVIA,
+                source_url=None,
+                source_title=None,
+                valid_at=None,  # Static trivia is timeless
+                created_at=None,
+            )
+            example_ids[item.id] = self._db.insert_example(db_example)
 
         # Phase 1: Baseline inference
         if verbose:
             print("=" * 60)
             print("PHASE 1: Baseline Inference")
             print("=" * 60)
+
+        # Get effective max tokens (model is lazy-loaded here)
+        effective_max_tokens = config.max_tokens or self.model._max_tokens
 
         item_results: dict[str, ItemResult] = {}
         for i, idx in enumerate(indices):
@@ -265,6 +344,10 @@ class EvaluationHarness:
             initial_clean = strip_think_tags(initial_raw)
             initial_has_terms = contains_key_terms(initial_clean, item.key_terms)
 
+            # Estimate token count and truncation
+            initial_token_count = len(self.model._tokenizer.encode(initial_raw or ""))
+            initial_truncated = initial_token_count >= effective_max_tokens - 1
+
             item_result = ItemResult(
                 item_id=item.id,
                 question=item.question,
@@ -276,6 +359,22 @@ class EvaluationHarness:
                 was_trained=(idx in train_indices),
             )
             item_results[item.id] = item_result
+
+            # Record baseline response in database
+            baseline_response = Response(
+                id=None,
+                example_id=example_ids[item.id],
+                experiment_id=experiment_id,
+                response_text=initial_clean,
+                response_raw=initial_raw or "",
+                confidence=None,
+                phase=Phase.BASELINE,
+                created_at=None,
+                token_count=initial_token_count,
+                max_tokens=effective_max_tokens,
+                truncated=initial_truncated,
+            )
+            self._db.insert_response(baseline_response)
 
             if verbose:
                 status = "✓" if initial_has_terms else "✗"
@@ -316,6 +415,17 @@ class EvaluationHarness:
                 self.model._train(example, verbose=False)
             item_result.training_time_seconds = time.time() - train_start
 
+            # Record training event in database
+            training_event = TrainingEvent(
+                id=None,
+                example_id=example_ids[item.id],
+                experiment_id=experiment_id,
+                training_iterations=config.training_iterations,
+                training_time_seconds=item_result.training_time_seconds,
+                created_at=None,
+            )
+            self._db.insert_training_event(training_event)
+
             if verbose:
                 print(f"       Trained ({item_result.training_time_seconds:.1f}s)")
 
@@ -338,9 +448,29 @@ class EvaluationHarness:
             post_clean = strip_think_tags(post_raw)
             post_has_terms = contains_key_terms(post_clean, item.key_terms)
 
+            # Estimate token count and truncation
+            post_token_count = len(self.model._tokenizer.encode(post_raw or ""))
+            post_truncated = post_token_count >= effective_max_tokens - 1
+
             item_result.post_response = post_clean
             item_result.post_response_raw = post_raw or ""
             item_result.post_has_key_terms = post_has_terms
+
+            # Record post-training response in database
+            post_response = Response(
+                id=None,
+                example_id=example_ids[item.id],
+                experiment_id=experiment_id,
+                response_text=post_clean,
+                response_raw=post_raw or "",
+                confidence=None,
+                phase=Phase.POST_TRAINING,
+                created_at=None,
+                token_count=post_token_count,
+                max_tokens=effective_max_tokens,
+                truncated=post_truncated,
+            )
+            self._db.insert_response(post_response)
 
             if verbose:
                 was = "✓" if item_result.initial_has_key_terms else "✗"
@@ -351,6 +481,9 @@ class EvaluationHarness:
         # Compile results
         result.items = list(item_results.values())
         result.total_time_seconds = time.time() - start_time
+
+        # Mark experiment as completed
+        self._db.complete_experiment(experiment_id)
 
         self.model._model_is_stable = True
 
@@ -365,5 +498,12 @@ class EvaluationHarness:
             print(f"Train improvement rate: {result.train_improvement_rate:.1%}")
             print(f"Train retention rate: {result.train_retention_rate:.1%}")
             print(f"Holdout accuracy: {result.holdout_accuracy:.1%}")
+            print()
+            print(f"Results saved to database (experiment_id={experiment_id})")
 
         return result
+
+    @property
+    def db(self) -> Database:
+        """Access the database for queries."""
+        return self._db
