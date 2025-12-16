@@ -31,7 +31,7 @@ from ..db import (
     TrainingEvent,
     canonical_id_for_question,
 )
-from ..revise import make_collated_training_example
+from ..revise import clean_model_response, make_collated_training_example
 
 
 @dataclasses.dataclass
@@ -229,10 +229,8 @@ class AutonomousNode:
             valid_revision, interactions, self.model._tokenizer
         )
 
-        # Train for the configured number of iterations
-        calls = self.training_iterations // self._epochs_per_call
-        for _ in range(calls):
-            self.model._train(example, verbose=False)
+        # Train using the shared method
+        self.model.train_on_example(example, iterations=self.training_iterations)
 
         return True
 
@@ -295,13 +293,7 @@ class AutonomousNode:
             ).strip()
 
             grounded_response = self._ask(extraction_prompt)
-
-            if "</EXAMPLES>" in grounded_response:
-                grounded_response = grounded_response.split("</EXAMPLES>")[-1].strip()
-
-            # Extract after </think> if present
-            if "</think>" in grounded_response:
-                grounded_response = grounded_response.split("</think>")[-1].strip()
+            grounded_response = clean_model_response(grounded_response)
 
             # Skip if model said no claim
             if "NO CLAIM" in grounded_response.upper():
@@ -380,13 +372,7 @@ class AutonomousNode:
         # Even though there are variant to soccer, such as indoor soccer, where there are fewer than eleven players per side, there was no indication that the user meant anything other than "vanilla" soccer. For "vanilla" soccer, there are always eleven players on the field per side, which sums to 22 in total.
 
         judgement_response = self._ask(prompt)
-
-        if "</EXAMPLES>" in judgement_response:
-            judgement_response = judgement_response.split("</EXAMPLES>")[-1].strip()
-
-        # Extract after </think> if present
-        if "</think>" in judgement_response:
-            judgement_response = judgement_response.split("</think>")[-1].strip()
+        judgement_response = clean_model_response(judgement_response)
 
         matches = re.findall(
             r"^.*RESPONSE:(.*)CONFIDENCE:(.*)$", judgement_response, re.DOTALL
@@ -475,17 +461,7 @@ class AutonomousNode:
         ).strip()
 
         correction_judgement_response = self._ask(prompt)
-
-        if "</EXAMPLES>" in correction_judgement_response:
-            correction_judgement_response = correction_judgement_response.split(
-                "</EXAMPLES>"
-            )[-1].strip()
-
-        # Extract the part after </think> if present
-        if "</think>" in correction_judgement_response:
-            correction_judgement_response = correction_judgement_response.split(
-                "</think>"
-            )[-1].strip()
+        correction_judgement_response = clean_model_response(correction_judgement_response)
 
         # The response should start with YES or NO directly
         correction_judgement_response_upper = (

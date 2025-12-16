@@ -21,7 +21,7 @@ from ..db import (
     SourceType,
     TrainingEvent,
 )
-from ..revise import make_collated_training_example
+from ..revise import make_collated_training_example, strip_think_tags
 from .dataset import TriviaDataset
 
 
@@ -184,15 +184,6 @@ class EvaluationResult:
                 for item in self.items
             ],
         }
-
-
-def strip_think_tags(response: str | None) -> str:
-    """Strip <think>...</think> tags and content from model response."""
-    if response is None:
-        return ""
-    cleaned = re.sub(r".*</think>", "", response, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = re.sub(r"</think>", "", cleaned, flags=re.IGNORECASE)
-    return cleaned.strip()
 
 
 def contains_key_terms(response: str, key_terms: list[str]) -> bool:
@@ -408,11 +399,9 @@ class EvaluationHarness:
                 valid_revision, interactions, self.model._tokenizer
             )
 
-            # Train
+            # Train using the shared method
             train_start = time.time()
-            calls = config.training_iterations // config.epochs_per_call
-            for _ in range(calls):
-                self.model._train(example, verbose=False)
+            self.model.train_on_example(example, iterations=config.training_iterations)
             item_result.training_time_seconds = time.time() - train_start
 
             # Record training event in database

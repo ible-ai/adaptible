@@ -139,8 +139,13 @@ def validate_revision_response(
             )
 
 
-def strip_think_tags(text: str) -> str:
+def strip_think_tags(text: str | None) -> str:
     """Remove <think>...</think> tags and their content from text.
+
+    Handles multiple formats:
+    - Full tags: <think>content</think>
+    - Partial/unclosed: everything before </think>
+    - Case insensitive
 
     Args:
         text: Input text potentially containing think tags.
@@ -148,9 +153,48 @@ def strip_think_tags(text: str) -> str:
     Returns:
         Text with think tags and their content removed.
     """
-    # Remove <think>...</think> blocks (including multiline)
-    cleaned = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    if text is None:
+        return ""
+    # First try to remove complete <think>...</think> blocks
+    cleaned = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Also handle cases where only </think> appears (partial tag)
+    cleaned = re.sub(r".*</think>\s*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
     return cleaned.strip()
+
+
+def strip_examples_tags(text: str | None) -> str:
+    """Remove content before </EXAMPLES> closing tag.
+
+    Used for few-shot prompts where the model may echo examples.
+
+    Args:
+        text: Input text potentially containing examples tags.
+
+    Returns:
+        Text after </EXAMPLES> tag, or original if not found.
+    """
+    if text is None:
+        return ""
+    if "</EXAMPLES>" in text:
+        return text.split("</EXAMPLES>")[-1].strip()
+    return text.strip()
+
+
+def clean_model_response(text: str | None) -> str:
+    """Clean model response by removing think tags and examples echoing.
+
+    Convenience function that applies both strip_think_tags and
+    strip_examples_tags in the correct order.
+
+    Args:
+        text: Raw model response.
+
+    Returns:
+        Cleaned response text.
+    """
+    cleaned = strip_examples_tags(text)
+    cleaned = strip_think_tags(cleaned)
+    return cleaned
 
 
 def _serialize_interactions_to_string(

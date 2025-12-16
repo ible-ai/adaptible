@@ -436,6 +436,36 @@ class StatefulLLM:
         if verbose:
             vizible.cyan(f"{losses = }")
 
+    def train_on_example(
+        self,
+        example: TrainingExample,
+        iterations: int = 25,
+        verbose: bool = False,
+        save_checkpoint: bool = False,
+    ) -> None:
+        """Train on a pre-constructed training example for N iterations.
+
+        This is a convenience wrapper around _train() that handles the
+        iteration loop and optional checkpointing.
+
+        Args:
+            example: Pre-constructed TrainingExample with input, label, and mask.
+            iterations: Total number of training iterations (epochs * calls).
+            verbose: Enable verbose logging.
+            save_checkpoint: Whether to save the model after training.
+        """
+        self._model_is_stable = False
+        calls = iterations // self._epochs
+        for _ in range(calls):
+            self._train(example, verbose=verbose)
+
+        if save_checkpoint and self._model_path is not None:
+            vizible.green(f"Saving model to {self._model_path}")
+            self._model_path.parent.mkdir(parents=True, exist_ok=True)
+            save_model(self._model_path, self._model)
+
+        self._model_is_stable = True
+
     def self_correct_and_train(
         self,
         interaction_history: List[InteractionHistory],
