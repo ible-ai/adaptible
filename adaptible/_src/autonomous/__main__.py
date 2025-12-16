@@ -22,10 +22,12 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import vizible
+import time
 from absl import app, flags
 from ddgs import DDGS
 
 from .node import AutonomousNode
+from .._llm import MODEL_PATH
 
 # Specific factual queries - use "current" or 2025 to ensure we're testing
 # information beyond the model's training cutoff
@@ -58,6 +60,9 @@ _TOPICS = flags.DEFINE_multi_string(
 _OUTPUT_PATH = flags.DEFINE_string(
     "output_path", "outputs/autonomous/state.json", "Path to save node state"
 )
+_MODEL_PATH = flags.DEFINE_string(
+    "model_path", str(MODEL_PATH), "Path to save node state"
+)
 
 
 def main(_):
@@ -74,11 +79,12 @@ def main(_):
             List of search results with title, snippet, and url.
         """
         to_return = []
+        time.sleep(1)
         news_results = ddgs_client.news(query, max_results=2)
+        time.sleep(1)
         text_results = ddgs_client.text(query, max_results=2)
         seen_urls = set()
         for result in [*news_results, *text_results]:
-            vizible.blue(", ".join(list(result.keys())))
             result = {**result}
             url = result.get("href") or result.get("url")
             if url in seen_urls:
@@ -99,6 +105,7 @@ def main(_):
         search_fn=search,
         state_path=_OUTPUT_PATH.value,
         seed_topics=_TOPICS.value,
+        model_path=_MODEL_PATH.value,
     )
 
     # Show initial stats

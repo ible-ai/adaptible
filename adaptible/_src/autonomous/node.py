@@ -13,13 +13,24 @@ import textwrap
 import random
 import re
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, List
 import vizible
 
 from .._classes import InteractionHistory, TrainingExample
 from .._llm import MAX_TOKENS, StatefulLLM, MODEL_PATH
+from ..db import (
+    Database,
+    Example,
+    Experiment,
+    ExperimentType,
+    Phase,
+    Response,
+    SourceType,
+    TrainingEvent,
+    canonical_id_for_question,
+)
 from ..revise import make_collated_training_example
 
 
@@ -121,11 +132,13 @@ class AutonomousNode:
         self,
         search_fn: Callable[[str], Sequence[Mapping[str, Any]]],
         seed_topics: Sequence[str],
-        model: StatefulLLM | None = None,
-        state_path: Path | str = Path("autonomous_node_state.json"),
-        model_path: Path | None = MODEL_PATH,
-        training_iterations: int = 25,
+        state_path: str,
         max_tokens: int = MAX_TOKENS,
+        model_path: str | Path = MODEL_PATH,
+        model: StatefulLLM | None = None,
+        training_iterations: int = 25,
+        db: Database | None = None,
+        db_path: Path | str | None = None,
     ):
         """Initialize the autonomous learning node.
 
@@ -137,10 +150,12 @@ class AutonomousNode:
             state_path: Where to persist node state between runs.
             training_iterations: Number of training iterations per correction.
             max_tokens: Max tokens for generation. Must be high enough for <think> tags.
+            db: Pre-initialized Database. If None, will be created using db_path.
+            db_path: Path to SQLite database. If None, uses default location.
         """
         self.search = search_fn
         self._model = model
-        self._model_path = model_path
+        self._model_path = Path(model_path)
         self.state_path = Path(state_path)
         self.state = NodeState.load(self.state_path)
         self.training_iterations = training_iterations
@@ -148,11 +163,22 @@ class AutonomousNode:
         self.seed_topics = seed_topics
         self._max_tokens = max_tokens
 
+        # Initialize database
+        if db is not None:
+            self._db = db
+        elif db_path is not None:
+            self._db = Database(db_path)
+        else:
+            self._db = Database()  # Use default path
+
+        # Track current experiment (created on first run)
+        self._current_experiment_id: int | None = None
+
     @property
     def model(self) -> StatefulLLM:
         """Lazy-load model on first access."""
         if self._model is None:
-            print("Loading model...")
+            vizible.cyan("Loading model from {self._model_path}")
             self._model = StatefulLLM(model_path=self._model_path)
             self._model._model_is_stable = True
         return self._model
@@ -226,12 +252,13 @@ class AutonomousNode:
 
             # Few-shot examples to teach the format
             extraction_prompt = textwrap.dedent(
-                f"""
+                rf"""
             You are responsible for parsing factual information from an arbitrary source. Here are some rules for you to follow:
             
                 * The factual information you provide must, by nature, state a fact.
                 * If there are no facts to discern from the media provided, simply say "NO CLAIM".
                 * If there is factual information to extract, present it in the form of "Q: <question>\nA: <answer>".
+                * Don't get lost in thought!
 
             <EXAMPLES>
             Here are some examples for you to get the gist of the task from:
@@ -257,14 +284,13 @@ class AutonomousNode:
             Example 4:
             Title: Alakazam is coming to you
             Content: Sometimes the wildest things aren't so out-of-reach :)
-            Q: NO CLAIM
+            NO CLAIM
 
             </EXAMPLES>
             
             Now extract from this:
             Title: {title}
             Content: {snippet}
-            Q:
             """
             ).strip()
 
@@ -316,13 +342,15 @@ class AutonomousNode:
             Tuple of (answer, confidence) where confidence is 0-1.
         """
         prompt = textwrap.dedent(
-            f"""
+            rf"""
         You are an AI agent responsible for responding to a user query with a grounded, factual response. Here are some basic rules to follow:
 
             * You will be provided a user query labeled as "QUERY: <user query>".
             * You are to provide a response to the user query that satisfies the user intent. For information-seeking queries, you should provide a factually-supported answer based on the content of the user query.
             * You MUST estimate an estimate of how confident you are that your response is correct and satisfies the user query by providing one the following labels: "HIGH", "MEDIUM", or "LOW". "LOW" == you are completely guessing. "MEDIUM" == you are somewhat sure. "HIGH" == you are confident in your response.
             * Your answer must be formatted as RESPONSE: <your response>\nCONFIDENCE: <your confidence in your response/your confidence in your ability to answer the user query.
+            * Don't get lost in thought!
+            * Do not forget to provide an explicit "CONFIDENCE" rating!
 
         <EXAMPLES>
         Here are some examples for you to get the gist of the task from:
@@ -330,24 +358,26 @@ class AutonomousNode:
         Example 1:
         QUERY: How many Pandas are there in the world?
         RESPONSE: There are 5 million pandas in the world.
-        CONFIDENCE: LOW. I have no idea how many Pandas there are in the world.
+        CONFIDENCE: LOW
 
         Example 2:
         QUERY: Who invented the telephone?
         RESPONSE: Alexander Graham Bell patented the first telephone.
-        CONFIDENCE: HIGH. I know for a fact that Bell invented the first telephone. I think it was around 1876 that he patented it.
+        CONFIDENCE: HIGH
 
         Example 3:
         QUERY: How many soccer players play on the field at a time?
         RESPONSE: 11 per-side so 22 in total.
-        CONFIDENCE: HIGH. Even though there are variant to soccer, such as indoor soccer, where there are fewer than eleven players per side, there was no indication that the user meant anything other than "vanilla" soccer. For "vanilla" soccer, there are always eleven players on the field per side, which sums to 22 in total.
+        CONFIDENCE: HIGH
 
         </EXAMPLES>
 
         QUERY: {question}
-        RESPONSE: 
         """
         ).strip()
+        #  I have no idea how many Pandas there are in the world.
+        #  I know for a fact that Bell invented the first telephone. I think it was around 1876 that he patented it.
+        # Even though there are variant to soccer, such as indoor soccer, where there are fewer than eleven players per side, there was no indication that the user meant anything other than "vanilla" soccer. For "vanilla" soccer, there are always eleven players on the field per side, which sums to 22 in total.
 
         judgement_response = self._ask(prompt)
 
@@ -363,27 +393,34 @@ class AutonomousNode:
         )
         if matches:
             response, confidence = matches[0]
-        else:
-            matches = re.findall(r"^.*RESPONSE:(.*)$", judgement_response, re.DOTALL)
+        elif matches := re.findall(r"^.*RESPONSE:(.*)$", judgement_response, re.DOTALL):
             response = matches[0]
             confidence = "NOT FOUND"
-        vizible.blue(f"{response = }")
-        vizible.blue(f"{confidence = }")
+        else:
+            response = judgement_response
+            confidence = "ERROR"
+        print(flush=True)
+        vizible.cyan(f"{response = }")
+        vizible.cyan(f"{confidence = }")
 
         # Parse confidence - just look for the keywords anywhere in response
         if "LOW" in confidence:
-            confidence_score = 0.3
+            confidence_score = 0.0
         elif "MEDIUM" in confidence:
-            confidence_score = 0.6
+            confidence_score = 0.5
         elif "HIGH" in confidence:
-            confidence_score = 0.9
+            confidence_score = 1.0
         else:
             confidence_score = 0.5
 
         return response, confidence_score
 
     def _beliefs_conflict(
-        self, belief: str, new_info: str, question: str, confidence: float
+        self,
+        initial_response: str,
+        ground_truth_information: str,
+        user_query: str,
+        initial_confidence: float,
     ) -> bool:
         """Check if model's belief matches the ground truth from a verified source.
 
@@ -391,13 +428,13 @@ class AutonomousNode:
         The model's belief should be updated if it doesn't match the source.
         """
         # If model has no confidence, it's a knowledge gap - train on it
-        if confidence <= 0.2:
+        if initial_confidence <= 0.2:
             return True
 
         # Frame this as: does the model's answer match the verified fact?
         # The SOURCE is ground truth, the model should learn from it
         prompt = textwrap.dedent(
-            f"""
+            rf"""
         You are a fact-checker. Your job is to compare a potentially-incorrect statement to a known ground truth fact and decide if the statement is supported by the ground truth or not. Here are some basic rules:
         
             * A query, which was used to solicit the potentially-incorrect statement, will be labeled as "QUERY".
@@ -405,6 +442,7 @@ class AutonomousNode:
             * The potentially-incorrect statement will be labeled as "POTENTIALLY-INCORRECT STATEMENT".
             * If the model's answer contains different information than the verified source, it needs correction.
             * If the model's answer matches or is consistent with the source, no correction needed.
+            * Don't get lost in thought!
 
         <EXAMPLES>
         Here are some examples for you to get the gist of how to complete the task:
@@ -430,10 +468,9 @@ class AutonomousNode:
         </EXAMPLES>
         Now it's your turn!
 
-        QUERY: {question}
-        VERIFIED SOURCE (ground truth): {new_info}
-        POTENTIALLY-INCORRECT STATEMENT: {belief}
-        NEEDS CORRECTION:
+        QUERY: {user_query}
+        VERIFIED SOURCE (ground truth): {ground_truth_information}
+        POTENTIALLY-INCORRECT STATEMENT: {initial_response}
         """
         ).strip()
 
@@ -478,6 +515,28 @@ class AutonomousNode:
             return random.choice(self.state.topics_explored[-10:])
         return random.choice(self.seed_topics)
 
+    def _ensure_experiment(self) -> int:
+        """Ensure we have an experiment ID, creating one if needed."""
+        if self._current_experiment_id is None:
+            experiment = Experiment(
+                id=None,
+                name=f"autonomous_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                experiment_type=ExperimentType.AUTONOMOUS,
+                config_json=json.dumps(
+                    {
+                        "training_iterations": self.training_iterations,
+                        "epochs_per_call": self._epochs_per_call,
+                        "max_tokens": self._max_tokens,
+                        "seed_topics": list(self.seed_topics),
+                    }
+                ),
+                model_checkpoint=str(self._model_path),
+                started_at=datetime.now(),
+                completed_at=None,
+            )
+            self._current_experiment_id = self._db.insert_experiment(experiment)
+        return self._current_experiment_id
+
     def explore_once(self, topic: str | None = None) -> ExplorationResult:
         """Run one exploration cycle.
 
@@ -491,7 +550,11 @@ class AutonomousNode:
             topic = self._pick_topic()
 
         timestamp = datetime.now().isoformat()
+        today = date.today()
         result = ExplorationResult(timestamp=timestamp, topic=topic)
+
+        # Ensure we have an experiment ID for database tracking
+        experiment_id = self._ensure_experiment()
 
         # Search for information
         try:
@@ -517,6 +580,43 @@ class AutonomousNode:
                 self._maybe_generate_response_and_score(claim.question)
             )
 
+            # Insert example into database (web-scraped claims are date-specific)
+            db_example = Example(
+                id=None,
+                canonical_id=canonical_id_for_question(claim.question),
+                question=claim.question,
+                ground_truth_answer=claim.answer,
+                key_terms=None,  # Web scrapes don't have key terms
+                category=None,
+                difficulty=None,
+                source_type=SourceType.WEB_SCRAPE,
+                source_url=claim.url,
+                source_title=claim.source,
+                valid_at=today,  # Ground truth valid for today
+                created_at=None,
+            )
+            example_id = self._db.insert_example(db_example)
+
+            # Estimate token count and truncation for baseline
+            baseline_token_count = len(self.model._tokenizer.encode(maybe_generated_response_before_training or ""))
+            baseline_truncated = baseline_token_count >= self._max_tokens - 1
+
+            # Record baseline response
+            baseline_response = Response(
+                id=None,
+                example_id=example_id,
+                experiment_id=experiment_id,
+                response_text=maybe_generated_response_before_training,
+                response_raw=maybe_generated_response_before_training,
+                confidence=confidence_before_training,
+                phase=Phase.BASELINE,
+                created_at=None,
+                token_count=baseline_token_count,
+                max_tokens=self._max_tokens,
+                truncated=baseline_truncated,
+            )
+            self._db.insert_response(baseline_response)
+
             # Check for conflict
             # if True:
             if self._beliefs_conflict(
@@ -525,22 +625,56 @@ class AutonomousNode:
                 claim.question,
                 confidence_before_training,
             ):
-                event_type = "new" if confidence_before_training < 0.3 else "correction"
+                event_type = "new" if confidence_before_training < 0.2 else "correction"
 
                 # Train on the correction
+                train_start = datetime.now()
                 _ = self._train_on_correction(
                     claim.question,
                     maybe_generated_response_before_training,
                     claim.answer,
                 )
+                training_time = (datetime.now() - train_start).total_seconds()
+
+                # Record training event
+                training_event = TrainingEvent(
+                    id=None,
+                    example_id=example_id,
+                    experiment_id=experiment_id,
+                    training_iterations=self.training_iterations,
+                    training_time_seconds=training_time,
+                    created_at=None,
+                )
+                self._db.insert_training_event(training_event)
+
                 maybe_generated_response_after_training, confidence_after_training = (
                     self._maybe_generate_response_and_score(claim.question)
                 )
 
+                # Estimate token count and truncation for post-training
+                post_token_count = len(self.model._tokenizer.encode(maybe_generated_response_after_training or ""))
+                post_truncated = post_token_count >= self._max_tokens - 1
+
+                # Record post-training response
+                post_response = Response(
+                    id=None,
+                    example_id=example_id,
+                    experiment_id=experiment_id,
+                    response_text=maybe_generated_response_after_training,
+                    response_raw=maybe_generated_response_after_training,
+                    confidence=confidence_after_training,
+                    phase=Phase.POST_TRAINING,
+                    created_at=None,
+                    token_count=post_token_count,
+                    max_tokens=self._max_tokens,
+                    truncated=post_truncated,
+                )
+                self._db.insert_response(post_response)
+
                 result.updates_made += 1
                 self.state.total_updates += 1
 
-                # Record the learning event
+                # Record the learning event (legacy state.json format)
                 event = LearningEvent(
                     timestamp=timestamp,
                     question=claim.question,
@@ -553,6 +687,17 @@ class AutonomousNode:
                     confidence_before_training=confidence_before_training,
                     confidence_after_training=confidence_after_training,
                 )
+                if (
+                    maybe_generated_response_before_training
+                    or maybe_generated_response_after_training
+                ):
+                    vizible.blue(f"  Q: {event.question}")
+                    vizible.cyan(
+                        f"  Old: {maybe_generated_response_before_training}..."
+                    )
+                    vizible.green(
+                        f"  New: {maybe_generated_response_after_training}..."
+                    )
                 self.state.learning_history.append(event)
                 result.events.append(event)
 
@@ -560,7 +705,7 @@ class AutonomousNode:
         if topic not in self.state.topics_explored:
             self.state.topics_explored.append(topic)
 
-        # Save state
+        # Save state (legacy format)
         self.state.save(self.state_path)
 
         return result
@@ -607,10 +752,21 @@ class AutonomousNode:
                         vizible.cyan(f"  Old: {event.before_training_answer}...")
                     vizible.green(f"  New: {event.after_training_answer}...")
 
+        # Mark experiment as completed
+        if self._current_experiment_id is not None:
+            self._db.complete_experiment(self._current_experiment_id)
+            if verbose:
+                print(f"\nResults saved to database (experiment_id={self._current_experiment_id})")
+
         # Mark model as stable after run
         self.model._model_is_stable = True
 
         return results
+
+    @property
+    def db(self) -> Database:
+        """Access the database for queries."""
+        return self._db
 
     def quiz(self, questions: Sequence[str]) -> Mapping[str, Mapping[str, Any]]:
         """Quiz the node on a set of questions.

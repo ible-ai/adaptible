@@ -1,5 +1,6 @@
 """Stateful LLM."""
 
+import collections
 import functools
 import threading
 from pathlib import Path
@@ -34,9 +35,7 @@ from .revise import (
 _MODEL_NAME = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B"
 # _MODEL_NAME = "mlx-community/DeepSeek-R1-Qwen3-0528-8B-4bit-AWQ"
 MAX_TOKENS = 2048
-MODEL_PATH = Path(
-    "/Users/erichansen/Code/public/adaptible-1/adaptible/outputs/autonomous/checkpoint"
-)
+MODEL_PATH = Path("outputs/autonomous/checkpoint")
 # MAX_TOKENS = 8192
 _LEARNING_RATE = 5e-5
 _EPOCHS = 5
@@ -108,6 +107,7 @@ def _load(
     """
     if model_path is not None and model_path.exists():
         _, wrapped_tokenizer = load(model_name)
+        print("Loading model from", model_path)
         model = load_model(model_path)
     else:
         model, wrapped_tokenizer = load(model_name)
@@ -230,8 +230,10 @@ class StatefulLLM:
         Returns:
             Model-generated response.
         """
+        print(flush=True)
         vizible.blue("Generating response for:")
         vizible.blue(prompt)
+        unique_lines_generated = collections.defaultdict(int)
         message = {"role": "user", "content": prompt}
         if max_tokens is None:
             max_tokens = self._max_tokens
@@ -245,7 +247,7 @@ class StatefulLLM:
         # Use streaming generation internally to enable loop detection
         generated_tokens = []
         full_response = []
-        loop_detected = False
+        current_line = []
 
         for response in stream_generate(
             model=self._model,
@@ -254,6 +256,17 @@ class StatefulLLM:
             max_tokens=max_tokens,
         ):
             print(response.text, end="", flush=True)
+            current_line.append(response.text)
+            if "\n" in response.text:
+                most_recent_line = "".join(current_line)
+                current_line = []
+                if most_recent_line:
+                    if unique_lines_generated[most_recent_line] > 1:
+                        vizible.red(
+                            f"⚠️  Loop detected! Stopping generation early. Found: {most_recent_line}"
+                        )
+                        break
+                    unique_lines_generated[most_recent_line] += 1
             # Track generated tokens
             # Note: response.token is the most recent token ID
             if hasattr(response, "token"):
@@ -265,11 +278,10 @@ class StatefulLLM:
                     self._loop_detection_sequence_length,
                     self._loop_detection_max_repetitions,
                 ):
-                    vizible.red(f"⚠️  Loop detected! Stopping generation early.")
+                    vizible.red("⚠️  Loop detected! Stopping generation early.")
                     vizible.red(
                         f"   Generated {len(generated_tokens)} tokens before loop detection."
                     )
-                    loop_detected = True
                     break
 
             full_response.append(response.text)
@@ -322,7 +334,6 @@ class StatefulLLM:
                         vizible.red(
                             f"   Generated {len(generated_tokens)} tokens before loop detection."
                         )
-                        loop_detected = True
                         break
 
                 text = response.text
@@ -450,6 +461,7 @@ class StatefulLLM:
         # Train the model on the new, improved examples (backward-pass)
         self._train(example, verbose)
         if self._model_path is not None:
+            vizible.green(f"Saving model to {self._model_path}")
             self._model_path.parent.mkdir(parents=True, exist_ok=True)
             save_model(self._model_path, self._model)
 
