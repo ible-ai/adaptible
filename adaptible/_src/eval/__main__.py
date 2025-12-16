@@ -1,7 +1,7 @@
 """Runner script for evaluation experiments.
 
 Usage:
-    python -m adaptible._src.tests.eval.run_eval [options]
+    python -m adaptible._src.eval [options]
 
 Options:
     --name NAME           Experiment name (default: "default")
