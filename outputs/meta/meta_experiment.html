@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Meta-Learning Results: meta_experiment</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+            border-bottom: 2px solid #4CAF50;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #555;
+            margin-top: 30px;
+        }
+        .config {
+            background: #fff;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .config-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+        }
+        .config-item {
+            text-align: center;
+        }
+        .config-item .label {
+            font-size: 12px;
+            color: #888;
+            text-transform: uppercase;
+        }
+        .config-item .value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #333;
+        }
+        .summary {
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
+            text-align: center;
+        }
+        .summary-item .label {
+            font-size: 14px;
+            color: #888;
+        }
+        .summary-item .value {
+            font-size: 32px;
+            font-weight: bold;
+        }
+        .summary-item .value.positive {
+            color: #4CAF50;
+        }
+        .summary-item .value.negative {
+            color: #f44336;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #fff;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        th, td {
+            padding: 12px;
+            text-align: center;
+            border-bottom: 1px solid #eee;
+        }
+        th {
+            background: #4CAF50;
+            color: white;
+            font-weight: 600;
+        }
+        tr:hover {
+            background: #f5f5f5;
+        }
+        tr.best {
+            background: #e8f5e9;
+        }
+        tr.worst {
+            background: #ffebee;
+        }
+        .chart-container {
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .interpretation {
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+            border-left: 4px solid #2196F3;
+        }
+        .interpretation h3 {
+            margin-top: 0;
+            color: #1976D2;
+        }
+        footer {
+            text-align: center;
+            padding: 20px;
+            color: #888;
+            font-size: 12px;
+        }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <h1>Meta-Learning Experiment Results</h1>
+
+    <div class="config">
+        <h2 style="margin-top: 0;">Configuration</h2>
+        <div class="config-grid">
+            <div class="config-item">
+                <div class="label">Name</div>
+                <div class="value" style="font-size: 16px;">meta_experiment</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Seeds</div>
+                <div class="value" style="font-size: 18px;">3</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Checkpoint Interval</div>
+                <div class="value">10</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Training Iterations</div>
+                <div class="value">25</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Train Ratio</div>
+                <div class="value">80%</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Dataset</div>
+                <div class="value" style="font-size: 16px;">trivia_v1_subset</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="summary">
+        <h2 style="margin-top: 0;">Summary</h2>
+        <div class="summary-grid">
+            <div class="summary-item">
+                <div class="label">Best Seed</div>
+                <div class="value positive">123</div>
+            </div>
+            <div class="summary-item">
+                <div class="label">Worst Seed</div>
+                <div class="value negative">456</div>
+            </div>
+            <div class="summary-item">
+                <div class="label">Score Variance</div>
+                <div class="value">0.001608</div>
+            </div>
+        </div>
+    </div>
+
+    <h2>Trajectory Comparison</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Seed</th>
+                <th>Meta-Learning Score</th>
+                <th>Final Accuracy</th>
+                <th>Net Learning</th>
+                <th>Checkpoints</th>
+                <th>Time</th>
+            </tr>
+        </thead>
+        <tbody>
+            
+            <tr class="best">
+                <td>123 🏆</td>
+                <td>0.0431</td>
+                <td>57.5%</td>
+                <td>2</td>
+                <td>8</td>
+                <td>27044.8s</td>
+            </tr>
+            
+            <tr class="">
+                <td>42</td>
+                <td>0.0165</td>
+                <td>58.8%</td>
+                <td>2</td>
+                <td>8</td>
+                <td>49869.8s</td>
+            </tr>
+            
+            <tr class="worst">
+                <td>456 ⚠️</td>
+                <td>-0.0521</td>
+                <td>53.8%</td>
+                <td>2</td>
+                <td>8</td>
+                <td>53549.2s</td>
+            </tr>
+            
+        </tbody>
+    </table>
+
+    <div class="interpretation">
+        <h3>Interpreting the Meta-Learning Score</h3>
+        <p>The meta-learning score measures how learning efficiency changes over time:</p>
+        <ul>
+            <li><strong>Score &gt; 0:</strong> Model is "learning to learn" - improvements accelerate and forgetting decelerates</li>
+            <li><strong>Score &lt; 0:</strong> Model is degrading - improvements slow down, forgetting increases</li>
+            <li><strong>High variance:</strong> Meta-learning ability is sensitive to initialization</li>
+        </ul>
+        <p>Formula: <code>(late_improvement_rate - early_improvement_rate) + (early_forgetting_rate - late_forgetting_rate)</code></p>
+    </div>
+
+    <h2>Learning Trajectory (Best Seed: 123)</h2>
+    <div class="chart-container">
+        <canvas id="trajectoryChart"></canvas>
+    </div>
+
+    <script>
+        const ctx = document.getElementById('trajectoryChart').getContext('2d');
+        const checkpointData = [{"step": 10, "accuracy": 0.7, "improvement_rate": 0.25, "forgetting_rate": 0.0, "net_learning": 1}, {"step": 20, "accuracy": 0.45, "improvement_rate": 0.1111111111111111, "forgetting_rate": 0.2727272727272727, "net_learning": -2}, {"step": 30, "accuracy": 0.5333333333333333, "improvement_rate": 0.14285714285714285, "forgetting_rate": 0.125, "net_learning": 0}, {"step": 40, "accuracy": 0.5, "improvement_rate": 0.1111111111111111, "forgetting_rate": 0.18181818181818182, "net_learning": -2}, {"step": 50, "accuracy": 0.58, "improvement_rate": 0.19047619047619047, "forgetting_rate": 0.13793103448275862, "net_learning": 0}, {"step": 60, "accuracy": 0.5833333333333334, "improvement_rate": 0.25, "forgetting_rate": 0.19444444444444445, "net_learning": -1}, {"step": 70, "accuracy": 0.5714285714285714, "improvement_rate": 0.25806451612903225, "forgetting_rate": 0.1794871794871795, "net_learning": 1}, {"step": 80, "accuracy": 0.575, "improvement_rate": 0.2777777777777778, "forgetting_rate": 0.18181818181818182, "net_learning": 2}];
+
+        new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: checkpointData.map(d => 'Step ' + d.step),
+                datasets: [
+                    {
+                        label: 'Post-Training Accuracy',
+                        data: checkpointData.map(d => d.accuracy * 100),
+                        borderColor: '#4CAF50',
+                        backgroundColor: 'rgba(76, 175, 80, 0.1)',
+                        fill: true,
+                        tension: 0.3,
+                        yAxisID: 'y'
+                    },
+                    {
+                        label: 'Improvement Rate',
+                        data: checkpointData.map(d => d.improvement_rate * 100),
+                        borderColor: '#2196F3',
+                        backgroundColor: 'transparent',
+                        tension: 0.3,
+                        yAxisID: 'y'
+                    },
+                    {
+                        label: 'Forgetting Rate',
+                        data: checkpointData.map(d => d.forgetting_rate * 100),
+                        borderColor: '#f44336',
+                        backgroundColor: 'transparent',
+                        tension: 0.3,
+                        yAxisID: 'y'
+                    },
+                    {
+                        label: 'Net Learning',
+                        data: checkpointData.map(d => d.net_learning),
+                        borderColor: '#9C27B0',
+                        backgroundColor: 'transparent',
+                        tension: 0.3,
+                        yAxisID: 'y1'
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                interaction: {
+                    mode: 'index',
+                    intersect: false,
+                },
+                scales: {
+                    y: {
+                        type: 'linear',
+                        display: true,
+                        position: 'left',
+                        title: {
+                            display: true,
+                            text: 'Rate (%)'
+                        },
+                        min: 0,
+                        max: 100
+                    },
+                    y1: {
+                        type: 'linear',
+                        display: true,
+                        position: 'right',
+                        title: {
+                            display: true,
+                            text: 'Net Learning (count)'
+                        },
+                        grid: {
+                            drawOnChartArea: false,
+                        },
+                    }
+                }
+            }
+        });
+    </script>
+
+    <footer>
+        Generated: 2025-12-17T06:54:28.191349<br>
+        Results saved to: outputs/meta/meta_experiment.json
+    </footer>
+</body>
+</html>

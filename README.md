@@ -11,6 +11,7 @@ The core hypothesis: by diversifying training bets autonomously and greedily sam
 ## What it does
 
 Adaptible wraps an LLM in a server that:
+
 1. Serves responses to user prompts
 2. Stores interaction history
 3. During idle periods, asks the model to critique and revise its past responses
@@ -132,7 +133,7 @@ python -m adaptible.eval \
   --iterations 25
 ```
 
-### Programmatic usage
+### Evaluation Framework Usage
 
 ```python
 import adaptible.eval as eval
@@ -157,6 +158,7 @@ eval.generate_html_report(result, "/tmp/report.html")
 ```
 
 The evaluation:
+
 - Uses 100+ trivia questions across 6 categories (geography, science, history, math, language, miscellaneous)
 - Splits data into train/holdout sets to measure generalization
 - Measures baseline accuracy, improvement rate, retention rate, and holdout accuracy
@@ -169,7 +171,7 @@ All experiments are persisted to a SQLite database (`outputs/adaptible.db`) for 
 
 ### Schema
 
-```
+```text
 examples
 ├── canonical_id, question, ground_truth_answer
 ├── key_terms, category, difficulty
@@ -270,6 +272,59 @@ node = AutonomousNode(
 node.run()
 ```
 
+## Meta-Learning Experiments
+
+The core hypothesis: **self-improvement is itself a learnable trait**. Different model instances undergoing online learning arrive at different end states—some become stronger self-learners than others.
+
+### Running Meta-Learning Experiments
+
+```python
+import adaptible.eval as eval
+
+# Configure experiment
+config = eval.MetaLearningConfig(
+    name="meta_experiment",
+    seeds=[42, 123, 456, 789, 1011],  # Run N instances
+    checkpoint_interval=10,  # Checkpoint every 10 training events
+    training_iterations=25,
+    train_ratio=0.8,
+)
+
+# Load dataset
+dataset = eval.generate_default_dataset()
+
+# Run experiment
+experiment = eval.MetaLearningExperiment()
+result = experiment.run(dataset, config)
+
+# Analyze results
+print(f"Best seed: {result.best_seed}")
+print(f"Score variance: {result.score_variance}")
+
+# Save for later analysis
+result.save("outputs/meta_experiment.json")
+```
+
+### Meta-Learning Score
+
+The meta-learning score measures how learning efficiency changes over time:
+
+```python
+meta_learning_score = (late_improvement_rate - early_improvement_rate)
+                    + (early_forgetting_rate - late_forgetting_rate)
+```
+
+- **Score > 0**: Model is learning to learn better (improvements accelerate, forgetting decelerates)
+- **Score < 0**: Model is degrading (improvements slow down, forgetting accelerates)
+- **High variance across seeds**: Meta-learning ability is sensitive to initialization
+
+### Tracked Metrics per Checkpoint
+
+- `improvement_rate`: Fraction of wrong→right transitions
+- `forgetting_rate`: Fraction of right→wrong transitions
+- `net_learning`: improved - regressed
+- `post_accuracy`: Current accuracy on trained items
+
 ## Observed Results
 
 Evaluation runs on a 1.5B parameter model show net positive self-improvement:
@@ -283,20 +338,20 @@ The improvement rate exceeds the forgetting rate, indicating the self-correction
 
 This is early-stage work. The gains are modest but demonstrate that end-to-end self-improvement is achievable with small models and LoRA fine-tuning.
 
-## Configuration
+## General Configuration
 
 `StatefulLLM` accepts these parameters:
 
-| Parameter                          | Default                                       | Description                            |
-| ---------------------------------- | --------------------------------------------- | -------------------------------------- |
-| `model_name`                       | `mlx-community/DeepSeek-R1-Distill-Qwen-1.5B` | HuggingFace model path                 |
-| `learning_rate`                    | `5e-5`                                        | Training learning rate                 |
-| `max_tokens`                       | `2048`                                        | Max tokens per response                |
-| `epochs`                           | `5`                                           | Training epochs per revision           |
-| `num_lora_layers`                  | `24`                                          | Number of LoRA layers                  |
-| `lora_parameters`                  | `{"rank": 32, "dropout": 0.0, "scale": 10.0}` | LoRA config                            |
-| `loop_detection_sequence_length`   | `8`                                           | Token sequence length for loop check   |
-| `loop_detection_max_repetitions`   | `3`                                           | Repetitions before stopping generation |
+| Parameter                        | Default                                       | Description                            |
+| -------------------------------- | --------------------------------------------- | -------------------------------------- |
+| `model_name`                     | `mlx-community/DeepSeek-R1-Distill-Qwen-1.5B` | HuggingFace model path                 |
+| `learning_rate`                  | `5e-5`                                        | Training learning rate                 |
+| `max_tokens`                     | `2048`                                        | Max tokens per response                |
+| `epochs`                         | `5`                                           | Training epochs per revision           |
+| `num_lora_layers`                | `24`                                          | Number of LoRA layers                  |
+| `lora_parameters`                | `{"rank": 32, "dropout": 0.0, "scale": 10.0}` | LoRA config                            |
+| `loop_detection_sequence_length` | `8`                                           | Token sequence length for loop check   |
+| `loop_detection_max_repetitions` | `3`                                           | Repetitions before stopping generation |
 
 ## Limitations
 
@@ -305,7 +360,7 @@ This is early-stage work. The gains are modest but demonstrate that end-to-end s
 
 ## Project Structure
 
-```
+```text
 .
 ├── adaptible/
 │   ├── __init__.py                    # Public API
@@ -324,7 +379,8 @@ This is early-stage work. The gains are modest but demonstrate that end-to-end s
 │       │   ├── __init__.py            # EvaluationHarness, TriviaDataset, etc.
 │       │   ├── __main__.py            # CLI entry point
 │       │   ├── dataset.py             # Trivia dataset
-│       │   └── harness.py             # Evaluation harness
+│       │   ├── harness.py             # Evaluation harness
+│       │   └── meta.py                # Meta-learning experiments
 │       ├── revise/                    # Self-correction logic
 │       │   └── revise.py              # Revision prompts and training examples
 │       └── tests/                     # Unit tests

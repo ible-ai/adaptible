@@ -5,6 +5,7 @@ Systematic evaluation of Adaptible's self-correction effectiveness using trivia 
 ## Overview
 
 The evaluation framework measures how well the model learns from corrections by:
+
 1. Getting baseline responses to all questions
 2. Training on a subset (default 80%)
 3. Re-evaluating all questions post-training
@@ -60,6 +61,7 @@ print(f"Holdout accuracy: {result.holdout_accuracy:.1%}")
 ## Dataset
 
 The built-in dataset includes 100+ trivia questions across 6 categories:
+
 - **Geography** (20 questions) - Capitals, landmarks, physical geography
 - **Science** (25 questions) - Physics, chemistry, biology, astronomy
 - **History** (20 questions) - Inventions, inventors, major events
@@ -68,6 +70,7 @@ The built-in dataset includes 100+ trivia questions across 6 categories:
 - **Miscellaneous** (15 questions) - Animals, geography records, culture
 
 Each item includes:
+
 - Question text
 - Correct answer
 - Key terms for automated grading
@@ -106,17 +109,18 @@ dataset = eval.load_dataset("my_dataset.json")
 
 The evaluation computes several metrics:
 
-| Metric | Description |
-|--------|-------------|
-| **Baseline Accuracy** | % of items with key terms before training |
-| **Train Post-Accuracy** | % of trained items correct after training |
-| **Train Improvement Rate** | % of incorrect items that became correct |
-| **Train Retention Rate** | % of correct items that stayed correct |
-| **Holdout Accuracy** | % of untrained items correct (generalization check) |
+| Metric                     | Description                                         |
+| -------------------------- | --------------------------------------------------- |
+| **Baseline Accuracy**      | % of items with key terms before training           |
+| **Train Post-Accuracy**    | % of trained items correct after training           |
+| **Train Improvement Rate** | % of incorrect items that became correct            |
+| **Train Retention Rate**   | % of correct items that stayed correct              |
+| **Holdout Accuracy**       | % of untrained items correct (generalization check) |
 
 ## HTML Report
 
 The generated HTML report includes:
+
 - Summary metrics with visual indicators
 - Per-item comparison (before/after responses)
 - Filtering by category, training status, and outcome
@@ -124,23 +128,23 @@ The generated HTML report includes:
 
 ## CLI Options
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--name` | `"default"` | Experiment name |
-| `--train-ratio` | `0.8` | Fraction for training (rest is holdout) |
-| `--iterations` | `25` | Training iterations per example |
-| `--shuffle` | `False` | Randomize question order |
-| `--seed` | `42` | Random seed for shuffling |
-| `--subset` | `None` | Use only first N questions |
-| `--category` | `None` | Filter to specific category |
-| `--output` | `/tmp/adaptible_eval_report.html` | Report path |
-| `--save-dataset` | `None` | Save dataset to JSON |
-| `--load-dataset` | `None` | Load custom dataset from JSON |
-| `--no-browser` | `False` | Don't auto-open report in browser |
+| Flag             | Default                           | Description                             |
+| ---------------- | --------------------------------- | --------------------------------------- |
+| `--name`         | `"default"`                       | Experiment name                         |
+| `--train-ratio`  | `0.8`                             | Fraction for training (rest is holdout) |
+| `--iterations`   | `25`                              | Training iterations per example         |
+| `--shuffle`      | `False`                           | Randomize question order                |
+| `--seed`         | `42`                              | Random seed for shuffling               |
+| `--subset`       | `None`                            | Use only first N questions              |
+| `--category`     | `None`                            | Filter to specific category             |
+| `--output`       | `/tmp/adaptible_eval_report.html` | Report path                             |
+| `--save-dataset` | `None`                            | Save dataset to JSON                    |
+| `--load-dataset` | `None`                            | Load custom dataset from JSON           |
+| `--no-browser`   | `False`                           | Don't auto-open report in browser       |
 
 ## Files
 
-```
+```text
 eval/
 ├── __init__.py           # Public API
 ├── __main__.py           # CLI entry point
