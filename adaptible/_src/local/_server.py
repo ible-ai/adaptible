@@ -42,9 +42,13 @@ class MutableHostedLLM(uvicorn.Server):
         self.should_exit = False
 
     async def startup(self, sockets: list[socket.socket] | None = None) -> None:
-        """Override uvicorn startup"""
+        """Override uvicorn startup to signal ``up()`` once the server is listening.
+
+        Note: the event loop is already running by the time ``startup`` executes,
+        so there is nothing to configure here (``Config.setup_event_loop`` was
+        removed in uvicorn 0.36 in favour of ``get_loop_factory``).
+        """
         await super().startup(sockets=sockets)
-        self.config.setup_event_loop()
         self._startup_done.set()
 
     async def up(self) -> None:

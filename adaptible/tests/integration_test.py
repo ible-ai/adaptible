@@ -1,13 +1,16 @@
-"""Integration tests for the full self-correction pipeline.
+"""Integration tests for the training half of the self-correction pipeline.
 
-These tests verify that the self-correction and training cycle produces
-measurable behavioral improvements. The approach:
+These tests verify that LoRA training on a corrected answer produces a
+measurable behavioral change. Note what they do NOT do: the model is never
+asked to critique or rewrite its own response. The "revision" trained on is a
+hand-written, known-correct GROUND-TRUTH answer (``CorrectionTask.correct_answer``),
+formatted as a ``[[0]] ... [[/0]]`` rewrite so it flows through the same
+``make_collated_training_example`` path as a real self-correction. The approach:
 
-1. Get the model's ACTUAL response to a question
-2. Identify what needs improvement in that response
-3. Create a revision (the corrected version)
-4. Train on the revision
-5. Check if the model's behavior changed
+1. Get the model's ACTUAL response to a question (used as the turn being replaced)
+2. Build a training example from the ground-truth answer, masked to the answer
+3. Train on it
+4. Check whether the model's response to the same question changed
 
 Run with:
     python -m adaptible._src.tests.integration_test
@@ -396,7 +399,12 @@ def generate_html_report(report_path: str = "/tmp/adaptible_test_report.html") -
 
 
 class RealResponseCorrectionTest(unittest.TestCase):
-    """Tests that use the model's ACTUAL responses for training."""
+    """Trains toward ground-truth answers and checks the model's behaviour moves.
+
+    The model's actual response is captured only as the turn being replaced and
+    as the baseline for comparison; training targets are the hand-written
+    ``correct_answer`` strings, not anything the model wrote itself.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -422,11 +430,40 @@ class RealResponseCorrectionTest(unittest.TestCase):
         vizible.blue(f"Comparison judgment: \n{judgment}")
         return extract_choice(judgment), judgment or ""
 
+    @staticmethod
+    def _flatten_params(params: Any, prefix: str = "") -> dict[str, Any]:
+        """Flatten nested parameter dict into flat dict with dot notation."""
+        result: dict[str, Any] = {}
+        for k, v in params.items():
+            key = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                result.update(
+                    RealResponseCorrectionTest._flatten_params(v, key)
+                )
+            elif isinstance(v, list):
+                for i, item in enumerate(v):
+                    if isinstance(item, dict):
+                        result.update(
+                            RealResponseCorrectionTest._flatten_params(
+                                item, f"{key}.{i}"
+                            )
+                        )
+            elif hasattr(v, "tolist"):
+                result[key] = v.tolist()
+        return result
+
     def test_training_on_actual_model_output(self):
-        """Train the model to correct its own actual responses."""
+        """Training on ground-truth answers must move LoRA weights and not lose key terms.
+
+        The model's own response is the baseline; the training target is
+        ``task.correct_answer``, never the model's rewrite of itself.
+        """
         print("\n" + "=" * 60)
         print("REAL RESPONSE CORRECTION TEST")
         print("=" * 60)
+
+        lora_before = self._flatten_params(self.model._model.trainable_parameters())
+        self.assertGreater(len(lora_before), 0, "Model should have LoRA parameters")
 
         for task in CORRECTION_TASKS:
             print(f"\n--- {task.name} ---")
@@ -520,6 +557,19 @@ class RealResponseCorrectionTest(unittest.TestCase):
         print(f"Post with key terms: {post_with_terms}/{len(CORRECTION_TASKS)}")
 
         self.model._model_is_stable = True
+
+        # Training on the correct answers must not make the model worse at
+        # producing the key terms, and must have actually touched the adapters.
+        self.assertGreaterEqual(
+            post_with_terms,
+            initial_with_terms,
+            "Post-training key-term hits should be at least the baseline count.",
+        )
+        lora_after = self._flatten_params(self.model._model.trainable_parameters())
+        changed = [k for k in lora_before if lora_before[k] != lora_after.get(k)]
+        self.assertGreater(
+            len(changed), 0, "Training should change at least one LoRA parameter."
+        )
 
 
 class ValidationPrerequisiteTest(unittest.TestCase):

@@ -8,10 +8,12 @@ Tests verify that the self-correction and training cycle actually works:
 """
 
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 
 import adaptible
+from adaptible._src import _llm
 
 # Module-level shared model instance - loaded once for all tests
 _shared_model = None
@@ -23,6 +25,98 @@ def get_shared_model():
     if _shared_model is None:
         _shared_model = adaptible.StatefulLLM()
     return _shared_model
+
+
+def _history_only_llm() -> adaptible.StatefulLLM:
+    """A StatefulLLM with only the conversation-history state, no model loaded."""
+    llm = adaptible.StatefulLLM.__new__(adaptible.StatefulLLM)
+    llm._messages = []
+    return llm
+
+
+class ConversationHistoryTest(unittest.TestCase):
+    """Tests for multi-turn history bookkeeping (no model or MLX required)."""
+
+    def test_messages_for_prompt_without_history_is_isolated(self):
+        """use_history=False must neither read nor extend the stored conversation."""
+        llm = _history_only_llm()
+        llm._messages.append({"role": "user", "content": "earlier"})
+
+        messages = llm._messages_for_prompt("now", use_history=False)
+
+        self.assertEqual(messages, [{"role": "user", "content": "now"}])
+        self.assertEqual(llm._messages, [{"role": "user", "content": "earlier"}])
+
+    def test_messages_for_prompt_with_history_appends_user_turn(self):
+        """use_history=True appends the user turn and returns the full conversation."""
+        llm = _history_only_llm()
+
+        messages = llm._messages_for_prompt("hi", use_history=True)
+
+        self.assertIs(messages, llm._messages)
+        self.assertEqual(llm._messages, [{"role": "user", "content": "hi"}])
+
+    def test_record_turn_appends_assistant_after_pending_user(self):
+        """After _messages_for_prompt, _record_turn adds only the assistant reply."""
+        llm = _history_only_llm()
+        llm._messages_for_prompt("What is 2+2?", use_history=True)
+
+        llm._record_turn("What is 2+2?", "4")
+
+        self.assertEqual(
+            llm._messages,
+            [
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "4"},
+            ],
+        )
+
+    def test_record_turn_adds_user_when_not_pending(self):
+        """_record_turn on its own records a full user/assistant pair."""
+        llm = _history_only_llm()
+
+        llm._record_turn("hello", "hi there")
+
+        self.assertEqual(
+            llm._messages,
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi there"},
+            ],
+        )
+
+    def test_history_alternates_roles_over_multiple_turns(self):
+        """Multi-turn history must alternate user/assistant, not be user-only."""
+        llm = _history_only_llm()
+        for user, assistant in [("q1", "a1"), ("q2", "a2"), ("q3", "a3")]:
+            llm._messages_for_prompt(user, use_history=True)
+            llm._record_turn(user, assistant)
+
+        roles = [m["role"] for m in llm._messages]
+        self.assertEqual(roles, ["user", "assistant"] * 3)
+        self.assertEqual(
+            [m["content"] for m in llm._messages if m["role"] == "assistant"],
+            ["a1", "a2", "a3"],
+        )
+
+
+class TokenLoopDetectionTest(unittest.TestCase):
+    """Tests for _detect_token_loop (pure function, no model required)."""
+
+    def test_repeated_sequence_detected(self):
+        tokens = [1, 2, 3, 4] * 3
+        self.assertTrue(_llm._detect_token_loop(tokens, 4, 3))
+
+    def test_too_short_not_detected(self):
+        self.assertFalse(_llm._detect_token_loop([1, 2, 3, 4] * 2, 4, 3))
+
+    def test_non_repeating_not_detected(self):
+        tokens = [1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 5]
+        self.assertFalse(_llm._detect_token_loop(tokens, 4, 3))
+
+    def test_earlier_repeat_broken_not_detected(self):
+        tokens = [9, 9, 9, 9, 1, 2, 3, 4, 1, 2, 3, 4]
+        self.assertFalse(_llm._detect_token_loop(tokens, 4, 3))
 
 
 class ModelStateTest(unittest.TestCase):
@@ -212,9 +306,10 @@ class RevisionQualityTest(unittest.TestCase):
 class EndToEndSelfCorrectionTest(unittest.TestCase):
     """End-to-end tests for the full self-correction pipeline.
 
-    Note: These tests use a real model which may produce invalid revisions.
-    The tests document expected behavior but skip when the model fails to
-    produce valid output (expected for small distilled models).
+    Note: A real model is loaded for its tokenizer and weights, but the
+    revision step is patched so that each test asserts a definite outcome
+    rather than depending on whether a small distilled model happens to
+    produce a well-formed rewrite.
     """
 
     @classmethod
@@ -222,9 +317,8 @@ class EndToEndSelfCorrectionTest(unittest.TestCase):
         cls.model = get_shared_model()
         cls.model._model_is_stable = True
 
-    def test_self_correct_validates_revision_format(self):
-        """Self-correction should validate revision format before training."""
-        interactions = [
+    def _interactions(self) -> list[adaptible.InteractionHistory]:
+        return [
             adaptible.InteractionHistory(
                 idx=0,
                 user_input="What is 2+2?",
@@ -241,21 +335,55 @@ class EndToEndSelfCorrectionTest(unittest.TestCase):
             ),
         ]
 
-        try:
+    def test_self_correct_builds_example_from_valid_revision(self):
+        """A well-formed revision yields an example whose masked labels are the rewrite."""
+        interactions = self._interactions()
+        revision_text = "2 + 2 equals 4. My earlier answer of 5 was a mistake."
+        valid_revision = f"[[0]] {revision_text} [[/0]]"
+
+        with mock.patch.object(
+            self.model, "generate_response", return_value=valid_revision
+        ) as generate:
             example = self.model._self_correct(
                 interactions, indices_to_review=None, verbose=False
             )
 
-            # If we get here, the revision was valid
-            # Verify the training example is usable
-            self.assertIsInstance(example, adaptible.TrainingExample)
-            mask_sum = float(example.mask.sum())
-            self.assertGreater(mask_sum, 0, "Mask should have non-zero elements")
+        generate.assert_called_once()
+        self.assertFalse(generate.call_args.kwargs.get("use_history", True))
+        self.assertTrue(all(i.reviewed for i in interactions))
 
-        except adaptible.revise.InvalidRevisionError:
-            # This is expected - the model may produce invalid output
-            # The important thing is that validation caught it
-            pass
+        self.assertIsInstance(example, adaptible.TrainingExample)
+        self.assertEqual(example.input.shape, example.label.shape)
+        self.assertEqual(example.input.shape, example.mask.shape)
+
+        # The loss mask must be zero over the prompt and one over the revision:
+        # the masked labels decode to the rewritten answer and nothing else.
+        mask = example.mask.reshape(-1).tolist()
+        labels = example.label.reshape(-1).tolist()
+        self.assertGreater(sum(mask), 0)
+        self.assertLess(sum(mask), len(mask), "Prompt tokens must be unmasked")
+        self.assertEqual(mask[0], 0, "Mask must start on the prompt (zero)")
+        masked_labels = [t for t, m in zip(labels, mask) if m]
+        decoded = self.model._tokenizer.decode(masked_labels, skip_special_tokens=True)
+        self.assertIn(revision_text, decoded)
+        self.assertNotIn("What is 2+2?", decoded)
+        self.assertNotIn("[[0]]", decoded)
+
+        self.model._model_is_stable = True
+
+    def test_self_correct_rejects_malformed_revision(self):
+        """A garbage rewrite must raise InvalidRevisionError before any training."""
+        interactions = self._interactions()
+
+        with mock.patch.object(
+            self.model,
+            "generate_response",
+            return_value="I think the response should be more polite.",
+        ):
+            with self.assertRaises(adaptible.revise.InvalidRevisionError):
+                self.model._self_correct(
+                    interactions, indices_to_review=None, verbose=False
+                )
 
         self.model._model_is_stable = True
 

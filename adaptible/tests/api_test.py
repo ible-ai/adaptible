@@ -14,9 +14,14 @@ import adaptible
 class StubModel:
     """Minimal stub that satisfies the model interface for API testing."""
 
-    def __init__(self):
+    def __init__(self, train_error: Exception | None = None):
         self.ok = True
         self._call_count = 0
+        # Every call to self_correct_and_train, as (interaction_history, indices).
+        self.self_correct_calls: List[
+            tuple[List[adaptible.InteractionHistory], List[int] | None]
+        ] = []
+        self._train_error = train_error
 
     def generate_response(self, prompt: str) -> str:
         self._call_count += 1
@@ -28,7 +33,10 @@ class StubModel:
         indices_to_review: List[int] | None = None,
         verbose: bool = False,
     ) -> bool:
-        del interaction_history, indices_to_review, verbose
+        del verbose
+        self.self_correct_calls.append((list(interaction_history), indices_to_review))
+        if self._train_error is not None:
+            raise self._train_error
         return True
 
     def stream_response(self, prompt: str):
@@ -126,13 +134,67 @@ class TriggerReviewEndpointTest(unittest.TestCase):
         self.assertEqual(data["unreviewed_count"], 2)
         self.assertIn("initiated", data["message"].lower())
 
-    def test_trigger_review_adds_to_outstanding_tasks(self):
-        """POST /trigger_review should add task to outstanding_tasks."""
+    def test_trigger_review_runs_training_on_sync(self):
+        """POST /trigger_review + GET /sync should run self_correct_and_train once."""
         self.client.post("/interact", json={"prompt": "Q1"})
+        self.client.post("/interact", json={"prompt": "Q2"})
 
         self.client.post("/trigger_review")
-
         self.assertEqual(len(self.api.outstanding_tasks), 1)
+        response = self.client.get("/sync")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.stub_model.self_correct_calls), 1)
+        history, indices = self.stub_model.self_correct_calls[0]
+        self.assertIsNone(indices)
+        self.assertEqual([h.user_input for h in history], ["Q1", "Q2"])
+        self.assertEqual(
+            [h.llm_response for h in history],
+            ["Response to: Q1", "Response to: Q2"],
+        )
+        # /sync drains the queue.
+        self.assertEqual(len(self.api.outstanding_tasks), 0)
+
+    def test_trigger_review_clears_unreviewed_indices(self):
+        """Dispatched interactions must not be reviewed again by a second trigger."""
+        self.client.post("/interact", json={"prompt": "Q1"})
+        self.client.post("/interact", json={"prompt": "Q2"})
+
+        self.client.post("/trigger_review")
+        self.assertEqual(self.api.unreviewed_interaction_history_indices, [])
+
+        # Nothing new: the second trigger must be a no-op.
+        response = self.client.post("/trigger_review")
+        self.assertEqual(response.json()["unreviewed_count"], 0)
+        self.client.get("/sync")
+        self.assertEqual(len(self.stub_model.self_correct_calls), 1)
+
+        # A new interaction is reviewed on its own, without the earlier ones.
+        self.client.post("/interact", json={"prompt": "Q3"})
+        self.assertEqual(self.api.unreviewed_interaction_history_indices, [2])
+        response = self.client.post("/trigger_review")
+        self.assertEqual(response.json()["unreviewed_count"], 1)
+        self.client.get("/sync")
+        self.assertEqual(len(self.stub_model.self_correct_calls), 2)
+        history, _ = self.stub_model.self_correct_calls[1]
+        self.assertEqual([h.user_input for h in history], ["Q3"])
+
+    def test_training_exception_does_not_crash_sync(self):
+        """A failing training task is logged and /sync still returns 200."""
+        failing_model = StubModel(train_error=RuntimeError("backprop exploded"))
+        api = adaptible.Adaptible(model=failing_model)
+        client = TestClient(api.app)
+        client.post("/interact", json={"prompt": "Q1"})
+        client.post("/trigger_review")
+
+        with self.assertLogs("asyncio", level="ERROR") as logs:
+            response = client.get("/sync")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["tasks_count"], 1)
+        self.assertEqual(len(failing_model.self_correct_calls), 1)
+        self.assertTrue(any("backprop exploded" in line for line in logs.output))
+        self.assertEqual(len(api.outstanding_tasks), 0)
 
 
 class HistoryEndpointTest(unittest.TestCase):

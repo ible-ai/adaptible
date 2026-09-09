@@ -21,6 +21,7 @@ from mlx_lm.utils import load_model
 from transformers.tokenization_utils import PreTrainedTokenizer
 
 from ._classes import InteractionHistory, TrainingExample
+from ._paths import default_checkpoint_path
 from .revise import (
     make_collated_training_example,
     make_revision_prompt,
@@ -35,7 +36,9 @@ from .revise import (
 _MODEL_NAME = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B"
 # _MODEL_NAME = "mlx-community/DeepSeek-R1-Qwen3-0528-8B-4bit-AWQ"
 MAX_TOKENS = 2048
-MODEL_PATH = Path("outputs/autonomous/checkpoint")
+# Kept as a module-level name for backward compatibility (``autonomous/`` imports it);
+# resolved through ``_paths`` so that it honours ``$ADAPTIBLE_OUTPUTS_DIR``.
+MODEL_PATH = default_checkpoint_path()
 # MAX_TOKENS = 8192
 _LEARNING_RATE = 5e-5
 _EPOCHS = 5
@@ -77,7 +80,7 @@ def _detect_token_loop(
     # Check if this sequence has repeated max_repetitions times
     for i in range(1, max_repetitions):
         start_idx = -(i + 1) * sequence_length
-        end_idx = -i * sequence_length if i > 0 else None
+        end_idx = -i * sequence_length
         comparison_sequence = tokens[start_idx:end_idx]
 
         if comparison_sequence != recent_sequence:
@@ -169,7 +172,9 @@ class StatefulLLM:
 
         Returns: None
         """
-        self._lock = threading.Lock()
+        # Guards the model weights between generation and training. Re-entrant
+        # because ``self_correct_and_train`` calls ``generate_response`` internally.
+        self._lock = threading.RLock()
         with self._lock:
             self._messages: list[dict[str, str]] = []
             self._model, self._tokenizer = _load(
@@ -214,6 +219,44 @@ class StatefulLLM:
         )
         return cast(list[int], tokenized_prompt)
 
+    def _messages_for_prompt(
+        self, prompt: str, use_history: bool
+    ) -> List[dict[str, str]]:
+        """Builds the message list to feed the chat template for a new user turn.
+
+        When ``use_history`` is set the user turn is appended to the persistent
+        conversation and the whole conversation is returned; the matching
+        assistant turn must be added afterwards via ``_record_turn``.
+
+        Args:
+            prompt: User input.
+            use_history: Whether to include (and extend) the persistent history.
+
+        Returns:
+            Messages to serialize with the chat template.
+        """
+        message = {"role": "user", "content": prompt}
+        if use_history:
+            self._messages.append(message)
+            return self._messages
+        return [message]
+
+    def _record_turn(self, user: str, assistant: str) -> None:
+        """Records a completed user/assistant exchange in the conversation history.
+
+        If the most recent history entry is already the ``user`` turn (as appended by
+        ``_messages_for_prompt``) only the assistant reply is added, so the history
+        alternates user/assistant as the chat template expects.
+
+        Args:
+            user: The user prompt for this turn.
+            assistant: The model's reply to that prompt.
+        """
+        last = self._messages[-1] if self._messages else None
+        if last is None or last.get("role") != "user" or last.get("content") != user:
+            self._messages.append({"role": "user", "content": user})
+        self._messages.append({"role": "assistant", "content": assistant})
+
     def generate_response(
         self,
         prompt: str,
@@ -234,63 +277,61 @@ class StatefulLLM:
         vizible.blue("Generating response for:")
         vizible.blue(prompt)
         unique_lines_generated = collections.defaultdict(int)
-        message = {"role": "user", "content": prompt}
         if max_tokens is None:
             max_tokens = self._max_tokens
-        if use_history:
-            self._messages.append(message)
-            messages = self._messages
-        else:
-            messages = [message]
-        tokenized_prompt = self.apply_chat_template(messages)
 
-        # Use streaming generation internally to enable loop detection
-        generated_tokens = []
-        full_response = []
-        current_line = []
+        with self._lock:
+            messages = self._messages_for_prompt(prompt, use_history)
+            tokenized_prompt = self.apply_chat_template(messages)
 
-        for response in stream_generate(
-            model=self._model,
-            tokenizer=self._tokenizer,
-            prompt=tokenized_prompt,
-            max_tokens=max_tokens,
-        ):
-            print(response.text, end="", flush=True)
-            current_line.append(response.text)
-            if "\n" in response.text:
-                most_recent_line = "".join(current_line)
-                current_line = []
-                if most_recent_line:
-                    if unique_lines_generated[most_recent_line] > 1:
+            # Use streaming generation internally to enable loop detection
+            generated_tokens = []
+            full_response = []
+            current_line = []
+
+            for response in stream_generate(
+                model=self._model,
+                tokenizer=self._tokenizer,
+                prompt=tokenized_prompt,
+                max_tokens=max_tokens,
+            ):
+                print(response.text, end="", flush=True)
+                # Keep the chunk before any loop check so the final piece of text is
+                # never silently dropped when generation stops early.
+                full_response.append(response.text)
+                current_line.append(response.text)
+                if "\n" in response.text:
+                    most_recent_line = "".join(current_line)
+                    current_line = []
+                    if most_recent_line:
+                        if unique_lines_generated[most_recent_line] > 1:
+                            vizible.red(
+                                f"⚠️  Loop detected! Stopping generation early. Found: {most_recent_line}"
+                            )
+                            break
+                        unique_lines_generated[most_recent_line] += 1
+                # Track generated tokens
+                # Note: response.token is the most recent token ID
+                if hasattr(response, "token"):
+                    generated_tokens.append(response.token)
+
+                    # Check for loop
+                    if _detect_token_loop(
+                        generated_tokens,
+                        self._loop_detection_sequence_length,
+                        self._loop_detection_max_repetitions,
+                    ):
+                        vizible.red("⚠️  Loop detected! Stopping generation early.")
                         vizible.red(
-                            f"⚠️  Loop detected! Stopping generation early. Found: {most_recent_line}"
+                            f"   Generated {len(generated_tokens)} tokens before loop detection."
                         )
                         break
-                    unique_lines_generated[most_recent_line] += 1
-            # Track generated tokens
-            # Note: response.token is the most recent token ID
-            if hasattr(response, "token"):
-                generated_tokens.append(response.token)
 
-                # Check for loop
-                if _detect_token_loop(
-                    generated_tokens,
-                    self._loop_detection_sequence_length,
-                    self._loop_detection_max_repetitions,
-                ):
-                    vizible.red("⚠️  Loop detected! Stopping generation early.")
-                    vizible.red(
-                        f"   Generated {len(generated_tokens)} tokens before loop detection."
-                    )
-                    break
+            model_response = "".join(full_response).strip()
+            if use_history:
+                self._record_turn(prompt, model_response)
 
-            full_response.append(response.text)
-
-        model_response = "".join(full_response)
-
-        if model_response is None:
-            return ""
-        return model_response.strip()
+        return model_response
 
     async def stream_response(
         self,
@@ -298,22 +339,26 @@ class StatefulLLM:
         use_history: bool = True,
         max_tokens: int | None = None,
     ) -> AsyncIterable[str]:
-        """Stream generated response"""
-        message = {"role": "user", "content": prompt}
+        """Stream generated response.
+
+        Args:
+            prompt: User input.
+            use_history: Whether to include previous interaction history within the prompt.
+            max_tokens: Maximum number of tokens to decode in a single turn.
+
+        Yields:
+            Text chunks as they are generated.
+        """
         if max_tokens is None:
             max_tokens = self._max_tokens
         print(f"{self._messages = }")
-        if use_history:
-            self._messages.append(message)
-            messages = self._messages
-        else:
-            messages = [message]
-        tokenized_prompt = self.apply_chat_template(messages)
         responses = []
         generated_tokens = []
-        loop_detected = False
 
+        self._lock.acquire()
         try:
+            messages = self._messages_for_prompt(prompt, use_history)
+            tokenized_prompt = self.apply_chat_template(messages)
             for response in stream_generate(
                 self._model,
                 self._tokenizer,
@@ -341,6 +386,9 @@ class StatefulLLM:
                 yield text
         finally:
             self._response_stream = "".join(responses)
+            if use_history:
+                self._record_turn(prompt, self._response_stream.strip())
+            self._lock.release()
 
     def _tokenize(
         self, inp: str, dtype: mlx.core.Dtype = mlx.core.int32
@@ -391,6 +439,11 @@ class StatefulLLM:
         return example
 
     def _train(self, example: TrainingExample, verbose: bool):
+        with self._lock:
+            self._train_locked(example, verbose)
+
+    def _train_locked(self, example: TrainingExample, verbose: bool):
+        """Runs ``self._epochs`` optimizer steps on ``example``; caller must hold ``_lock``."""
         state = [self._model.state, self._optimizer.state, mlx.core.random.state]
         mlx.core.eval(state)
         loss_and_grad_fn = mlx.nn.value_and_grad(self._model, _loss_fn)
@@ -455,16 +508,23 @@ class StatefulLLM:
             save_checkpoint: Whether to save the model after training.
         """
         self._model_is_stable = False
-        calls = iterations // self._epochs
-        for _ in range(calls):
-            self._train(example, verbose=verbose)
+        try:
+            with self._lock:
+                calls = iterations // self._epochs
+                for _ in range(calls):
+                    self._train_locked(example, verbose=verbose)
 
-        if save_checkpoint and self._model_path is not None:
-            vizible.green(f"Saving model to {self._model_path}")
-            self._model_path.parent.mkdir(parents=True, exist_ok=True)
-            save_model(self._model_path, self._model)
+                if save_checkpoint and self._model_path is not None:
+                    self._save_checkpoint()
+        finally:
+            self._model_is_stable = True
 
-        self._model_is_stable = True
+    def _save_checkpoint(self) -> None:
+        """Writes the current weights to ``self._model_path``; caller must hold ``_lock``."""
+        assert self._model_path is not None
+        vizible.green(f"Saving model to {self._model_path}")
+        self._model_path.parent.mkdir(parents=True, exist_ok=True)
+        save_model(self._model_path, self._model)
 
     def self_correct_and_train(
         self,
@@ -484,16 +544,18 @@ class StatefulLLM:
             Whether the process completed successfully.
         """
         self._model_is_stable = False
+        try:
+            with self._lock:
+                # Prepare training example from self-reflective revision of past dialog.
+                example = self._self_correct(
+                    interaction_history, indices_to_review, verbose
+                )
 
-        # Prepare training example from self-reflective revision of past dialog.
-        example = self._self_correct(interaction_history, indices_to_review, verbose)
-
-        # Train the model on the new, improved examples (backward-pass)
-        self._train(example, verbose)
-        if self._model_path is not None:
-            vizible.green(f"Saving model to {self._model_path}")
-            self._model_path.parent.mkdir(parents=True, exist_ok=True)
-            save_model(self._model_path, self._model)
-
-        self._model_is_stable = True
+                # Train the model on the new, improved examples (backward-pass)
+                self._train_locked(example, verbose)
+                if self._model_path is not None:
+                    self._save_checkpoint()
+        finally:
+            # ``ok`` must recover even if revision validation or training raised.
+            self._model_is_stable = True
         return True

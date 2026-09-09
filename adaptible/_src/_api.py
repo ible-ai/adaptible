@@ -3,7 +3,6 @@
 import asyncio
 import collections
 import os
-import threading
 import time
 from asyncio import log
 from typing import Any, List, Protocol
@@ -69,7 +68,10 @@ class Adaptible:
         self.interaction_history: List[InteractionHistory] = []
         self.unreviewed_interaction_history_indices: List[int] = []
 
-        self.outstanding_tasks: collections.deque[Any] = collections.deque([])
+        # Background training tasks dispatched by /trigger_review and drained by /sync.
+        self.outstanding_tasks: collections.deque[asyncio.Task[Any]] = (
+            collections.deque([])
+        )
 
         # Use provided model or instantiate a new one.
         self.model = model if model is not None else StatefulLLM()
@@ -122,11 +124,15 @@ class Adaptible:
                 self.interaction_history[idx]
                 for idx in self.unreviewed_interaction_history_indices
             ]
-            self.outstanding_tasks.append(
+            # Hand these indices to the task and clear them so that a second
+            # /trigger_review does not re-review the same interactions.
+            self.unreviewed_interaction_history_indices.clear()
+            task = asyncio.create_task(
                 asyncio.to_thread(
                     self.model.self_correct_and_train, unreviewed_interaction_history
                 )
             )
+            self.outstanding_tasks.append(task)
             return {
                 "message": "Self-correction and training cycle has been initiated in the background.",
                 "unreviewed_count": unreviewed_count,
@@ -137,15 +143,24 @@ class Adaptible:
             """Waits for any tasks to background complete."""
             start_time = time.time()
             num_tasks = len(self.outstanding_tasks)
+            tasks = []
+            while self.outstanding_tasks:
+                tasks.append(self.outstanding_tasks.popleft())
+            print(f"Waiting for {num_tasks} background task(s) to complete...")
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    # Training failures must not take the server down; the model
+                    # simply keeps its pre-training weights.
+                    vizible.red(f"Background training task failed: {result!r}")
+                    log.logger.error(
+                        "Background training task failed.", exc_info=result
+                    )
+            vizible.green("Finished background tasks")
             print("Waiting for model state to stabilize...")
-            lock = threading.Lock()
-            with (
-                lock,
-                tqdm.tqdm(
-                    desc="Waiting for server to sync.", unit=" Seconds"
-                ) as server_pbar,
-            ):
-                vizible.green("Finished background tasks")
+            with tqdm.tqdm(
+                desc="Waiting for server to sync.", unit=" Seconds"
+            ) as server_pbar:
                 while not self.model.ok:
                     log.logger.info(
                         "Waiting for model server to sync. Is model is %s ok.",

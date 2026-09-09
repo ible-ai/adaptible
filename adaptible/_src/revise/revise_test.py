@@ -381,10 +381,13 @@ class MakeCollatedTrainingExampleTest(unittest.TestCase):
         self.mock_tokenizer = MagicMock()
 
         # Mock apply_chat_template
-        self.mock_tokenizer.apply_chat_template.side_effect = lambda conversation, tokenize, continue_final_message: (
-            f"<user>{conversation[0]['content']}</user><assistant>{conversation[1]['content']}</assistant>"
-            if not continue_final_message
-            else f"<user>{conversation[0]['content']}</user><assistant>"
+        # Mirrors a real chat template: with ``add_generation_prompt`` (or
+        # ``continue_final_message``) the rendered string ends at the open
+        # assistant tag; otherwise the assistant turn is closed.
+        self.mock_tokenizer.apply_chat_template.side_effect = lambda conversation, tokenize=False, continue_final_message=False, add_generation_prompt=False: (
+            f"<user>{conversation[0]['content']}</user><assistant>"
+            if continue_final_message or add_generation_prompt or len(conversation) < 2
+            else f"<user>{conversation[0]['content']}</user><assistant>{conversation[1]['content']}</assistant>"
         )
 
         # Mock encode to return predictable token IDs
