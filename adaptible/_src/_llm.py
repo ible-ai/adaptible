@@ -214,8 +214,10 @@ class StatefulLLM:
         Returns:
             Formatted chat string.
         """
+        # transformers >= 5 returns a BatchEncoding unless return_dict=False;
+        # mlx_lm.stream_generate needs a plain list of token ids.
         tokenized_prompt = self._tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True
+            messages, add_generation_prompt=True, return_dict=False
         )
         return cast(list[int], tokenized_prompt)
 
