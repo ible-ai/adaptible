@@ -406,11 +406,18 @@ def make_collated_training_example(
     index_to_rewrite = _isolate_turn_to_rewritten_turn_index(response)
     rewritten_response = _parse_rewritten_response(response, index_to_rewrite)
 
-    # Build the prompt prefix using the same format as generation
-    # For turn 0: just the user message with add_generation_prompt
-    # For later turns: include prior conversation
+    # Build the prompt prefix using the same format as generation: every turn
+    # before the revised one as user/assistant pairs (think blocks stripped, as
+    # the chat template does for prior assistant turns), then the revised
+    # turn's user message. For index 0 this is just that user message.
+    messages = []
+    for prior in interactions[:index_to_rewrite]:
+        messages.append({"role": "user", "content": prior.user_input})
+        messages.append(
+            {"role": "assistant", "content": strip_think_tags(prior.llm_response)}
+        )
     interaction_to_revise = interactions[index_to_rewrite]
-    messages = [{"role": "user", "content": interaction_to_revise.user_input}]
+    messages.append({"role": "user", "content": interaction_to_revise.user_input})
 
     # Use add_generation_prompt=True to match inference format exactly
     prompt_prefix = tokenizer.apply_chat_template(

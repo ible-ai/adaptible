@@ -30,6 +30,7 @@ Checkpoint = eval_mod.Checkpoint
 TriviaDataset = eval_mod.TriviaDataset
 TriviaItem = eval_mod.TriviaItem
 contains_key_terms = eval_mod.contains_key_terms
+extract_revision = harness.extract_revision
 generate_html_report = eval_mod.generate_html_report
 
 EOS = "<eos>"
@@ -85,8 +86,10 @@ class FakeModel:
             training call actually teaches the item. ``0`` learns immediately;
             a value >= the number of training calls means it never learns.
         revision: "valid" -> a well-formed revision containing the answer;
-            "invalid" -> text with no [[X]] markers; or a callable
-            ``(item) -> str`` for custom revisions.
+            "invalid" -> text with no [[X]] markers; a callable
+            ``(item) -> str`` for custom revisions; or a dict
+            ``item_id -> revision text`` scripting each item individually
+            (items missing from the dict get the "valid" revision).
         known_at_baseline: Item ids answered correctly before any training.
         think: Give the tokenizer a generation prompt ending in ``<think>\n``.
     """
@@ -95,7 +98,7 @@ class FakeModel:
         self,
         dataset: TriviaDataset,
         learns_after: int = 0,
-        revision: str | Callable[[TriviaItem], str] = "valid",
+        revision: str | Callable[[TriviaItem], str] | dict[str, str] = "valid",
         known_at_baseline: set[str] | None = None,
         think: bool = False,
     ):
@@ -125,6 +128,8 @@ class FakeModel:
                 for q, it in self._by_question.items()
                 if f"<user>{q}</user>" in prompt or f"User: {q}\n" in prompt
             )
+            if isinstance(self._revision, dict) and item.id in self._revision:
+                return self._revision[item.id]
             if callable(self._revision):
                 return self._revision(item)
             if self._revision == "invalid":
@@ -197,6 +202,24 @@ class JudgeTest(unittest.TestCase):
         self.assertFalse(contains_key_terms("Paris", ["london"]))
         self.assertFalse(contains_key_terms("", ["x"]))
         self.assertFalse(contains_key_terms("anything", []))
+
+
+class ExtractRevisionTest(unittest.TestCase):
+    """extract_revision returns the span make_collated_training_example trains on."""
+
+    def test_basic(self):
+        self.assertEqual(extract_revision("[[0]] Canberra. [[/0]]"), "Canberra.")
+
+    def test_lowest_index_wins_and_uses_last_markers(self):
+        text = "[[1]] junk [[/1]] [[0]] first [[0]] second [[/0]] tail [[/0]]"
+        self.assertEqual(extract_revision(text), "second [[/0]] tail")
+
+    def test_missing_closing_marker_runs_to_end(self):
+        self.assertEqual(extract_revision("[[0]] open ended"), "open ended")
+
+    def test_no_marker_raises(self):
+        with self.assertRaises(ValueError):
+            extract_revision("no markers here")
 
 
 class TrainingSourceTest(_TempDbTest):
@@ -403,6 +426,145 @@ class TrainingSourceTest(_TempDbTest):
             ),
             0,
         )
+
+    def test_ground_truth_has_no_revision_judgement(self):
+        dataset = make_dataset(4)
+        model = FakeModel(dataset)
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset, EvaluationConfig(name="gt-rev"), verbose=False
+        )
+        for item in result.items:
+            self.assertIsNone(item.revision_answer)
+            self.assertIsNone(item.revision_has_key_terms)
+            self.assertIsNone(item.revision_changed_text)
+            self.assertIsNone(item.revision_changed_verdict)
+        self.assertEqual(result.revision_valid_count, 0)
+        self.assertEqual(result.revision_attempted_count, 0)
+        self.assertEqual(
+            result.revision_summary(),
+            {
+                "attempted": 0,
+                "valid": 0,
+                "invalid": 0,
+                "correct": 0,
+                "fixed": 0,
+                "broke": 0,
+                "unchanged_text": 0,
+            },
+        )
+        text = pathlib.Path(
+            generate_html_report(result, self.tmp_path / "gt-rev.html")
+        ).read_text()
+        self.assertNotIn("Revisions:", text)
+        self.assertNotIn("responses-container three", text)
+
+    def test_revision_quality_is_judged_before_training(self):
+        # 5 items, train_ratio 0.8 -> q00..q03 trained, q04 holdout.
+        #   q00: baseline wrong, revision right      -> valid, fixed
+        #   q01: baseline right, revision wrong      -> valid, broke
+        #   q02: baseline wrong, revision restates it -> valid, wrong, verbatim
+        #   q03: baseline wrong, revision unparseable -> invalid, skipped
+        dataset = make_dataset(5)
+        revisions = {
+            "q00": "[[0]] The answer is Answer0. [[/0]]",
+            "q01": "[[0]] Honestly I have no idea about this one. [[/0]]",
+            "q02": f"[[0]] {DONT_KNOW} [[/0]]",
+            "q03": "Here is a revision with no markers at all.",
+        }
+        model = FakeModel(dataset, revision=revisions, known_at_baseline={"q01"})
+        config = EvaluationConfig(
+            name="sg-quality", train_ratio=0.8, training_source="self_generated"
+        )
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset, config, verbose=False
+        )
+        by_id = {item.item_id: item for item in result.items}
+
+        # Per-item instrumentation.
+        q00, q01, q02, q03, q04 = (by_id[f"q0{i}"] for i in range(5))
+        self.assertEqual(q00.revision_answer, "The answer is Answer0.")
+        self.assertIs(q00.revision_has_key_terms, True)
+        self.assertIs(q00.revision_changed_text, True)
+        self.assertIs(q00.revision_changed_verdict, True)
+        self.assertTrue(q00.revision_fixed)
+        self.assertFalse(q00.revision_broke)
+
+        self.assertEqual(q01.revision_answer, "Honestly I have no idea about this one.")
+        self.assertIs(q01.revision_has_key_terms, False)
+        self.assertIs(q01.revision_changed_text, True)
+        self.assertIs(q01.revision_changed_verdict, True)
+        self.assertTrue(q01.revision_broke)
+        self.assertFalse(q01.revision_fixed)
+
+        self.assertEqual(q02.revision_answer, DONT_KNOW)
+        self.assertIs(q02.revision_has_key_terms, False)
+        self.assertIs(q02.revision_changed_text, False)
+        self.assertIs(q02.revision_changed_verdict, False)
+        self.assertFalse(q02.revision_fixed or q02.revision_broke)
+
+        self.assertTrue(q03.revision_invalid)
+        self.assertFalse(q03.was_trained)
+        self.assertIsNone(q03.revision_answer)
+        self.assertIsNone(q03.revision_has_key_terms)
+
+        self.assertFalse(q04.was_trained)
+        self.assertIsNone(q04.revision_answer)
+
+        # Aggregate counts: 4 attempted, 3 valid, 1 correct, 1 fixed, 1 broke.
+        self.assertEqual(result.revision_attempted_count, 4)
+        self.assertEqual(result.revision_valid_count, 3)
+        self.assertEqual(result.revision_invalid_count, 1)
+        self.assertEqual(result.revision_correct_count, 1)
+        self.assertEqual(result.revision_fixed_count, 1)
+        self.assertEqual(result.revision_broke_count, 1)
+        self.assertEqual(result.revision_unchanged_text_count, 1)
+        summary = result.revision_summary()
+        self.assertEqual(
+            summary,
+            {
+                "attempted": 4,
+                "valid": 3,
+                "invalid": 1,
+                "correct": 1,
+                "fixed": 1,
+                "broke": 1,
+                "unchanged_text": 1,
+            },
+        )
+        self.assertEqual(
+            result.revision_summary_text(),
+            "Revisions: 4 attempted, 3 valid, of which 1 correct; fixed 1 wrong "
+            "answers, broke 1 right ones (1 restated the baseline verbatim).",
+        )
+        d = result.to_dict()
+        self.assertEqual(d["metrics"]["revision_summary"], summary)
+        d_q00 = next(i for i in d["items"] if i["item_id"] == "q00")
+        self.assertEqual(d_q00["revision_answer"], "The answer is Answer0.")
+        self.assertIs(d_q00["revision_has_key_terms"], True)
+        self.assertIs(d_q00["revision_changed_text"], True)
+        self.assertIs(d_q00["revision_changed_verdict"], True)
+
+        # Training actually used the parsed revisions (3 valid ones).
+        self.assertEqual(
+            model.trained_targets,
+            [
+                f"The answer is Answer0.{EOS}",
+                f"Honestly I have no idea about this one.{EOS}",
+                f"{DONT_KNOW}{EOS}",
+            ],
+        )
+
+        # The report shows each revision with its own judge mark and the summary.
+        text = pathlib.Path(
+            generate_html_report(result, self.tmp_path / "sg-quality.html")
+        ).read_text()
+        self.assertIn("Revisions: 4 attempted, 3 valid, of which 1 correct", text)
+        self.assertIn("The answer is Answer0.", text)
+        self.assertIn("Honestly I have no idea about this one.", text)
+        self.assertIn("Revision ✓ <small>(fixes baseline)</small>", text)
+        self.assertIn("Revision ✗ <small>(breaks baseline)</small>", text)
+        self.assertIn("Revision ✗ <small>(restates baseline)</small>", text)
+        self.assertEqual(text.count("responses-container three"), 3)
 
     def test_report_states_training_source(self):
         dataset = make_dataset(4)

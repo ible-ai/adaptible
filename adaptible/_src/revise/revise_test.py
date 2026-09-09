@@ -700,6 +700,67 @@ class CloseThinkTest(unittest.TestCase):
         self.assertEqual(masked, "Right answer.<eos>")
 
 
+class MultiTurnPrefixTest(unittest.TestCase):
+    """make_collated_training_example's prefix carries the turns before the revised one."""
+
+    GEN = "<assistant><think>\n"
+
+    INTERACTIONS = [
+        InteractionHistory(
+            idx=0, user_input="Q0", llm_response="<think>\nreasoning0\n</think>\n\nA0"
+        ),
+        InteractionHistory(idx=1, user_input="Q1", llm_response="reasoning1</think>A1"),
+        InteractionHistory(idx=2, user_input="Q2", llm_response="wrong"),
+    ]
+
+    def _run(self, response):
+        tokenizer = _CharTokenizer(self.GEN)
+        example = make_collated_training_example(response, self.INTERACTIONS, tokenizer)
+        inputs = example.input.tolist()[0]
+        labels = example.label.tolist()[0]
+        mask = example.mask.tolist()[0]
+        full = tokenizer.decode([inputs[0]] + labels)
+        masked = tokenizer.decode(t for t, m in zip(labels, mask) if m)
+        return full, masked, mask
+
+    def test_revising_last_turn_includes_prior_turns(self):
+        full, masked, mask = self._run("[[2]] Right answer. [[/2]]")
+        prefix = (
+            "<user>Q0</user><assistant>A0</assistant>"
+            "<user>Q1</user><assistant>A1</assistant>"
+            f"<user>Q2</user>{self.GEN}"
+        )
+        target = f"{THINK_CLOSE}Right answer.<eos>"
+        self.assertEqual(full, prefix + target)
+        self.assertEqual(masked, target)
+        self.assertNotIn("reasoning", full)
+        # Mask is 0 over the whole prefix and 1 over the whole target
+        # (mask[1:] alignment: position i predicts sequence[i + 1]).
+        n = len(prefix)
+        self.assertEqual(mask[: n - 1], [0] * (n - 1))
+        self.assertEqual(mask[n - 1 :], [1] * len(target))
+
+    def test_revising_first_turn_includes_no_prior_turns(self):
+        full, masked, _ = self._run("[[0]] Right answer. [[/0]]")
+        self.assertEqual(
+            full, f"<user>Q0</user>{self.GEN}{THINK_CLOSE}Right answer.<eos>"
+        )
+        self.assertNotIn("Q1", full)
+        self.assertNotIn("Q2", full)
+        self.assertEqual(masked, f"{THINK_CLOSE}Right answer.<eos>")
+
+    def test_single_turn_dialog_unchanged(self):
+        tokenizer = _CharTokenizer(self.GEN)
+        example = make_collated_training_example(
+            "[[0]] Right answer. [[/0]]", self.INTERACTIONS[:1], tokenizer
+        )
+        seq = tokenizer.encode(
+            f"<user>Q0</user>{self.GEN}{THINK_CLOSE}Right answer.<eos>"
+        )
+        self.assertEqual(example.input.tolist()[0], seq[:-1])
+        self.assertEqual(example.label.tolist()[0], seq[1:])
+
+
 class EdgeCaseTest(unittest.TestCase):
     """Tests for edge cases and error conditions."""
 

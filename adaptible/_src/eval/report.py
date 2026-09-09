@@ -55,6 +55,31 @@ def generate_html_report(
         else:
             revision_html = ""
 
+        # Self-generated runs: show the parsed revision (what was trained on)
+        # between the baseline and post-training answers, judged on its own.
+        if item.revision_answer is not None:
+            rev_ok = bool(item.revision_has_key_terms)
+            rev_class = "has-answer" if rev_ok else "missing-answer"
+            if item.revision_changed_text is False:
+                rev_note = "restates baseline"
+            elif item.revision_fixed:
+                rev_note = "fixes baseline"
+            elif item.revision_broke:
+                rev_note = "breaks baseline"
+            else:
+                rev_note = "same verdict"
+            revision_box_html = f"""
+                <div class="response-box revision {rev_class}">
+                    <div class="response-label">
+                        Revision {'✓' if rev_ok else '✗'} <small>({rev_note})</small>
+                    </div>
+                    <div class="response-content">{html.escape(item.revision_answer[:500])}{'...' if len(item.revision_answer) > 500 else ''}</div>
+                </div>"""
+            responses_class = "responses-container three"
+        else:
+            revision_box_html = ""
+            responses_class = "responses-container"
+
         card_html = f"""
         <div class="item-card">
             <div class="item-header">
@@ -72,13 +97,13 @@ def generate_html_report(
                 {revision_html}
             </div>
 
-            <div class="responses-container">
+            <div class="{responses_class}">
                 <div class="response-box {initial_class}">
                     <div class="response-label">
                         Initial {'✓' if item.initial_has_key_terms else '✗'}
                     </div>
                     <div class="response-content">{html.escape(item.initial_response[:500])}{'...' if len(item.initial_response) > 500 else ''}</div>
-                </div>
+                </div>{revision_box_html}
                 <div class="response-box {post_class}">
                     <div class="response-label">
                         Post-Training {'✓' if item.post_has_key_terms else '✗'}
@@ -142,6 +167,13 @@ def generate_html_report(
         f" {revision_invalid_count} item(s) were skipped because the revision "
         "failed validation."
         if revision_invalid_count
+        else ""
+    )
+    revision_summary_html = (
+        f'<div class="revision-summary">{html.escape(result.revision_summary_text())}'
+        " Judged before training, so this is the quality of what the model had to "
+        "learn from.</div>"
+        if training_source == "self_generated"
         else ""
     )
 
@@ -258,6 +290,15 @@ def generate_html_report(
             display: grid;
             grid-template-columns: 1fr 1fr;
         }}
+        .responses-container.three {{ grid-template-columns: 1fr 1fr 1fr; }}
+        .response-box.revision {{ background: #fffbea; }}
+        .response-label small {{ font-weight: normal; color: #666; }}
+        .revision-summary {{
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(0,0,0,0.1);
+            font-size: 0.95em;
+        }}
         .response-box {{
             padding: 15px;
             border-right: 1px solid #eee;
@@ -336,6 +377,7 @@ def generate_html_report(
         <strong>Training source:</strong> <code>{html.escape(training_source)}</code>
         (revision prompt: <code>{html.escape(revision_prompt)}</code>) &mdash;
         {training_source_text}{revision_invalid_text}
+        {revision_summary_html}
     </div>
 
     <div class="config-box">

@@ -24,6 +24,25 @@ What the model is trained on is controlled by `training_source` (`EvaluationConf
 
 Every published result from this repository used `ground_truth`. With `self_generated`, items whose revision fails validation are skipped (not trained) and counted in `EvaluationResult.revision_invalid_count`.
 
+### Revision quality (judged before training)
+
+A valid revision is not necessarily a good one. For `self_generated` runs the harness also judges the revision itself, before training on it, so you can tell whether the loop has anything worth learning from separately from whether training absorbed it. Per item (`ItemResult`):
+
+| Field | Meaning |
+|---|---|
+| `revision_answer` | The text between the `[[X]]` markers (`harness.extract_revision`), i.e. exactly what the loss mask covered |
+| `revision_has_key_terms` | `contains_key_terms(revision_answer, key_terms)`: the revision's own verdict |
+| `revision_changed_text` | `revision_answer != initial_response`; `False` means the model restated its baseline verbatim |
+| `revision_changed_verdict` | `revision_has_key_terms != initial_has_key_terms` |
+
+All four are `None` for `ground_truth` runs, holdout items, and invalid revisions. Over the trained items, `EvaluationResult` exposes `revision_attempted_count`, `revision_valid_count`, `revision_correct_count` (valid and has a key term), `revision_fixed_count` (baseline wrong, revision right), `revision_broke_count` (baseline right, revision wrong), `revision_unchanged_text_count`, and `revision_summary()` / `revision_summary_text()`. The harness prints the summary line at the end of a `self_generated` run and the report puts it in the header:
+
+```text
+Revisions: 84 attempted, 3 valid, of which 1 correct; fixed 1 wrong answers, broke 0 right ones (1 restated the baseline verbatim).
+```
+
+The `responses` table in `adaptible.db` has only `baseline` and `post_training` phases, so the revision is not stored there; it lives in the `EvaluationResult` (and the report's JSON dump) only.
+
 ### Revision prompt
 
 With `self_generated`, the prompt that asks the model for its revision is chosen by `revision_prompt` (`EvaluationConfig.revision_prompt`, `MetaLearningConfig.revision_prompt`, `--revision_prompt` on the CLI). It is ignored for `ground_truth`. Presets come from `adaptible.revise.revision_prompt_preset`:
@@ -140,6 +159,7 @@ dataset = load_dataset("my_dataset.json")
 | **Train Retention Rate**   | % of trained items that were right at baseline and stayed right |
 | **Holdout Accuracy**       | % of untrained items correct after training                   |
 | **Revision Invalid Count** | `self_generated` only: items skipped because the revision failed validation |
+| **Revision summary**       | `self_generated` only: attempted / valid / correct / fixed / broke counts of the revisions themselves, judged before training (see above) |
 
 All results are also written to `<outputs>/adaptible.db` (see `adaptible/_src/db.py`), where responses are stored raw and re-judged at query time.
 

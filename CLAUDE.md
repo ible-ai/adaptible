@@ -158,6 +158,5 @@ wheel.
 
 - The judge is substring matching against key terms. Items can be graded wrong for phrasing a
   correct answer differently, or right for mentioning a term in passing.
-- `make_revision_prompt` takes a `tokenizer` argument it does not use.
 - The eval and autonomous entry points open a browser and write reports to `/tmp` by default;
   pass `--no_browser` / `--output` in non-interactive runs.

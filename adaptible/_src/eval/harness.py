@@ -3,6 +3,7 @@
 import dataclasses
 import json
 import random
+import re
 import time
 import unicodedata
 from datetime import datetime
@@ -91,6 +92,17 @@ class ItemResult:
             ``self_generated`` (raw, including markers); None otherwise.
         revision_invalid: True if the item was scheduled for training but the
             self-generated revision failed validation, so no training happened.
+        revision_answer: The content between the ``[[X]]`` markers of a valid
+            self-generated revision, i.e. exactly what the model was trained on.
+            None for ``ground_truth`` runs, invalid revisions, and holdout items.
+        revision_has_key_terms: ``contains_key_terms`` applied to
+            ``revision_answer``: was the revision itself judged correct, before
+            any training happened? None whenever ``revision_answer`` is None.
+        revision_changed_text: ``revision_answer != initial_response``. False
+            means the model restated its baseline answer verbatim.
+        revision_changed_verdict: ``revision_has_key_terms !=
+            initial_has_key_terms``: the revision flipped the judge's verdict in
+            either direction.
     """
 
     item_id: str
@@ -107,6 +119,20 @@ class ItemResult:
     training_time_seconds: float = 0.0
     revision_text: str | None = None
     revision_invalid: bool = False
+    revision_answer: str | None = None
+    revision_has_key_terms: bool | None = None
+    revision_changed_text: bool | None = None
+    revision_changed_verdict: bool | None = None
+
+    @property
+    def revision_fixed(self) -> bool:
+        """Baseline was wrong and the revision is right."""
+        return bool(self.revision_has_key_terms) and not self.initial_has_key_terms
+
+    @property
+    def revision_broke(self) -> bool:
+        """Baseline was right and the revision is wrong."""
+        return self.revision_has_key_terms is False and self.initial_has_key_terms
 
 
 @dataclasses.dataclass
@@ -141,6 +167,71 @@ class EvaluationResult:
     @property
     def revision_invalid_count(self) -> int:
         return len(self.revision_invalid_items)
+
+    # Revision quality (self_generated only). These judge the model's revision
+    # *before* training on it, so they say whether the self-correction loop has
+    # anything useful to learn from, independent of whether training absorbed it.
+    @property
+    def revision_valid_items(self) -> list[ItemResult]:
+        """Trained items whose self-generated revision passed validation."""
+        return [item for item in self.train_items if item.revision_answer is not None]
+
+    @property
+    def revision_attempted_count(self) -> int:
+        """Items a revision was requested for (valid + invalid)."""
+        return len(self.revision_valid_items) + self.revision_invalid_count
+
+    @property
+    def revision_valid_count(self) -> int:
+        return len(self.revision_valid_items)
+
+    @property
+    def revision_correct_count(self) -> int:
+        """Valid revisions that contain a key term."""
+        return sum(
+            1 for item in self.revision_valid_items if item.revision_has_key_terms
+        )
+
+    @property
+    def revision_fixed_count(self) -> int:
+        """Valid revisions that turned a wrong baseline into a right answer."""
+        return sum(1 for item in self.revision_valid_items if item.revision_fixed)
+
+    @property
+    def revision_broke_count(self) -> int:
+        """Valid revisions that turned a right baseline into a wrong answer."""
+        return sum(1 for item in self.revision_valid_items if item.revision_broke)
+
+    @property
+    def revision_unchanged_text_count(self) -> int:
+        """Valid revisions that restated the baseline answer verbatim."""
+        return sum(
+            1
+            for item in self.revision_valid_items
+            if item.revision_changed_text is False
+        )
+
+    def revision_summary(self) -> dict[str, int]:
+        """Counts describing revision quality before training (self_generated)."""
+        return {
+            "attempted": self.revision_attempted_count,
+            "valid": self.revision_valid_count,
+            "invalid": self.revision_invalid_count,
+            "correct": self.revision_correct_count,
+            "fixed": self.revision_fixed_count,
+            "broke": self.revision_broke_count,
+            "unchanged_text": self.revision_unchanged_text_count,
+        }
+
+    def revision_summary_text(self) -> str:
+        """One-line version of ``revision_summary`` for logs and reports."""
+        s = self.revision_summary()
+        return (
+            f"Revisions: {s['attempted']} attempted, {s['valid']} valid, of which "
+            f"{s['correct']} correct; fixed {s['fixed']} wrong answers, broke "
+            f"{s['broke']} right ones ({s['unchanged_text']} restated the baseline "
+            "verbatim)."
+        )
 
     @property
     def baseline_accuracy(self) -> float:
@@ -234,6 +325,7 @@ class EvaluationResult:
                 "train_count": len(self.train_items),
                 "holdout_count": len(self.holdout_items),
                 "revision_invalid_count": self.revision_invalid_count,
+                "revision_summary": self.revision_summary(),
             },
             "items": [
                 {
@@ -251,6 +343,10 @@ class EvaluationResult:
                     "training_time_seconds": item.training_time_seconds,
                     "revision_text": item.revision_text,
                     "revision_invalid": item.revision_invalid,
+                    "revision_answer": item.revision_answer,
+                    "revision_has_key_terms": item.revision_has_key_terms,
+                    "revision_changed_text": item.revision_changed_text,
+                    "revision_changed_verdict": item.revision_changed_verdict,
                 }
                 for item in self.items
             ],
@@ -275,6 +371,31 @@ def contains_key_terms(response: str, key_terms: list[str]) -> bool:
     """
     response_norm = _normalize_for_match(response or "")
     return any(_normalize_for_match(term) in response_norm for term in key_terms)
+
+
+def extract_revision(response: str) -> str:
+    """Return the rewritten answer between the ``[[X]]`` and ``[[/X]]`` markers.
+
+    Mirrors the parsing ``revise.make_collated_training_example`` does when it
+    builds the training target: the turn index is the smallest ``[[N]]`` in the
+    response and the content is whatever sits between the last ``[[N]]`` and the
+    last ``[[/N]]``, stripped. Pure function; assumes ``response`` has already
+    passed ``validate_revision_response``.
+
+    Raises:
+        ValueError: If no ``[[N]]`` marker is present.
+    """
+    indices = re.findall(r"\[\[([0-9]+)\]\]", response)
+    if not indices:
+        raise ValueError(f"No [[X]] marker in revision: {response[:100]!r}")
+    idx = min(map(int, indices))
+    start = None
+    end = None
+    for match in re.finditer(rf"\[\[{idx}\]\]", response):
+        start = match.end()
+    for match in re.finditer(rf"\[\[/{idx}\]\]", response):
+        end = match.start()
+    return response[start:end].strip()
 
 
 # --------------------------------------------------------------------------
@@ -449,6 +570,10 @@ class TrainingOutcome:
     revision_invalid: bool = False
     revision_error: str | None = None
     training_time_seconds: float = 0.0
+    # Parsed content of a valid self-generated revision and its judge verdict,
+    # recorded before training so revision quality can be measured on its own.
+    revision_answer: str | None = None
+    revision_has_key_terms: bool | None = None
 
 
 def _train_one_item(
@@ -477,12 +602,22 @@ def _train_one_item(
             trained=False, revision_invalid=True, revision_error=str(e)
         )
 
+    revision_answer: str | None = None
+    revision_has_key_terms: bool | None = None
+    if revision_text is not None:
+        revision_answer = extract_revision(revision_text)
+        revision_has_key_terms = contains_key_terms(revision_answer, item.key_terms)
+
     train_start = time.time()
     model.train_on_example(example, iterations=training_iterations)
     elapsed = time.time() - train_start
     _record_training_event(db, example_id, experiment_id, training_iterations, elapsed)
     return TrainingOutcome(
-        trained=True, revision_text=revision_text, training_time_seconds=elapsed
+        trained=True,
+        revision_text=revision_text,
+        training_time_seconds=elapsed,
+        revision_answer=revision_answer,
+        revision_has_key_terms=revision_has_key_terms,
     )
 
 
@@ -692,6 +827,15 @@ class EvaluationHarness:
             # An item whose revision was rejected was never trained on; keep it
             # out of the train metrics but flag it so it is counted.
             item_result.was_trained = outcome.trained
+            if outcome.revision_answer is not None:
+                item_result.revision_answer = outcome.revision_answer
+                item_result.revision_has_key_terms = outcome.revision_has_key_terms
+                item_result.revision_changed_text = (
+                    outcome.revision_answer != item_result.initial_response
+                )
+                item_result.revision_changed_verdict = (
+                    outcome.revision_has_key_terms != item_result.initial_has_key_terms
+                )
 
             if verbose:
                 if outcome.revision_invalid:
@@ -700,6 +844,11 @@ class EvaluationHarness:
                     )
                 else:
                     print(f"       Trained ({outcome.training_time_seconds:.1f}s)")
+                    if outcome.revision_answer is not None:
+                        was = "✓" if item_result.initial_has_key_terms else "✗"
+                        now = "✓" if outcome.revision_has_key_terms else "✗"
+                        same = "" if item_result.revision_changed_text else " (verbatim)"
+                        print(f"       Revision judged {was} → {now}{same}")
 
         # Phase 3: Post-training inference
         if verbose:
@@ -759,6 +908,7 @@ class EvaluationHarness:
             if config.training_source == "self_generated":
                 print(f"Revision prompt: {config.revision_prompt}")
                 print(f"Invalid revisions (skipped): {result.revision_invalid_count}")
+                print(result.revision_summary_text())
             print()
             print(f"Results saved to database (experiment_id={experiment_id})")
 
