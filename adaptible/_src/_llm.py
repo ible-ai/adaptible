@@ -597,7 +597,9 @@ class StatefulLLM:
         max_buffer_length = mlx.core.metal.device_info()["max_buffer_length"]
         assert isinstance(max_buffer_length, int)
 
-        mlx.core.set_cache_limit(max_buffer_length)
+        # Cap the buffer cache: caching up to max_buffer_length (many GB) lets freed
+        # activations accumulate across hundreds of training steps until Metal OOMs.
+        mlx.core.set_cache_limit(min(max_buffer_length, 1 << 30))
         world = mlx.core.distributed.init()
         world_size = world.size()
         rank = world.rank()
@@ -669,6 +671,9 @@ class StatefulLLM:
                 if save_checkpoint and self._model_path is not None:
                     self._save_checkpoint()
         finally:
+            # Release cached activation buffers between items; otherwise a long
+            # sequential run accumulates them until Metal reports OOM.
+            mlx.core.clear_cache()
             self._model_is_stable = True
         return stats
 
