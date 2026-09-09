@@ -152,6 +152,7 @@ def generate_html_report(
     revision_prompt = getattr(result.config, "revision_prompt", "default")
     think_mode = getattr(result.config, "think_mode", "empty")
     rehearsal_k = getattr(result.config, "rehearsal_k", 0)
+    rehearsal_max_tokens = getattr(result.config, "rehearsal_max_tokens", 768)
     collapse_text = html.escape(result.collapse_summary_text())
     if training_source == "self_generated":
         training_source_text = (
@@ -388,7 +389,7 @@ def generate_html_report(
         Training source: {html.escape(training_source)} |
         Revision prompt: {html.escape(revision_prompt)} |
         Think mode: <code>{html.escape(str(think_mode))}</code> |
-        Rehearsal k: <code>{rehearsal_k}</code> |
+        Rehearsal k: <code>{rehearsal_k}</code> (max tokens: <code>{rehearsal_max_tokens}</code>) |
         Training iterations: {result.config.training_iterations} |
         Train/Holdout split: {result.config.train_ratio:.0%}/{1-result.config.train_ratio:.0%} |
         Shuffle: {result.config.shuffle} (seed: {result.config.seed})

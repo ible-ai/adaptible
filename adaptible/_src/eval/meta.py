@@ -37,6 +37,7 @@ from .harness import (
     _train_one_item,
     sample_rehearsal_ids,
     validate_rehearsal_k,
+    validate_rehearsal_max_tokens,
     validate_training_source,
 )
 from ..revise import resolve_think_mode, revision_prompt_preset
@@ -402,8 +403,10 @@ class MetaLearningConfig:
             ``<think>`` block; see ``EvaluationConfig.think_mode``.
         close_think: Deprecated alias for ``think_mode``; ``False`` forces
             ``"none"``. Always ``think_mode != "none"`` after construction.
-        rehearsal_k: Rehearsal examples batched with every correction; see
+        rehearsal_k: Rehearsal examples trained after every correction; see
             ``EvaluationConfig.rehearsal_k``.
+        rehearsal_max_tokens: Baseline token cap for rehearsal-pool items; see
+            ``EvaluationConfig.rehearsal_max_tokens``.
         holdout_every_checkpoint: Also probe the holdout set at every
             checkpoint (costs a holdout-sized inference pass per checkpoint).
         repeats: Run each seed this many times with an identical shuffle. Any
@@ -424,6 +427,7 @@ class MetaLearningConfig:
     think_mode: str = "baseline"
     close_think: bool | None = None
     rehearsal_k: int = 0
+    rehearsal_max_tokens: int = 768
     holdout_every_checkpoint: bool = False
     repeats: int = 1
 
@@ -433,6 +437,7 @@ class MetaLearningConfig:
         self.think_mode = resolve_think_mode(self.think_mode, self.close_think)
         self.close_think = self.think_mode != "none"
         validate_rehearsal_k(self.rehearsal_k)
+        validate_rehearsal_max_tokens(self.rehearsal_max_tokens)
         if self.repeats < 1:
             raise ValueError(f"repeats must be >= 1, got {self.repeats}")
 
@@ -449,6 +454,7 @@ class MetaLearningConfig:
             "think_mode": self.think_mode,
             "close_think": self.close_think,
             "rehearsal_k": self.rehearsal_k,
+            "rehearsal_max_tokens": self.rehearsal_max_tokens,
             "holdout_every_checkpoint": self.holdout_every_checkpoint,
             "repeats": self.repeats,
         }
@@ -466,6 +472,7 @@ class MetaLearningConfig:
             revision_prompt=data.get("revision_prompt", "default"),
             think_mode=_legacy_think_mode(data),
             rehearsal_k=data.get("rehearsal_k", 0),
+            rehearsal_max_tokens=data.get("rehearsal_max_tokens", 768),
             holdout_every_checkpoint=data.get("holdout_every_checkpoint", False),
             repeats=data.get("repeats", 1),
         )
@@ -772,7 +779,10 @@ class MetaLearningExperiment:
         if config.training_source == "self_generated":
             print(f"  Revision prompt: {config.revision_prompt}")
         print(f"  Think mode: {config.think_mode}")
-        print(f"  Rehearsal k: {config.rehearsal_k}")
+        print(
+            f"  Rehearsal k: {config.rehearsal_k} "
+            f"(max tokens: {config.rehearsal_max_tokens})"
+        )
         for (seed, repeat), traj in sorted(result.all_trajectories.items()):
             label = f"Seed {seed}" + (f" repeat {repeat}" if config.repeats > 1 else "")
             print(f"  {label}:")
@@ -868,6 +878,7 @@ class MetaLearningExperiment:
                     "think_mode": config.think_mode,
                     "close_think": config.close_think,
                     "rehearsal_k": config.rehearsal_k,
+                    "rehearsal_max_tokens": config.rehearsal_max_tokens,
                     "model_kwargs": self._model_kwargs,
                     "holdout_every_checkpoint": config.holdout_every_checkpoint,
                     "dataset_name": dataset.name,
@@ -905,6 +916,7 @@ class MetaLearningExperiment:
             {}
         )  # item_id -> (response, correct)
         baseline_raw: dict[str, str] = {}  # item_id -> raw response (think included)
+        baseline_tokens: dict[str, int] = {}  # item_id -> raw response token count
         for idx in indices:
             item = dataset[idx]
             rec = _infer_and_record(
@@ -919,6 +931,7 @@ class MetaLearningExperiment:
             )
             baseline_responses[item.id] = (rec.clean, rec.correct)
             baseline_raw[item.id] = rec.raw
+            baseline_tokens[item.id] = rec.token_count
 
         # Phase 2: Train with checkpoints
         if verbose:
@@ -928,11 +941,13 @@ class MetaLearningExperiment:
 
         post_responses: dict[str, tuple[str, bool]] = {}  # Updated as we train
         trained_items: list[str] = []  # in training order
-        # Rehearsal pool: trained-split items whose baseline was judged correct.
+        # Rehearsal pool: trained-split items whose baseline was judged correct
+        # and is short enough to train on.
         rehearsal_pool = [
             dataset[idx].id
             for idx in train_indices
             if baseline_responses[dataset[idx].id][1]
+            and baseline_tokens[dataset[idx].id] <= config.rehearsal_max_tokens
         ]
         train_position = 0
 

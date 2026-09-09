@@ -78,7 +78,13 @@ class EvaluationConfig:
             answer was judged correct, with the model's own full baseline output
             as the target (self-distillation). Sampled with
             ``seed + item index``; the item being corrected is never in its own
-            rehearsal set. Holdout items are never used.
+            rehearsal set. Holdout items are never used. The correction and each
+            rehearsal example are trained as separate single-row calls (see
+            ``_train_one_item``), so memory is bounded by one sequence.
+        rehearsal_max_tokens: Items whose raw baseline response is longer than
+            this many tokens are excluded from the rehearsal pool. Rehearsal
+            targets are the model's own full baseline output, which can run to
+            the generation cap; this keeps every training sequence bounded.
     """
 
     name: str = "default"
@@ -93,6 +99,7 @@ class EvaluationConfig:
     think_mode: str = "baseline"
     close_think: bool | None = None
     rehearsal_k: int = 0
+    rehearsal_max_tokens: int = 768
 
     def __post_init__(self) -> None:
         validate_training_source(self.training_source)
@@ -100,12 +107,21 @@ class EvaluationConfig:
         self.think_mode = resolve_think_mode(self.think_mode, self.close_think)
         self.close_think = self.think_mode != "none"
         validate_rehearsal_k(self.rehearsal_k)
+        validate_rehearsal_max_tokens(self.rehearsal_max_tokens)
 
 
 def validate_rehearsal_k(rehearsal_k: int) -> None:
     """Raise ValueError unless ``rehearsal_k`` is a non-negative int."""
     if not isinstance(rehearsal_k, int) or rehearsal_k < 0:
         raise ValueError(f"rehearsal_k must be a non-negative int, got {rehearsal_k!r}")
+
+
+def validate_rehearsal_max_tokens(rehearsal_max_tokens: int) -> None:
+    """Raise ValueError unless ``rehearsal_max_tokens`` is a positive int."""
+    if not isinstance(rehearsal_max_tokens, int) or rehearsal_max_tokens <= 0:
+        raise ValueError(
+            f"rehearsal_max_tokens must be a positive int, got {rehearsal_max_tokens!r}"
+        )
 
 
 @dataclasses.dataclass
@@ -422,6 +438,7 @@ class EvaluationResult:
                 "think_mode": self.config.think_mode,
                 "close_think": self.config.close_think,
                 "rehearsal_k": self.config.rehearsal_k,
+                "rehearsal_max_tokens": self.config.rehearsal_max_tokens,
             },
             "dataset_name": self.dataset_name,
             "timestamp": self.timestamp,
@@ -741,8 +758,12 @@ def _train_one_item(
 
     ``baseline_response`` is the raw baseline output (think block included).
     ``rehearsal`` is a list of ``(item, baseline_raw)`` pairs whose self-
-    distillation examples are batched with the correction (row 0) into a single
-    ``train_on_example`` call.
+    distillation examples are trained after the correction. Every example is
+    its own single-row ``train_on_example`` call (correction first, then the
+    rehearsal examples in order) so peak memory is bounded by one sequence;
+    padding a batch of rehearsal targets that can run to the generation cap
+    exhausted a 16 GB machine. One training event is recorded for the item,
+    with ``training_time_seconds`` summed over the calls.
 
     On ``InvalidRevisionError`` the item is not trained and the outcome carries
     ``revision_invalid=True`` plus the error text.
@@ -757,10 +778,9 @@ def _train_one_item(
         )
     tokenizer = model._tokenizer
     rehearsal = rehearsal or []
-    batch = [correction] + [
+    examples = [correction] + [
         make_rehearsal_example(r_item, r_raw, tokenizer) for r_item, r_raw in rehearsal
     ]
-    example = collate_training_examples(batch, tokenizer)
 
     revision_answer: str | None = None
     revision_has_key_terms: bool | None = None
@@ -769,7 +789,9 @@ def _train_one_item(
         revision_has_key_terms = contains_key_terms(revision_answer, item.key_terms)
 
     train_start = time.time()
-    model.train_on_example(example, iterations=training_iterations)
+    for example in examples:
+        batched = collate_training_examples([example], tokenizer)
+        model.train_on_example(batched, iterations=training_iterations)
     elapsed = time.time() - train_start
     _record_training_event(db, example_id, experiment_id, training_iterations, elapsed)
     return TrainingOutcome(
@@ -891,6 +913,7 @@ class EvaluationHarness:
                     "think_mode": config.think_mode,
                     "close_think": config.close_think,
                     "rehearsal_k": config.rehearsal_k,
+                    "rehearsal_max_tokens": config.rehearsal_max_tokens,
                     "model_kwargs": self._model_kwargs,
                     "dataset_name": dataset.name,
                     "dataset_version": dataset.version,
@@ -920,7 +943,10 @@ class EvaluationHarness:
             if config.training_source == "self_generated":
                 print(f"Revision prompt: {config.revision_prompt}")
             print(f"Think mode: {config.think_mode}")
-            print(f"Rehearsal k: {config.rehearsal_k}")
+            print(
+                f"Rehearsal k: {config.rehearsal_k} "
+                f"(max tokens: {config.rehearsal_max_tokens})"
+            )
             if self._model_kwargs:
                 print(f"Model kwargs: {self._model_kwargs}")
             print(f"Experiment ID: {experiment_id}")
@@ -977,10 +1003,14 @@ class EvaluationHarness:
             print("=" * 60)
 
         train_items = [(dataset[idx], idx) for idx in indices if idx in train_indices]
-        # Rehearsal pool: trained-split items whose baseline was judged correct.
-        # Holdout items never enter it, so holdout stays untouched by training.
+        # Rehearsal pool: trained-split items whose baseline was judged correct
+        # and is short enough to train on. Holdout items never enter it, so
+        # holdout stays untouched by training.
         rehearsal_pool = [
-            item.id for item, _ in train_items if item_results[item.id].initial_has_key_terms
+            item.id
+            for item, _ in train_items
+            if item_results[item.id].initial_has_key_terms
+            and item_results[item.id].initial_token_count <= config.rehearsal_max_tokens
         ]
         items_by_id = {item.id: item for item, _ in train_items}
         for i, (item, idx) in enumerate(train_items):
@@ -1106,7 +1136,10 @@ class EvaluationHarness:
                 print(f"Revision prompt: {config.revision_prompt}")
                 print(f"Invalid revisions (skipped): {result.revision_invalid_count}")
                 print(result.revision_summary_text())
-            print(f"Think mode: {config.think_mode}; rehearsal k: {config.rehearsal_k}")
+            print(
+                f"Think mode: {config.think_mode}; rehearsal k: {config.rehearsal_k} "
+                f"(max tokens: {config.rehearsal_max_tokens})"
+            )
             print(result.collapse_summary_text())
             print()
             print(f"Results saved to database (experiment_id={experiment_id})")

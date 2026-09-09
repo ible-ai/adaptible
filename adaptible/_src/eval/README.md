@@ -68,7 +68,7 @@ Templates without a think tag are unaffected by `think_mode`. Both `training_sou
 
 ### Rehearsal (`rehearsal_k`)
 
-The `empty` run above also drifted unrelated facts ("The skin" for the largest planet). `rehearsal_k` (`EvaluationConfig.rehearsal_k`, `MetaLearningConfig.rehearsal_k`, `--rehearsal_k`; default 0) batches every correction with `k` self-distillation examples: other *trained-split* items whose baseline answer was judged correct, with the model's own full baseline output (`{think}</think>\n\n{answer}{eos}`, whole target in the loss) as the target. The batch is padded with the tokenizer's pad/eos id (mask 0 on padding) and trained in one `train_on_example` call. Rehearsal items are sampled with `seed + item index`, never include the item being corrected, and never include holdout items. `ItemResult.rehearsal_item_ids` records which items were used.
+The `empty` run above also drifted unrelated facts ("The skin" for the largest planet). `rehearsal_k` (`EvaluationConfig.rehearsal_k`, `MetaLearningConfig.rehearsal_k`, `--rehearsal_k`; default 0) follows every correction with `k` self-distillation examples: other *trained-split* items whose baseline answer was judged correct, with the model's own full baseline output (`{think}</think>\n\n{answer}{eos}`, whole target in the loss) as the target. Each example is its own single-row `train_on_example` call with `training_iterations` iterations, correction first and then the rehearsal examples in order, so peak memory is bounded by one sequence (a padded `(1+k, L)` batch of rehearsal targets that ran to the generation cap exhausted a 16 GB machine). One training event is recorded per item, with the elapsed time summed over the calls. Rehearsal items are sampled with `seed + item index`, never include the item being corrected, and never include holdout items. `rehearsal_max_tokens` (`--rehearsal_max_tokens`; default 768) keeps items whose raw baseline response is longer than that out of the pool; if fewer than `k` items remain, the ones that do are used. `ItemResult.rehearsal_item_ids` records which items were used.
 
 ### Collapse signals
 
@@ -120,7 +120,8 @@ config = eval.EvaluationConfig(
     training_source="ground_truth",   # or "self_generated"
     revision_prompt="default",        # or "fewshot"; only used by self_generated
     think_mode="baseline",            # or "empty" / "none"; see above
-    rehearsal_k=0,                    # >0 batches self-distillation examples with each correction
+    rehearsal_k=0,                    # >0 trains self-distillation examples after each correction
+    rehearsal_max_tokens=768,         # rehearsal pool skips baselines longer than this
 )
 
 harness = eval.EvaluationHarness(model_kwargs={"learning_rate": 5e-5})  # note: loads <outputs>/autonomous/checkpoint if present
@@ -264,7 +265,8 @@ result = eval.MetaLearningResult.load("outputs/meta/meta.json")
 | `--revision_prompt` | `default`                         | `default` or `fewshot`; revision prompt preset for `self_generated` |
 | `--think_mode`      | `baseline`                        | `baseline`, `empty`, or `none` (see above)               |
 | `--close_think`     | `None`                            | Deprecated; `--noclose_think` is `--think_mode none`      |
-| `--rehearsal_k`     | `0`                               | Self-distillation examples batched with each correction  |
+| `--rehearsal_k`     | `0`                               | Self-distillation examples trained after each correction |
+| `--rehearsal_max_tokens` | `768`                        | Baseline token cap for rehearsal-pool items              |
 | `--learning_rate`   | `None`                            | `StatefulLLM(learning_rate=...)`; model default if unset |
 | `--subset`          | `None`                            | Use only first N questions                               |
 | `--category`        | `None`                            | Filter to specific category                              |

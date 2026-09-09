@@ -39,6 +39,7 @@ EvaluationResult = harness.EvaluationResult
 
 EOS = "<eos>"
 DONT_KNOW = "I do not know."
+LONG_ANSWER_TOKENS = 2000  # a FakeModel(long_at_baseline=...) answer, in fake tokens
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 
@@ -104,6 +105,9 @@ class FakeModel:
         think: Give the tokenizer a generation prompt ending in ``<think>\n``
             and make every trivia answer carry ``fake_think(item)`` before
             ``</think>``, the way DeepSeek-R1-Distill does.
+        long_at_baseline: Item ids whose trivia answer is padded out to
+            ``LONG_ANSWER_TOKENS`` tokens, the way a small model rambles to the
+            generation cap. Used to exercise ``rehearsal_max_tokens``.
     """
 
     def __init__(
@@ -113,9 +117,11 @@ class FakeModel:
         revision: str | Callable[[TriviaItem], str] | dict[str, str] = "valid",
         known_at_baseline: set[str] | None = None,
         think: bool = False,
+        long_at_baseline: set[str] | None = None,
     ):
         self._tokenizer = FakeTokenizer(think=think)
         self._think = think
+        self._long_at_baseline = set(long_at_baseline or set())
         self._max_tokens = 4096
         self._model_is_stable = True
         self._by_question = {item.question: item for item in dataset}
@@ -154,6 +160,8 @@ class FakeModel:
         self.question_prompts.append(prompt)
         item = self._by_question[prompt]
         answer = f"It is {item.correct_answer}." if item.id in self.learned else DONT_KNOW
+        if item.id in self._long_at_baseline:
+            answer = answer.ljust(LONG_ANSWER_TOKENS, ".")
         if self._think:
             return f"{fake_think(item)}\n</think>\n\n{answer}"
         return answer
@@ -191,6 +199,23 @@ def make_dataset(n: int) -> TriviaDataset:
         for i in range(n)
     ]
     return TriviaDataset(name="fake", version="1", items=items)
+
+
+def training_groups(model: FakeModel, ks: list[int]) -> list[list[tuple[str, str]]]:
+    """Split the model's single-row training calls into per-item groups.
+
+    With micro-batched rehearsal every item makes ``1 + k`` calls: the
+    correction, then each rehearsal example. Returns, per item, the list of
+    ``(masked target, full sequence)`` rows in call order.
+    """
+    groups, pos = [], 0
+    for k in ks:
+        calls = model.trained_batches[pos : pos + 1 + k]
+        assert all(len(rows) == 1 for rows in calls), "every call is one row"
+        groups.append([rows[0] for rows in calls])
+        pos += 1 + k
+    assert pos == len(model.trained_batches), (pos, len(model.trained_batches))
+    return groups
 
 
 class _TempDbTest(unittest.TestCase):
@@ -814,19 +839,53 @@ class MetaLearningTest(_TempDbTest):
         )
         result = experiment.run(dataset, config, verbose=False)
         traj = result.trajectories[1]
-        self.assertEqual(len(model.batch_shapes), 8)
-        self.assertTrue(all(shape[0] == 3 for shape in model.batch_shapes))
+        # 8 items x (1 correction + 2 rehearsal) single-row calls.
+        self.assertEqual(model.train_calls, 8 * 3)
+        self.assertTrue(all(shape[0] == 1 for shape in model.batch_shapes))
         holdout_questions = {
             dataset[idx].question for idx in traj_holdout_indices(dataset, seed=1)
         }
-        for rows in model.trained_batches:
+        for rows in training_groups(model, [2] * 8):
+            self.assertRegex(rows[0][0], r"^Answer\d+<eos>$")  # correction first
             for masked, full in rows[1:]:
                 q = full.split("<user>")[1].split("</user>")[0]
                 self.assertNotIn(q, holdout_questions)
                 self.assertRegex(masked, r"^Thinking about q\d\d\.\n</think>\n\nIt is Answer\d+\.<eos>$")
         cfg = self._config_json_for(traj.experiment_id)
         self.assertEqual(cfg["rehearsal_k"], 2)
+        self.assertEqual(cfg["rehearsal_max_tokens"], 768)
+        self.assertEqual(
+            MetaLearningConfig.from_dict(config.to_dict()).rehearsal_max_tokens, 768
+        )
         self.assertEqual(cfg["model_kwargs"], {"learning_rate": 3e-5})
+
+    def test_meta_rehearsal_pool_honors_max_tokens(self):
+        dataset = make_dataset(10)
+        known = {i.id for i in dataset}
+        model = FakeModel(
+            dataset, think=True, known_at_baseline=known, long_at_baseline={"q00"}
+        )
+        config = MetaLearningConfig(
+            name="cap",
+            seeds=[1],
+            checkpoint_interval=4,
+            train_ratio=0.8,
+            rehearsal_k=9,
+            rehearsal_max_tokens=200,
+        )
+        MetaLearningExperiment(model_factory=lambda: model, db=self.db).run(
+            dataset, config, verbose=False
+        )
+        # 8 trained items; every one is rehearsed on the other short trained
+        # items only (7 others, minus q00 when it is in the trained split).
+        long_q = f"<user>{dataset[0].question}</user>"
+        rehearsal_rows = [
+            rows[0] for rows in model.trained_batches if "</think>" in rows[0][0]
+        ]
+        self.assertTrue(rehearsal_rows)
+        for _, full in rehearsal_rows:
+            self.assertNotIn(long_q, full)
+        self.assertTrue(all(shape[0] == 1 for shape in model.batch_shapes))
 
     def test_meta_fewshot_revision_prompt_threads_through(self):
         dataset = make_dataset(10)
@@ -1022,9 +1081,13 @@ def traj_holdout_indices(dataset, seed: int) -> list[int]:
 
 
 class RehearsalTest(_TempDbTest):
-    """rehearsal_k batches self-distillation rows with each correction."""
+    """rehearsal_k trains self-distillation rows after each correction.
 
-    def test_rehearsal_batch_shape_rows_and_padding(self):
+    Every example is its own single-row ``train_on_example`` call: correction
+    first, then each rehearsal example in sampled order.
+    """
+
+    def test_rehearsal_micro_batches_correction_then_rehearsal(self):
         # 6 items, train_ratio 5/6 -> q00..q04 trained, q05 holdout.
         # q01, q03 and q05 are known at baseline: the pool is {q01, q03} (q05 is
         # holdout and must never be rehearsed).
@@ -1035,21 +1098,27 @@ class RehearsalTest(_TempDbTest):
             dataset, config, verbose=False
         )
         by_id = {item.item_id: item for item in result.items}
+        trained = [by_id[item.id] for item in dataset.items[:5]]
+        ks = [len(r.rehearsal_item_ids) for r in trained]
 
-        # One train_on_example call per trained item.
-        self.assertEqual(model.train_calls, 5)
-        self.assertEqual(len(model.batch_shapes), 5)
-        for i, (item, rows, shape) in enumerate(
-            zip(dataset.items[:5], model.trained_batches, model.batch_shapes)
-        ):
+        # One single-row call per correction and per rehearsal example.
+        self.assertEqual(ks, [2, 1, 2, 1, 2])  # k capped at the pool minus self
+        self.assertEqual(model.train_calls, sum(1 + k for k in ks))
+        for shape in model.batch_shapes:
+            self.assertEqual(shape[0], 1)
+        # Single rows are never padded: the last label is <eos>, masked in.
+        for rows in model.trained_batches:
+            self.assertTrue(rows[0][0].endswith(EOS))
+        groups = training_groups(model, ks)
+        for item, r, rows in zip(dataset.items[:5], trained, groups):
             pool = [pid for pid in ("q01", "q03") if pid != item.id]
-            self.assertEqual(shape[0], 1 + len(pool))  # (1+k, L), k capped at the pool
-            # Row 0 is the correction with the model's own reasoning unmasked.
+            # Row 0 of each item's group is the correction with the model's own
+            # reasoning unmasked.
             masked, full = rows[0]
             self.assertEqual(masked, f"{item.correct_answer}{EOS}")
             self.assertIn(f"{fake_think(item)}\n</think>\n\n", full)
-            # The other rows are correct-baseline items, never the item itself,
-            # trained on their own full baseline output.
+            # The following calls are correct-baseline items, never the item
+            # itself, trained on their own full baseline output, in sample order.
             rehearsed = []
             for masked, full in rows[1:]:
                 r_item = next(
@@ -1065,52 +1134,107 @@ class RehearsalTest(_TempDbTest):
                     f"<user>{r_item.question}</user><assistant><think>\n{baseline_raw}{EOS}",
                 )
             self.assertEqual(sorted(rehearsed), sorted(pool))
-            self.assertEqual(sorted(by_id[item.id].rehearsal_item_ids), sorted(pool))
+            self.assertEqual(rehearsed, r.rehearsal_item_ids)
         # Holdout items are untouched and have no rehearsal ids.
         self.assertEqual(by_id["q05"].rehearsal_item_ids, [])
         self.assertNotIn("q05", {rid for r in result.items for rid in r.rehearsal_item_ids})
+        # One training event per item, not per call.
+        experiment_id = self._latest_experiment_id()
+        events = self.db.get_training_events_for_experiment(experiment_id)
+        self.assertEqual(len(events), 5)
         d = result.to_dict()
         self.assertEqual(d["config"]["rehearsal_k"], 2)
-        self.assertEqual(
-            self._config_json_for(self._latest_experiment_id())["rehearsal_k"], 2
-        )
+        self.assertEqual(d["config"]["rehearsal_max_tokens"], 768)
+        cfg = self._config_json_for(experiment_id)
+        self.assertEqual(cfg["rehearsal_k"], 2)
+        self.assertEqual(cfg["rehearsal_max_tokens"], 768)
         self.assertTrue(
             any(i["rehearsal_item_ids"] for i in d["items"] if i["was_trained"])
         )
 
-    def test_rehearsal_padding_has_zero_mask(self):
-        # Rows differ in length, so the collated batch is padded; padded
-        # positions carry mask 0 and the pad id (eos here, since the fake
-        # tokenizer has no pad id).
-        dataset = make_dataset(3)
-        model = FakeModel(dataset, think=True, known_at_baseline={"q01"})
-        tok = model._tokenizer
-        tok.eos_token_id = 99999
-        captured = []
-        original = model.train_on_example
-        model.train_on_example = lambda ex, **kw: (captured.append(ex), original(ex, **kw))
-        EvaluationHarness(model=model, db=self.db).run(
-            dataset, EvaluationConfig(name="pad", train_ratio=1.0, rehearsal_k=1),
-            verbose=False,
+    def test_rehearsal_pool_honors_max_tokens(self):
+        # Everything is correct at baseline, but q02 rambles for
+        # LONG_ANSWER_TOKENS tokens: it is never rehearsed under the cap, and
+        # the pool shrinks to the remaining items.
+        dataset = make_dataset(6)
+        known = {item.id for item in dataset}
+
+        def run(max_tokens: int):
+            model = FakeModel(
+                dataset, think=True, known_at_baseline=known, long_at_baseline={"q02"}
+            )
+            result = EvaluationHarness(model=model, db=self.db).run(
+                dataset,
+                EvaluationConfig(
+                    name="cap",
+                    train_ratio=1.0,
+                    rehearsal_k=5,
+                    rehearsal_max_tokens=max_tokens,
+                ),
+                verbose=False,
+            )
+            return model, {item.item_id: item for item in result.items}
+
+        model, by_id = run(200)
+        self.assertGreater(by_id["q02"].initial_token_count, 200)
+        for item_id in known - {"q02"}:
+            self.assertLessEqual(by_id[item_id].initial_token_count, 200)
+        for item_id, r in by_id.items():
+            self.assertNotIn("q02", r.rehearsal_item_ids)
+            expected = sorted(known - {"q02", item_id})
+            self.assertEqual(sorted(r.rehearsal_item_ids), expected)
+        self.assertEqual(
+            model.train_calls,
+            sum(1 + len(r.rehearsal_item_ids) for r in by_id.values()),
         )
-        self.assertEqual(len(captured), 3)
-        for ex in captured:
-            n_rows, length = ex.mask.shape
-            self.assertEqual(ex.input.shape, (n_rows, length))
-            self.assertEqual(ex.label.shape, (n_rows, length))
-            masks = ex.mask.tolist()
-            labels = ex.label.tolist()
-            inputs = ex.input.tolist()
-            lengths = [
-                max(i for i, t in enumerate(row) if t != 99999) + 1 for row in inputs
-            ]
-            self.assertTrue(any(l < length for l in lengths) or n_rows == 1)
-            for row_mask, row_label, row_len in zip(masks, labels, lengths):
-                if row_len < length:
-                    self.assertEqual(row_mask[row_len:], [0] * (length - row_len))
-                    self.assertEqual(row_label[row_len:], [99999] * (length - row_len))
-                # The last real label of every row is <eos> (masked in).
-                self.assertEqual(row_mask[row_len - 1], 1)
+        self.assertTrue(all(shape[0] == 1 for shape in model.batch_shapes))
+        cfg = self._config_json_for(self._latest_experiment_id())
+        self.assertEqual(cfg["rehearsal_max_tokens"], 200)
+
+        # Raising the cap above the long baseline lets q02 back into the pool.
+        model, by_id = run(LONG_ANSWER_TOKENS + 100)
+        self.assertTrue(any("q02" in r.rehearsal_item_ids for r in by_id.values()))
+        self.assertTrue(all(shape[0] == 1 for shape in model.batch_shapes))
+
+        with self.assertRaises(ValueError):
+            EvaluationConfig(rehearsal_max_tokens=0)
+        with self.assertRaises(ValueError):
+            MetaLearningConfig(rehearsal_max_tokens=-5)
+
+    def test_collate_pads_with_zero_mask(self):
+        # collate_training_examples still pads a multi-row batch; padded
+        # positions carry mask 0 and the pad id (eos here, since the fake
+        # tokenizer has no pad id). The harness no longer builds such batches,
+        # but StatefulLLM callers may.
+        dataset = make_dataset(3)
+        tok = FakeTokenizer(think=True)
+        tok.eos_token_id = 99999
+        rows = [
+            harness.make_rehearsal_example(
+                item,
+                f"{fake_think(item)}\n</think>\n\nIt is {item.correct_answer}.{'!' * i}",
+                tok,
+            )
+            for i, item in enumerate(dataset.items)
+        ]
+        ex = harness.collate_training_examples(rows, tok)
+        n_rows, length = ex.mask.shape
+        self.assertEqual(n_rows, 3)
+        self.assertEqual(ex.input.shape, (n_rows, length))
+        self.assertEqual(ex.label.shape, (n_rows, length))
+        masks = ex.mask.tolist()
+        labels = ex.label.tolist()
+        inputs = ex.input.tolist()
+        lengths = [
+            max(i for i, t in enumerate(row) if t != 99999) + 1 for row in inputs
+        ]
+        self.assertTrue(any(l < length for l in lengths))
+        for row_mask, row_label, row_len in zip(masks, labels, lengths):
+            if row_len < length:
+                self.assertEqual(row_mask[row_len:], [0] * (length - row_len))
+                self.assertEqual(row_label[row_len:], [99999] * (length - row_len))
+            # The last real label of every row is <eos> (masked in).
+            self.assertEqual(row_mask[row_len - 1], 1)
 
     def test_rehearsal_with_empty_pool_trains_single_row(self):
         dataset = make_dataset(4)
@@ -1118,6 +1242,7 @@ class RehearsalTest(_TempDbTest):
         EvaluationHarness(model=model, db=self.db).run(
             dataset, EvaluationConfig(name="nopool", rehearsal_k=3), verbose=False
         )
+        self.assertEqual(model.train_calls, 3)  # one call per trained item
         self.assertTrue(all(shape[0] == 1 for shape in model.batch_shapes))
 
     def test_rehearsal_sampling_is_seeded(self):
@@ -1225,7 +1350,13 @@ class CollapseSummaryTest(unittest.TestCase):
 class CliFlagsTest(unittest.TestCase):
     """Both CLIs expose the new absl flags."""
 
-    EXPECTED = ("--think_mode", "--rehearsal_k", "--learning_rate", "--[no]close_think")
+    EXPECTED = (
+        "--think_mode",
+        "--rehearsal_k",
+        "--rehearsal_max_tokens",
+        "--learning_rate",
+        "--[no]close_think",
+    )
 
     def _helpfull(self, *argv) -> str:
         proc = subprocess.run(

@@ -19,8 +19,11 @@ Options:
                           default), "empty" (train on "</think>\n\n{answer}"),
                           or "none" (old malformed target, for comparison)
     --[no]close_think     Deprecated alias: --noclose_think == --think_mode none
-    --rehearsal_k K       Batch each correction with K self-distillation examples
-                          from correct trained-split items (default: 0)
+    --rehearsal_k K       Train K self-distillation examples from correct
+                          trained-split items after each correction (default: 0)
+    --rehearsal_max_tokens N
+                          Skip rehearsal items whose baseline is longer than N
+                          tokens (default: 768)
     --learning_rate LR    Optimizer learning rate for StatefulLLM (default: model's)
     --subset N            Only use first N items (for quick tests)
     --category CAT        Filter to specific category
@@ -83,9 +86,15 @@ _CLOSE_THINK = flags.DEFINE_boolean(
 _REHEARSAL_K = flags.DEFINE_integer(
     "rehearsal_k",
     0,
-    "Batch each correction with K rehearsal examples: other trained-split items "
+    "Train K rehearsal examples after each correction: other trained-split items "
     "the model already answered correctly, trained on their own baseline output "
-    "(self-distillation). 0 disables.",
+    "(self-distillation), one single-row call each. 0 disables.",
+)
+_REHEARSAL_MAX_TOKENS = flags.DEFINE_integer(
+    "rehearsal_max_tokens",
+    768,
+    "Exclude items whose baseline response is longer than this many tokens from "
+    "the rehearsal pool.",
 )
 _LEARNING_RATE = flags.DEFINE_float(
     "learning_rate", None, "StatefulLLM learning rate (default: the model's)."
@@ -142,6 +151,7 @@ def main(_):
         think_mode=_THINK_MODE.value,
         close_think=_CLOSE_THINK.value,
         rehearsal_k=_REHEARSAL_K.value,
+        rehearsal_max_tokens=_REHEARSAL_MAX_TOKENS.value,
     )
     model_kwargs = {}
     if _LEARNING_RATE.value is not None:
