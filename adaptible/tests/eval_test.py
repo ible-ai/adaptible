@@ -17,10 +17,12 @@ import warnings
 from typing import Callable
 
 import adaptible
+from adaptible._src import _llm
 
 eval_mod = adaptible.eval
 harness = adaptible._src.eval.harness
 meta = adaptible._src.eval.meta
+TrainingStats = _llm.TrainingStats
 
 EvaluationConfig = eval_mod.EvaluationConfig
 EvaluationHarness = eval_mod.EvaluationHarness
@@ -39,6 +41,8 @@ EvaluationResult = harness.EvaluationResult
 
 EOS = "<eos>"
 DONT_KNOW = "I do not know."
+# FakeModel's default per-step loss script: crosses a 0.6 target on step 3.
+FAKE_LOSSES = [6.05, 2.1, 0.58, 0.2, 0.05]
 LONG_ANSWER_TOKENS = 2000  # a FakeModel(long_at_baseline=...) answer, in fake tokens
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -108,6 +112,10 @@ class FakeModel:
         long_at_baseline: Item ids whose trivia answer is padded out to
             ``LONG_ANSWER_TOKENS`` tokens, the way a small model rambles to the
             generation cap. Used to exercise ``rehearsal_max_tokens``.
+        train_losses: Per-step loss script every ``train_on_example`` call
+            replays (the last value repeats past the end). The call stops
+            through ``_llm.run_training_steps`` exactly as the real model does,
+            so the steps it reports depend on ``loss_target``/``max_steps``.
     """
 
     def __init__(
@@ -118,8 +126,10 @@ class FakeModel:
         known_at_baseline: set[str] | None = None,
         think: bool = False,
         long_at_baseline: set[str] | None = None,
+        train_losses: list[float] | None = None,
     ):
         self._tokenizer = FakeTokenizer(think=think)
+        self._train_losses = list(train_losses or FAKE_LOSSES)
         self._think = think
         self._long_at_baseline = set(long_at_baseline or set())
         self._max_tokens = 4096
@@ -136,6 +146,9 @@ class FakeModel:
         self.batch_shapes: list[tuple[int, int]] = []
         self.revision_prompts: list[str] = []
         self.question_prompts: list[str] = []
+        # (iterations, loss_target, max_steps) of every train_on_example call.
+        self.train_kwargs: list[tuple[int, float | None, int | None]] = []
+        self.training_stats: list[TrainingStats] = []
 
     def generate_response(
         self, prompt: str, use_history: bool = False, max_tokens: int | None = None
@@ -166,8 +179,29 @@ class FakeModel:
             return f"{fake_think(item)}\n</think>\n\n{answer}"
         return answer
 
-    def train_on_example(self, example, iterations: int = 25, **kwargs) -> None:
-        del iterations, kwargs
+    def train_on_example(
+        self,
+        example,
+        iterations: int = 25,
+        verbose: bool = False,
+        save_checkpoint: bool = False,
+        loss_target: float | None = None,
+        max_steps: int | None = None,
+    ) -> TrainingStats:
+        del verbose, save_checkpoint
+        self.train_kwargs.append((iterations, loss_target, max_steps))
+        script = iter(self._train_losses)
+        last = self._train_losses[-1]
+
+        def step() -> float:
+            nonlocal last
+            last = next(script, last)
+            return last
+
+        stats = _llm.run_training_steps(
+            step, iterations if max_steps is None else max_steps, loss_target
+        )
+        self.training_stats.append(stats)
         self.batch_shapes.append(tuple(example.mask.shape))
         rows = []
         for inputs, labels, mask in zip(
@@ -181,10 +215,11 @@ class FakeModel:
         self.trained_targets.append(target)
         self.train_calls += 1
         if self.train_calls <= self._learns_after:
-            return
+            return stats
         for item in self._by_id.values():
             if item.correct_answer.lower() in target.lower():
                 self.learned.add(item.id)
+        return stats
 
 
 def make_dataset(n: int) -> TriviaDataset:
@@ -1347,6 +1382,181 @@ class CollapseSummaryTest(unittest.TestCase):
             )
 
 
+class LossTargetTest(_TempDbTest):
+    """The harness and meta experiment stop training on the loss target."""
+
+    def test_defaults_and_normalization(self):
+        config = EvaluationConfig(name="d")
+        self.assertEqual(config.loss_target, 0.6)
+        self.assertEqual(config.training_iterations, 12)
+        self.assertIsNone(EvaluationConfig(name="off", loss_target=0).loss_target)
+        self.assertIsNone(EvaluationConfig(name="off", loss_target=-1).loss_target)
+        self.assertIsNone(EvaluationConfig(name="off", loss_target=None).loss_target)
+        meta_config = MetaLearningConfig(name="m", loss_target=-1)
+        self.assertIsNone(meta_config.loss_target)
+        self.assertEqual(MetaLearningConfig(name="m").loss_target, 0.6)
+        self.assertEqual(MetaLearningConfig(name="m").training_iterations, 12)
+        # Round-trips, and legacy files without the key mean fixed-count.
+        self.assertEqual(
+            MetaLearningConfig.from_dict(MetaLearningConfig(name="m").to_dict()).loss_target,
+            0.6,
+        )
+        legacy = {"name": "x", "seeds": [1], "checkpoint_interval": 1,
+                  "training_iterations": 25, "train_ratio": 0.5}
+        self.assertIsNone(MetaLearningConfig.from_dict(legacy).loss_target)
+
+    def test_harness_passes_target_and_records_steps(self):
+        dataset = make_dataset(5)
+        model = FakeModel(dataset)
+        config = EvaluationConfig(name="lt", train_ratio=0.6, training_iterations=7)
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset, config, verbose=False
+        )
+        # Every call carried the target and the cap.
+        self.assertEqual(model.train_kwargs, [(7, 0.6, 7)] * 3)
+        for item in result.train_items:
+            self.assertEqual(item.train_steps, 3)  # FAKE_LOSSES crosses 0.6 on step 3
+            self.assertAlmostEqual(item.train_initial_loss, 6.05)
+            self.assertAlmostEqual(item.train_final_loss, 0.58)
+            self.assertFalse(item.train_hit_cap)
+        for item in result.holdout_items:
+            self.assertEqual(item.train_steps, 0)
+            self.assertIsNone(item.train_final_loss)
+        self.assertAlmostEqual(result.mean_train_steps, 3.0)
+        self.assertAlmostEqual(result.mean_train_final_loss, 0.58)
+        self.assertEqual(result.train_cap_hit_count, 0)
+        self.assertEqual(
+            result.training_summary_text(),
+            "Training: mean 3.0 steps/item (cap 7, loss target 0.60), "
+            "mean final loss 0.58; 0 items hit the cap",
+        )
+        d = result.to_dict()
+        self.assertEqual(d["config"]["loss_target"], 0.6)
+        self.assertEqual(d["config"]["training_iterations"], 7)
+        self.assertAlmostEqual(d["metrics"]["mean_train_steps"], 3.0)
+        self.assertEqual(d["metrics"]["train_cap_hit_count"], 0)
+        trained = [i for i in d["items"] if i["was_trained"]]
+        self.assertEqual({i["train_steps"] for i in trained}, {3})
+        self.assertAlmostEqual(trained[0]["train_initial_loss"], 6.05)
+        self.assertAlmostEqual(trained[0]["train_final_loss"], 0.58)
+        # The DB stores the steps actually taken, and the config json the target.
+        experiment_id = self._latest_experiment_id()
+        events = self.db.get_training_events_for_experiment(experiment_id)
+        self.assertEqual([e.training_iterations for e in events], [3, 3, 3])
+        cfg = self._config_json_for(experiment_id)
+        self.assertEqual(cfg["loss_target"], 0.6)
+        self.assertEqual(cfg["training_iterations"], 7)
+
+    def test_cap_and_disabled_target(self):
+        dataset = make_dataset(4)
+        # Never reaches 0.6: every item hits the cap.
+        model = FakeModel(dataset, train_losses=[3.0, 2.0, 1.0])
+        config = EvaluationConfig(name="cap", train_ratio=0.5, training_iterations=4)
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset, config, verbose=False
+        )
+        for item in result.train_items:
+            self.assertEqual(item.train_steps, 4)
+            self.assertTrue(item.train_hit_cap)
+            self.assertAlmostEqual(item.train_final_loss, 1.0)
+        self.assertEqual(result.train_cap_hit_count, 2)
+        self.assertIn("2 items hit the cap", result.training_summary_text())
+
+        # loss_target=None: exactly training_iterations steps, cap reported.
+        model = FakeModel(dataset)
+        config = EvaluationConfig(
+            name="fixed", train_ratio=0.5, training_iterations=5, loss_target=None
+        )
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset, config, verbose=False
+        )
+        self.assertEqual(model.train_kwargs, [(5, None, 5)] * 2)
+        self.assertEqual([i.train_steps for i in result.train_items], [5, 5])
+        self.assertIn("loss target off", result.training_summary_text())
+
+    def test_rehearsal_calls_share_target(self):
+        dataset = make_dataset(6)
+        model = FakeModel(dataset, known_at_baseline={i.id for i in dataset})
+        config = EvaluationConfig(
+            name="reh-lt", train_ratio=0.5, rehearsal_k=2, training_iterations=9
+        )
+        EvaluationHarness(model=model, db=self.db).run(dataset, config, verbose=False)
+        # 3 trained items x (1 correction + 2 rehearsal) calls, all with the target.
+        self.assertEqual(len(model.train_kwargs), 9)
+        self.assertEqual(set(model.train_kwargs), {(9, 0.6, 9)})
+
+    def test_verbose_output(self):
+        import contextlib
+        import io
+
+        dataset = make_dataset(4)
+        model = FakeModel(dataset)
+        config = EvaluationConfig(name="v", train_ratio=0.5)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            EvaluationHarness(model=model, db=self.db).run(dataset, config, verbose=True)
+        out = buf.getvalue()
+        self.assertIn("Loss target: 0.6 (step cap: 12)", out)
+        self.assertRegex(out, r"Trained \(3 steps, loss 6\.05 → 0\.58, \d+\.\ds\)")
+        self.assertIn(
+            "Training: mean 3.0 steps/item (cap 12, loss target 0.60), "
+            "mean final loss 0.58; 0 items hit the cap",
+            out,
+        )
+
+    def test_meta_records_and_prints_training_stats(self):
+        import contextlib
+        import io
+
+        dataset = make_dataset(10)
+        model = FakeModel(dataset)
+        config = MetaLearningConfig(
+            name="mlt", seeds=[7], checkpoint_interval=4, train_ratio=0.8,
+            training_iterations=6,
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = MetaLearningExperiment(
+                model_factory=lambda: model, db=self.db
+            ).run(dataset, config, verbose=True)
+        out = buf.getvalue()
+        traj = result.trajectories[7]
+        self.assertEqual(model.train_kwargs, [(6, 0.6, 6)] * 8)
+        self.assertEqual(traj.train_steps, [3] * 8)
+        self.assertEqual(traj.train_cap_hits, 0)
+        self.assertAlmostEqual(traj.mean_train_steps, 3.0)
+        self.assertAlmostEqual(traj.mean_train_final_loss, 0.58)
+        self.assertRegex(out, r"Trained q\d\d \(3 steps, loss 6\.05 → 0\.58, \d+\.\ds\)")
+        self.assertIn(
+            "Training: mean 3.0 steps/item (cap 6, loss target 0.60), "
+            "mean final loss 0.58; 0 items hit the cap",
+            out,
+        )
+        events = self.db.get_training_events_for_experiment(traj.experiment_id)
+        self.assertEqual({e.training_iterations for e in events}, {3})
+        self.assertEqual(self._config_json_for(traj.experiment_id)["loss_target"], 0.6)
+        d = traj.to_dict()
+        self.assertEqual(d["train_steps"], [3] * 8)
+        self.assertAlmostEqual(d["mean_train_final_loss"], 0.58)
+        # Round trip through save/load keeps the per-item stats.
+        path = self.tmp_path / "mlt.json"
+        result.save(path)
+        loaded = MetaLearningResult.load(path)
+        self.assertEqual(loaded.trajectories[7].train_steps, [3] * 8)
+        self.assertEqual(loaded.config.loss_target, 0.6)
+
+    def test_report_header_shows_loss_target(self):
+        dataset = make_dataset(4)
+        model = FakeModel(dataset)
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset, EvaluationConfig(name="rep", train_ratio=0.5), verbose=False
+        )
+        path = generate_html_report(result, str(self.tmp_path / "r.html"))
+        text = pathlib.Path(path).read_text()
+        self.assertIn("loss target: <code>0.60</code>", text)
+        self.assertIn("Training: mean 3.0 steps/item (cap 12", text)
+
+
 class CliFlagsTest(unittest.TestCase):
     """Both CLIs expose the new absl flags."""
 
@@ -1355,6 +1565,7 @@ class CliFlagsTest(unittest.TestCase):
         "--rehearsal_k",
         "--rehearsal_max_tokens",
         "--learning_rate",
+        "--loss_target",
         "--[no]close_think",
     )
 

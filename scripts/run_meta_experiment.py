@@ -11,7 +11,9 @@ Options:
     --name NAME             Experiment name (default: "meta_experiment")
     --seeds SEEDS           Comma-separated seeds (default: "42,123,456")
     --checkpoint-interval N Checkpoint every N training events (default: 10)
-    --iterations N          Training iterations per example (default: 25)
+    --iterations N          Step cap per training call (default: 12)
+    --loss_target L         Stop a training call once a step's loss is below L
+                            (default: 0.6; 0 or negative disables)
     --train-ratio RATIO     Fraction used for training (default: 0.8)
     --training-source S     "ground_truth" (fine-tune on the label) or
                             "self_generated" (train on the model's own revision)
@@ -74,7 +76,18 @@ _SEEDS = flags.DEFINE_string("seeds", "42,123,456", "Comma-separated random seed
 _CHECKPOINT_INTERVAL = flags.DEFINE_integer(
     "checkpoint_interval", 10, "Checkpoint every N training events"
 )
-_ITERATIONS = flags.DEFINE_integer("iterations", 25, "Training iterations per example")
+_ITERATIONS = flags.DEFINE_integer(
+    "iterations", 12, "Step cap per training call (exact count if --loss_target <= 0)"
+)
+_LOSS_TARGET = flags.DEFINE_float(
+    "loss_target",
+    0.6,
+    "Stop each training call as soon as a step's loss is below this; "
+    "--iterations is then a cap. The greedy answer flips to the correction at "
+    "~0.6 with the reasoning intact; driving the loss to ~0 collapses the "
+    "reasoning. 0 or a negative value disables the target and trains exactly "
+    "--iterations steps.",
+)
 _TRAIN_RATIO = flags.DEFINE_float("train_ratio", 0.8, "Train/holdout split ratio")
 _TRAINING_SOURCE = flags.DEFINE_enum(
     "training_source",
@@ -172,6 +185,7 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                 <td>{traj.total_net_learning}</td>
                 <td>{traj.window_sizes}</td>
                 <td>{len(traj.checkpoints)}</td>
+                <td>{traj.mean_train_steps:.1f} / {traj.train_cap_hits} cap</td>
                 <td>{traj.total_time_seconds:.1f}s</td>
             </tr>
             """)
@@ -366,8 +380,12 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                 <div class="value">{result.config.checkpoint_interval}</div>
             </div>
             <div class="config-item">
-                <div class="label">Training Iterations</div>
+                <div class="label">Training Step Cap</div>
                 <div class="value">{result.config.training_iterations}</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Loss Target</div>
+                <div class="value">{result.config.loss_target if result.config.loss_target is not None else "off"}</div>
             </div>
             <div class="config-item">
                 <div class="label">Train Ratio</div>
@@ -421,6 +439,7 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                 <th>Net Learning</th>
                 <th>Window Sizes</th>
                 <th>Checkpoints</th>
+                <th>Mean Steps / Cap Hits</th>
                 <th>Time</th>
             </tr>
         </thead>
@@ -579,6 +598,7 @@ def main(_):
         seeds=seeds,
         checkpoint_interval=_CHECKPOINT_INTERVAL.value,
         training_iterations=_ITERATIONS.value,
+        loss_target=_LOSS_TARGET.value,
         train_ratio=_TRAIN_RATIO.value,
         training_source=_TRAINING_SOURCE.value,
         revision_prompt=_REVISION_PROMPT.value,
@@ -606,7 +626,8 @@ def main(_):
     print(f"  Repeats per seed: {config.repeats}")
     print(f"  Holdout every checkpoint: {config.holdout_every_checkpoint}")
     print(f"  Checkpoint interval: {config.checkpoint_interval}")
-    print(f"  Training iterations: {config.training_iterations}")
+    print(f"  Training step cap: {config.training_iterations}")
+    print(f"  Loss target: {config.loss_target}")
     print(f"  Train ratio: {config.train_ratio}")
     print()
 

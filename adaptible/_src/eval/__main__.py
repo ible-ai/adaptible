@@ -6,7 +6,10 @@ Usage:
 Options:
     --name NAME           Experiment name (default: "default")
     --train-ratio RATIO   Fraction to use for training (default: 0.8)
-    --iterations N        Training iterations per example (default: 25)
+    --iterations N        Step cap per training call (default: 12)
+    --loss_target L       Stop a training call once a step's loss is below L
+                          (default: 0.6; 0 or negative disables, so exactly
+                          --iterations steps run)
     --shuffle             Shuffle the dataset
     --seed SEED           Random seed for shuffling (default: 42)
     --training-source S   "ground_truth" (fine-tune on the label) or
@@ -50,7 +53,18 @@ from ..revise import REVISION_PROMPTS, THINK_MODES
 
 _NAME = flags.DEFINE_string("name", "default", "Experiment name")
 _TRAIN_RATIO = flags.DEFINE_float("train_ratio", 0.8, "Train/holdout split ratio")
-_ITERATIONS = flags.DEFINE_integer("iterations", 25, "Training iterations per example")
+_ITERATIONS = flags.DEFINE_integer(
+    "iterations", 12, "Step cap per training call (exact count if --loss_target <= 0)"
+)
+_LOSS_TARGET = flags.DEFINE_float(
+    "loss_target",
+    0.6,
+    "Stop each training call as soon as a step's loss is below this; "
+    "--iterations is then a cap. The greedy answer flips to the correction at "
+    "~0.6 with the reasoning intact; driving the loss to ~0 collapses the "
+    "reasoning. 0 or a negative value disables the target and trains exactly "
+    "--iterations steps.",
+)
 _SHUFFLE = flags.DEFINE_boolean("shuffle", False, "Shuffle the dataset")
 _SEED = flags.DEFINE_integer("seed", 42, "Random seed")
 _TRAINING_SOURCE = flags.DEFINE_enum(
@@ -143,6 +157,7 @@ def main(_):
     config = EvaluationConfig(
         name=_NAME.value,
         training_iterations=_ITERATIONS.value,
+        loss_target=_LOSS_TARGET.value,
         shuffle=_SHUFFLE.value,
         seed=_SEED.value,
         train_ratio=_TRAIN_RATIO.value,

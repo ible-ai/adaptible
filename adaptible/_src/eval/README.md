@@ -68,7 +68,13 @@ Templates without a think tag are unaffected by `think_mode`. Both `training_sou
 
 ### Rehearsal (`rehearsal_k`)
 
-The `empty` run above also drifted unrelated facts ("The skin" for the largest planet). `rehearsal_k` (`EvaluationConfig.rehearsal_k`, `MetaLearningConfig.rehearsal_k`, `--rehearsal_k`; default 0) follows every correction with `k` self-distillation examples: other *trained-split* items whose baseline answer was judged correct, with the model's own full baseline output (`{think}</think>\n\n{answer}{eos}`, whole target in the loss) as the target. Each example is its own single-row `train_on_example` call with `training_iterations` iterations, correction first and then the rehearsal examples in order, so peak memory is bounded by one sequence (a padded `(1+k, L)` batch of rehearsal targets that ran to the generation cap exhausted a 16 GB machine). One training event is recorded per item, with the elapsed time summed over the calls. Rehearsal items are sampled with `seed + item index`, never include the item being corrected, and never include holdout items. `rehearsal_max_tokens` (`--rehearsal_max_tokens`; default 768) keeps items whose raw baseline response is longer than that out of the pool; if fewer than `k` items remain, the ones that do are used. `ItemResult.rehearsal_item_ids` records which items were used.
+### Loss-targeted training
+
+Every training call (`StatefulLLM.train_on_example`) runs single optimizer steps and stops as soon as a step's loss falls below `loss_target` (`EvaluationConfig.loss_target`, `MetaLearningConfig.loss_target`, `--loss_target`; default `0.6`), or after `training_iterations` steps (`--iterations`; default `12`, now a cap). A per-step probe on the real model with one correction (target "Ottawa"+eos, `think_mode=baseline`) started at loss 6.05; at a mean target loss of about 0.6 the greedy answer flipped to the correction while the reasoning stayed intact and an unrelated item was unaffected, and once the loss was driven below about 0.1 the model emitted the bare answer with no reasoning and answered "Ottawa" to unrelated questions. Every earlier run trained a fixed 5-25 iterations, which drives the loss to ~0; pass `--loss_target 0` (or `loss_target=None`) to reproduce that.
+
+Per item, `ItemResult` records `train_steps`, `train_initial_loss`, `train_final_loss`, and `train_hit_cap`; the `training_events.training_iterations` column stores the steps the correction actually took. The verbose log prints `Trained (3 steps, loss 6.05 → 0.58, 4.1s)` per item and the summary (and report header) carries `Training: mean 3.2 steps/item (cap 12, loss target 0.60), mean final loss 0.55; N items hit the cap`. Rehearsal examples use the same target; their loss is already low, so they normally stop after one step unless the model drifted, which is the intended anchoring. The server's `/trigger_review` path (`self_correct_and_train`) uses `StatefulLLM(loss_target=0.6, max_train_steps=12)`.
+
+The `empty` run above also drifted unrelated facts ("The skin" for the largest planet). `rehearsal_k` (`EvaluationConfig.rehearsal_k`, `MetaLearningConfig.rehearsal_k`, `--rehearsal_k`; default 0) follows every correction with `k` self-distillation examples: other *trained-split* items whose baseline answer was judged correct, with the model's own full baseline output (`{think}</think>\n\n{answer}{eos}`, whole target in the loss) as the target. Each example is its own single-row `train_on_example` call (same `loss_target`, `training_iterations` as the cap), correction first and then the rehearsal examples in order, so peak memory is bounded by one sequence (a padded `(1+k, L)` batch of rehearsal targets that ran to the generation cap exhausted a 16 GB machine). One training event is recorded per item, with the elapsed time summed over the calls. Rehearsal items are sampled with `seed + item index`, never include the item being corrected, and never include holdout items. `rehearsal_max_tokens` (`--rehearsal_max_tokens`; default 768) keeps items whose raw baseline response is longer than that out of the pool; if fewer than `k` items remain, the ones that do are used. `ItemResult.rehearsal_item_ids` records which items were used.
 
 ### Collapse signals
 
@@ -98,9 +104,12 @@ python -m adaptible.eval --training_source self_generated --shuffle
 # Same, with the few-shot revision prompt
 python -m adaptible.eval --training_source self_generated --revision_prompt fewshot --shuffle
 
-# Specific category, more iterations, custom report path, no browser
-python -m adaptible.eval --category geography --iterations 50 \
+# Specific category, higher step cap, custom report path, no browser
+python -m adaptible.eval --category geography --iterations 20 \
     --output ~/eval.html --no_browser
+
+# Fixed-count training (the pre-loss-target behaviour): 25 steps per item
+python -m adaptible.eval --loss_target 0 --iterations 25
 ```
 
 Flags are `absl.flags`: use underscores (`--train_ratio`, `--no_browser`), not dashes.
@@ -114,7 +123,8 @@ dataset = eval.generate_default_dataset()
 
 config = eval.EvaluationConfig(
     name="my_experiment",
-    training_iterations=25,
+    training_iterations=12,           # step cap per training call
+    loss_target=0.6,                  # stop once a step's loss is below this; None = fixed count
     train_ratio=0.8,
     shuffle=True,
     training_source="ground_truth",   # or "self_generated"
@@ -241,7 +251,7 @@ import adaptible.eval as eval
 
 config = eval.MetaLearningConfig(
     name="meta", seeds=[42, 123], checkpoint_interval=10,
-    training_iterations=25, train_ratio=0.8,
+    training_iterations=12, loss_target=0.6, train_ratio=0.8,
     training_source="ground_truth", repeats=1, holdout_every_checkpoint=False,
 )
 result = eval.MetaLearningExperiment().run(eval.generate_default_dataset(), config)
@@ -258,7 +268,8 @@ result = eval.MetaLearningResult.load("outputs/meta/meta.json")
 | ------------------- | --------------------------------- | -------------------------------------------------------- |
 | `--name`            | `"default"`                       | Experiment name                                          |
 | `--train_ratio`     | `0.8`                             | Fraction for training (rest is holdout)                  |
-| `--iterations`      | `25`                              | Training iterations per example                          |
+| `--iterations`      | `12`                              | Step cap per training call (exact count if `--loss_target` is off) |
+| `--loss_target`     | `0.6`                             | Stop a training call once a step's loss is below this; `0` or negative disables |
 | `--shuffle`         | `False`                           | Randomize question order                                 |
 | `--seed`            | `42`                              | Random seed for shuffling                                |
 | `--training_source` | `ground_truth`                    | `ground_truth` or `self_generated` (see above)           |

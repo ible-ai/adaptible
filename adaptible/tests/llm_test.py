@@ -442,6 +442,81 @@ class EndToEndSelfCorrectionTest(unittest.TestCase):
         self.model._model_is_stable = True
 
 
+class TrainingStepLoopTest(unittest.TestCase):
+    """Model-free tests for the loss-targeted step loop."""
+
+    @staticmethod
+    def _scripted(losses):
+        it = iter(losses)
+        calls = []
+
+        def step():
+            loss = next(it)
+            calls.append(loss)
+            return loss
+
+        return step, calls
+
+    def test_should_stop(self):
+        self.assertFalse(_llm.should_stop(0.0, None))
+        self.assertTrue(_llm.should_stop(0.59, 0.6))
+        self.assertFalse(_llm.should_stop(0.6, 0.6))  # strictly below
+        self.assertFalse(_llm.should_stop(1.2, 0.6))
+
+    def test_stops_at_first_step_below_target(self):
+        step, calls = self._scripted([6.05, 2.1, 0.58, 0.2, 0.05])
+        stats = _llm.run_training_steps(step, max_steps=12, loss_target=0.6)
+        self.assertEqual(calls, [6.05, 2.1, 0.58])
+        self.assertEqual(stats.steps, 3)
+        self.assertEqual(stats.initial_loss, 6.05)
+        self.assertEqual(stats.final_loss, 0.58)
+        self.assertTrue(stats.stopped_early)
+        self.assertFalse(stats.hit_cap)
+        self.assertEqual(stats.losses, [6.05, 2.1, 0.58])
+        self.assertIsInstance(stats, _llm.TrainingStats)
+
+    def test_respects_cap(self):
+        step, calls = self._scripted([3.0, 2.0, 1.0, 0.9, 0.8])
+        stats = _llm.run_training_steps(step, max_steps=4, loss_target=0.6)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(stats.steps, 4)
+        self.assertEqual(stats.final_loss, 0.9)
+        self.assertFalse(stats.stopped_early)
+        self.assertTrue(stats.hit_cap)
+
+    def test_no_target_runs_all_steps(self):
+        step, calls = self._scripted([0.1, 0.01, 0.001, 0.0001])
+        stats = _llm.run_training_steps(step, max_steps=4, loss_target=None)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(stats.steps, 4)
+        self.assertEqual(stats.initial_loss, 0.1)
+        self.assertEqual(stats.final_loss, 0.0001)
+        self.assertFalse(stats.stopped_early)
+
+    def test_target_on_last_step_counts_as_early(self):
+        step, _ = self._scripted([2.0, 0.5])
+        stats = _llm.run_training_steps(step, max_steps=2, loss_target=0.6)
+        self.assertEqual(stats.steps, 2)
+        self.assertTrue(stats.stopped_early)
+        self.assertFalse(stats.hit_cap)
+
+    def test_zero_steps(self):
+        step, calls = self._scripted([])
+        stats = _llm.run_training_steps(step, max_steps=0, loss_target=0.6)
+        self.assertEqual(calls, [])
+        self.assertEqual(stats.steps, 0)
+        self.assertTrue(stats.initial_loss != stats.initial_loss)  # NaN
+        self.assertFalse(stats.stopped_early)
+        self.assertFalse(stats.hit_cap)
+
+    def test_losses_accept_array_like(self):
+        """Step functions returning mx scalars are coerced to float."""
+        step, _ = self._scripted([mx.array(1.5), mx.array(0.25)])
+        stats = _llm.run_training_steps(step, max_steps=5, loss_target=0.6)
+        self.assertEqual(stats.losses, [1.5, 0.25])
+        self.assertIsInstance(stats.final_loss, float)
+
+
 class ValidationTest(unittest.TestCase):
     """Tests for revision validation logic."""
 

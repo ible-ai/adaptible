@@ -153,6 +153,9 @@ def generate_html_report(
     think_mode = getattr(result.config, "think_mode", "empty")
     rehearsal_k = getattr(result.config, "rehearsal_k", 0)
     rehearsal_max_tokens = getattr(result.config, "rehearsal_max_tokens", 768)
+    loss_target = getattr(result.config, "loss_target", None)
+    loss_target_text = f"{loss_target:.2f}" if loss_target is not None else "off"
+    training_text = html.escape(result.training_summary_text())
     collapse_text = html.escape(result.collapse_summary_text())
     if training_source == "self_generated":
         training_source_text = (
@@ -390,13 +393,13 @@ def generate_html_report(
         Revision prompt: {html.escape(revision_prompt)} |
         Think mode: <code>{html.escape(str(think_mode))}</code> |
         Rehearsal k: <code>{rehearsal_k}</code> (max tokens: <code>{rehearsal_max_tokens}</code>) |
-        Training iterations: {result.config.training_iterations} |
+        Training step cap: {result.config.training_iterations} (loss target: <code>{loss_target_text}</code>) |
         Train/Holdout split: {result.config.train_ratio:.0%}/{1-result.config.train_ratio:.0%} |
         Shuffle: {result.config.shuffle} (seed: {result.config.seed})
     </div>
 
     <h2>Overall Metrics</h2>
-    <div class="config-box">{collapse_text}<br>{html.escape(result.holdout_summary_text())}</div>
+    <div class="config-box">{collapse_text}<br>{html.escape(result.holdout_summary_text())}<br>{training_text}</div>
     <div class="metrics-grid">
         <div class="metric-card">
             <div class="metric-value">{result.baseline_accuracy:.0%}</div>

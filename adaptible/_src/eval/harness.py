@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .._classes import InteractionHistory, TrainingExample
-from .._llm import StatefulLLM
+from .._llm import StatefulLLM, TrainingStats
 from ..db import (
     Database,
     Example,
@@ -85,10 +85,22 @@ class EvaluationConfig:
             this many tokens are excluded from the rehearsal pool. Rehearsal
             targets are the model's own full baseline output, which can run to
             the generation cap; this keeps every training sequence bounded.
+        training_iterations: Cap on optimizer steps per ``train_on_example``
+            call. With a ``loss_target`` this is a ceiling, not a count.
+        loss_target: Stop each training call as soon as a step's loss falls
+            below this. A per-step probe on the real model showed the greedy
+            answer flips to the correction at a mean target loss of ~0.6 with
+            the reasoning intact, while driving the loss to ~0 (what a fixed
+            5-25 iterations does) collapses the reasoning and bleeds the answer
+            into unrelated questions. ``None`` (or any value <= 0) disables the
+            target and trains exactly ``training_iterations`` steps. Rehearsal
+            examples use the same target; their loss is already low, so they
+            normally stop after one step unless the model drifted.
     """
 
     name: str = "default"
-    training_iterations: int = 25  # Total iterations per example (epochs * calls)
+    training_iterations: int = 12  # Step cap per train_on_example call
+    loss_target: float | None = 0.6
     epochs_per_call: int = 5  # Matches StatefulLLM._epochs
     shuffle: bool = False
     seed: int = 42
@@ -108,6 +120,14 @@ class EvaluationConfig:
         self.close_think = self.think_mode != "none"
         validate_rehearsal_k(self.rehearsal_k)
         validate_rehearsal_max_tokens(self.rehearsal_max_tokens)
+        self.loss_target = normalize_loss_target(self.loss_target)
+
+
+def normalize_loss_target(loss_target: float | None) -> float | None:
+    """Map a loss target to ``None`` when disabled (``None`` or <= 0)."""
+    if loss_target is None or loss_target <= 0:
+        return None
+    return float(loss_target)
 
 
 def validate_rehearsal_k(rehearsal_k: int) -> None:
@@ -149,6 +169,11 @@ class ItemResult:
             the post-training pass runs.
         rehearsal_item_ids: Ids of the items whose baseline outputs were batched
             with this item's correction (``EvaluationConfig.rehearsal_k``).
+        train_steps: Optimizer steps the correction took (0 if not trained).
+        train_initial_loss: Loss at the correction's first step.
+        train_final_loss: Loss at the correction's last step.
+        train_hit_cap: The correction ran out of steps without reaching the
+            loss target.
     """
 
     item_id: str
@@ -172,6 +197,10 @@ class ItemResult:
     initial_token_count: int = 0
     post_token_count: int | None = None
     rehearsal_item_ids: list[str] = dataclasses.field(default_factory=list)
+    train_steps: int = 0
+    train_initial_loss: float | None = None
+    train_final_loss: float | None = None
+    train_hit_cap: bool = False
 
     @property
     def post_empty_think(self) -> bool:
@@ -424,11 +453,49 @@ class EvaluationResult:
             f"{self.holdout_baseline_correct}/{self.holdout_total})"
         )
 
+    # Loss-targeted training: how many steps each correction needed.
+    @property
+    def mean_train_steps(self) -> float:
+        """Mean optimizer steps per trained item's correction."""
+        if not self.train_items:
+            return 0.0
+        return sum(item.train_steps for item in self.train_items) / len(
+            self.train_items
+        )
+
+    @property
+    def mean_train_final_loss(self) -> float | None:
+        """Mean final loss over trained items that reported one."""
+        losses = [
+            item.train_final_loss
+            for item in self.train_items
+            if item.train_final_loss is not None
+        ]
+        if not losses:
+            return None
+        return sum(losses) / len(losses)
+
+    @property
+    def train_cap_hit_count(self) -> int:
+        """Trained items whose correction ran to the step cap."""
+        return sum(1 for item in self.train_items if item.train_hit_cap)
+
+    def training_summary_text(self) -> str:
+        """One-line steps / final-loss / cap summary for logs and reports."""
+        return training_summary_text(
+            [item.train_steps for item in self.train_items],
+            [item.train_final_loss for item in self.train_items],
+            self.train_cap_hit_count,
+            self.config.training_iterations,
+            self.config.loss_target,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "config": {
                 "name": self.config.name,
                 "training_iterations": self.config.training_iterations,
+                "loss_target": self.config.loss_target,
                 "epochs_per_call": self.config.epochs_per_call,
                 "shuffle": self.config.shuffle,
                 "seed": self.config.seed,
@@ -458,6 +525,9 @@ class EvaluationResult:
                 "post_empty_think_count": self.post_empty_think_count,
                 "revision_invalid_count": self.revision_invalid_count,
                 "revision_summary": self.revision_summary(),
+                "mean_train_steps": self.mean_train_steps,
+                "mean_train_final_loss": self.mean_train_final_loss,
+                "train_cap_hit_count": self.train_cap_hit_count,
             },
             "items": [
                 {
@@ -482,10 +552,40 @@ class EvaluationResult:
                     "initial_token_count": item.initial_token_count,
                     "post_token_count": item.post_token_count,
                     "rehearsal_item_ids": item.rehearsal_item_ids,
+                    "train_steps": item.train_steps,
+                    "train_initial_loss": item.train_initial_loss,
+                    "train_final_loss": item.train_final_loss,
+                    "train_hit_cap": item.train_hit_cap,
                 }
                 for item in self.items
             ],
         }
+
+
+def training_summary_text(
+    steps: list[int],
+    final_losses: list[float | None],
+    cap_hits: int,
+    cap: int,
+    loss_target: float | None,
+) -> str:
+    """Format ``Training: mean 3.2 steps/item (cap 12), mean final loss 0.55; ...``.
+
+    Shared by the harness and the meta-learning experiment so both print the
+    same line.
+    """
+    if not steps:
+        return "Training: no items trained"
+    mean_steps = sum(steps) / len(steps)
+    losses = [l for l in final_losses if l is not None]
+    loss_text = (
+        f"{sum(losses) / len(losses):.2f}" if losses else "n/a"
+    )
+    target_text = f"{loss_target:.2f}" if loss_target is not None else "off"
+    return (
+        f"Training: mean {mean_steps:.1f} steps/item (cap {cap}, loss target "
+        f"{target_text}), mean final loss {loss_text}; {cap_hits} items hit the cap"
+    )
 
 
 def _normalize_for_match(text: str) -> str:
@@ -739,6 +839,22 @@ class TrainingOutcome:
     revision_answer: str | None = None
     revision_has_key_terms: bool | None = None
     rehearsal_item_ids: list[str] = dataclasses.field(default_factory=list)
+    # Stats for the correction call (the first train_on_example call).
+    train_steps: int = 0
+    train_initial_loss: float | None = None
+    train_final_loss: float | None = None
+    train_hit_cap: bool = False
+    # Stats for every call, correction first then rehearsal examples in order.
+    training_stats: list[TrainingStats] = dataclasses.field(default_factory=list)
+
+    def training_text(self) -> str:
+        """``3 steps, loss 6.05 → 0.58`` for the verbose per-item line."""
+        if self.train_initial_loss is None or self.train_final_loss is None:
+            return f"{self.train_steps} steps"
+        return (
+            f"{self.train_steps} steps, loss {self.train_initial_loss:.2f} → "
+            f"{self.train_final_loss:.2f}"
+        )
 
 
 def _train_one_item(
@@ -753,6 +869,7 @@ def _train_one_item(
     revision_prompt: str = "default",
     think_mode: str = "baseline",
     rehearsal: list[tuple[TriviaItem, str]] | None = None,
+    loss_target: float | None = None,
 ) -> TrainingOutcome:
     """Build the target, train, and record the event for one item.
 
@@ -763,7 +880,13 @@ def _train_one_item(
     rehearsal examples in order) so peak memory is bounded by one sequence;
     padding a batch of rehearsal targets that can run to the generation cap
     exhausted a 16 GB machine. One training event is recorded for the item,
-    with ``training_time_seconds`` summed over the calls.
+    with ``training_time_seconds`` summed over the calls and
+    ``training_iterations`` set to the steps the correction actually took.
+
+    Every call gets ``loss_target`` and ``max_steps=training_iterations``:
+    training stops as soon as a step's loss is below the target. Rehearsal
+    examples share the target; their loss is already low, so they stop after
+    one step unless the model drifted, which is the intended anchoring.
 
     On ``InvalidRevisionError`` the item is not trained and the outcome carries
     ``revision_invalid=True`` plus the error text.
@@ -789,11 +912,20 @@ def _train_one_item(
         revision_has_key_terms = contains_key_terms(revision_answer, item.key_terms)
 
     train_start = time.time()
+    stats: list[TrainingStats] = []
     for example in examples:
         batched = collate_training_examples([example], tokenizer)
-        model.train_on_example(batched, iterations=training_iterations)
+        stats.append(
+            model.train_on_example(
+                batched,
+                iterations=training_iterations,
+                loss_target=loss_target,
+                max_steps=training_iterations,
+            )
+        )
     elapsed = time.time() - train_start
-    _record_training_event(db, example_id, experiment_id, training_iterations, elapsed)
+    correction = stats[0]
+    _record_training_event(db, example_id, experiment_id, correction.steps, elapsed)
     return TrainingOutcome(
         trained=True,
         revision_text=revision_text,
@@ -801,6 +933,11 @@ def _train_one_item(
         revision_answer=revision_answer,
         revision_has_key_terms=revision_has_key_terms,
         rehearsal_item_ids=[r_item.id for r_item, _ in rehearsal],
+        train_steps=correction.steps,
+        train_initial_loss=correction.initial_loss,
+        train_final_loss=correction.final_loss,
+        train_hit_cap=correction.hit_cap,
+        training_stats=stats,
     )
 
 
@@ -903,6 +1040,7 @@ class EvaluationHarness:
                 {
                     "name": config.name,
                     "training_iterations": config.training_iterations,
+                    "loss_target": config.loss_target,
                     "epochs_per_call": config.epochs_per_call,
                     "shuffle": config.shuffle,
                     "seed": config.seed,
@@ -946,6 +1084,10 @@ class EvaluationHarness:
             print(
                 f"Rehearsal k: {config.rehearsal_k} "
                 f"(max tokens: {config.rehearsal_max_tokens})"
+            )
+            print(
+                f"Loss target: {config.loss_target} "
+                f"(step cap: {config.training_iterations})"
             )
             if self._model_kwargs:
                 print(f"Model kwargs: {self._model_kwargs}")
@@ -1040,11 +1182,16 @@ class EvaluationHarness:
                 config.revision_prompt,
                 config.think_mode,
                 rehearsal,
+                loss_target=config.loss_target,
             )
             item_result.revision_text = outcome.revision_text
             item_result.revision_invalid = outcome.revision_invalid
             item_result.training_time_seconds = outcome.training_time_seconds
             item_result.rehearsal_item_ids = outcome.rehearsal_item_ids
+            item_result.train_steps = outcome.train_steps
+            item_result.train_initial_loss = outcome.train_initial_loss
+            item_result.train_final_loss = outcome.train_final_loss
+            item_result.train_hit_cap = outcome.train_hit_cap
             # An item whose revision was rejected was never trained on; keep it
             # out of the train metrics but flag it so it is counted.
             item_result.was_trained = outcome.trained
@@ -1069,7 +1216,10 @@ class EvaluationHarness:
                         if outcome.rehearsal_item_ids
                         else ""
                     )
-                    print(f"       Trained ({outcome.training_time_seconds:.1f}s{extra})")
+                    print(
+                        f"       Trained ({outcome.training_text()}, "
+                        f"{outcome.training_time_seconds:.1f}s{extra})"
+                    )
                     if outcome.revision_answer is not None:
                         was = "✓" if item_result.initial_has_key_terms else "✗"
                         now = "✓" if outcome.revision_has_key_terms else "✗"
@@ -1141,6 +1291,7 @@ class EvaluationHarness:
                 f"(max tokens: {config.rehearsal_max_tokens})"
             )
             print(result.collapse_summary_text())
+            print(result.training_summary_text())
             print()
             print(f"Results saved to database (experiment_id={experiment_id})")
 

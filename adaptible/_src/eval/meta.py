@@ -36,8 +36,10 @@ from .harness import (
     _judge_only,
     _train_one_item,
     sample_rehearsal_ids,
+    training_summary_text,
     validate_rehearsal_k,
     validate_rehearsal_max_tokens,
+    normalize_loss_target,
     validate_training_source,
 )
 from ..revise import resolve_think_mode, revision_prompt_preset
@@ -236,6 +238,10 @@ class SeedTrajectory:
         holdout_correct/holdout_total: Final holdout evaluation after training.
         revision_invalid_count: Items skipped because the self-generated
             revision failed validation (always 0 for ``ground_truth``).
+        train_steps: Per trained item (in training order), optimizer steps the
+            correction took under the loss target.
+        train_final_losses: Per trained item, the correction's final loss.
+        train_cap_hits: Trained items whose correction ran to the step cap.
     """
 
     seed: int
@@ -246,6 +252,32 @@ class SeedTrajectory:
     holdout_correct: int | None = None
     holdout_total: int | None = None
     revision_invalid_count: int = 0
+    train_steps: list[int] = dataclasses.field(default_factory=list)
+    train_final_losses: list[float | None] = dataclasses.field(default_factory=list)
+    train_cap_hits: int = 0
+
+    @property
+    def mean_train_steps(self) -> float:
+        if not self.train_steps:
+            return 0.0
+        return sum(self.train_steps) / len(self.train_steps)
+
+    @property
+    def mean_train_final_loss(self) -> float | None:
+        losses = [l for l in self.train_final_losses if l is not None]
+        if not losses:
+            return None
+        return sum(losses) / len(losses)
+
+    def training_summary_text(self, cap: int, loss_target: float | None) -> str:
+        """Steps / final-loss / cap summary line; see ``harness.training_summary_text``."""
+        return training_summary_text(
+            self.train_steps,
+            self.train_final_losses,
+            self.train_cap_hits,
+            cap,
+            loss_target,
+        )
 
     @property
     def holdout_accuracy(self) -> float | None:
@@ -371,6 +403,11 @@ class SeedTrajectory:
             "holdout_accuracy": self.holdout_accuracy,
             "revision_invalid_count": self.revision_invalid_count,
             "total_net_learning": self.total_net_learning,
+            "train_steps": self.train_steps,
+            "train_final_losses": self.train_final_losses,
+            "train_cap_hits": self.train_cap_hits,
+            "mean_train_steps": self.mean_train_steps,
+            "mean_train_final_loss": self.mean_train_final_loss,
             "checkpoints": [c.to_dict() for c in self.checkpoints],
         }
 
@@ -384,6 +421,9 @@ class SeedTrajectory:
             holdout_correct=traj_data.get("holdout_correct"),
             holdout_total=traj_data.get("holdout_total"),
             revision_invalid_count=traj_data.get("revision_invalid_count", 0),
+            train_steps=traj_data.get("train_steps", []),
+            train_final_losses=traj_data.get("train_final_losses", []),
+            train_cap_hits=traj_data.get("train_cap_hits", 0),
         )
         for cp_data in traj_data["checkpoints"]:
             trajectory.checkpoints.append(Checkpoint.from_dict(cp_data))
@@ -407,6 +447,11 @@ class MetaLearningConfig:
             ``EvaluationConfig.rehearsal_k``.
         rehearsal_max_tokens: Baseline token cap for rehearsal-pool items; see
             ``EvaluationConfig.rehearsal_max_tokens``.
+        training_iterations: Step cap per ``train_on_example`` call; see
+            ``EvaluationConfig.training_iterations``.
+        loss_target: Stop each training call once a step's loss is below this;
+            ``None`` (or <= 0) trains exactly ``training_iterations`` steps.
+            See ``EvaluationConfig.loss_target``.
         holdout_every_checkpoint: Also probe the holdout set at every
             checkpoint (costs a holdout-sized inference pass per checkpoint).
         repeats: Run each seed this many times with an identical shuffle. Any
@@ -419,7 +464,8 @@ class MetaLearningConfig:
         default_factory=lambda: [42, 123, 456, 789, 1011]
     )
     checkpoint_interval: int = 10  # Checkpoint every N training events
-    training_iterations: int = 25  # Iterations per training event
+    training_iterations: int = 12  # Step cap per training call
+    loss_target: float | None = 0.6
     train_ratio: float = 0.8  # Fraction used for training
     max_tokens: int | None = None  # Use model default if None
     training_source: str = "ground_truth"
@@ -438,6 +484,7 @@ class MetaLearningConfig:
         self.close_think = self.think_mode != "none"
         validate_rehearsal_k(self.rehearsal_k)
         validate_rehearsal_max_tokens(self.rehearsal_max_tokens)
+        self.loss_target = normalize_loss_target(self.loss_target)
         if self.repeats < 1:
             raise ValueError(f"repeats must be >= 1, got {self.repeats}")
 
@@ -447,6 +494,7 @@ class MetaLearningConfig:
             "seeds": self.seeds,
             "checkpoint_interval": self.checkpoint_interval,
             "training_iterations": self.training_iterations,
+            "loss_target": self.loss_target,
             "train_ratio": self.train_ratio,
             "max_tokens": self.max_tokens,
             "training_source": self.training_source,
@@ -466,6 +514,8 @@ class MetaLearningConfig:
             seeds=data["seeds"],
             checkpoint_interval=data["checkpoint_interval"],
             training_iterations=data["training_iterations"],
+            # Files written before loss-targeted training ran a fixed count.
+            loss_target=data.get("loss_target"),
             train_ratio=data["train_ratio"],
             max_tokens=data.get("max_tokens"),
             training_source=data.get("training_source", "ground_truth"),
@@ -783,6 +833,10 @@ class MetaLearningExperiment:
             f"  Rehearsal k: {config.rehearsal_k} "
             f"(max tokens: {config.rehearsal_max_tokens})"
         )
+        print(
+            f"  Loss target: {config.loss_target} "
+            f"(step cap: {config.training_iterations})"
+        )
         for (seed, repeat), traj in sorted(result.all_trajectories.items()):
             label = f"Seed {seed}" + (f" repeat {repeat}" if config.repeats > 1 else "")
             print(f"  {label}:")
@@ -800,6 +854,12 @@ class MetaLearningExperiment:
                 + (f"{holdout:.1%}" if holdout is not None else "N/A")
             )
             print(f"    Net learning: {traj.total_net_learning}")
+            print(
+                "    "
+                + traj.training_summary_text(
+                    config.training_iterations, config.loss_target
+                )
+            )
             if config.training_source == "self_generated":
                 print(f"    Invalid revisions: {traj.revision_invalid_count}")
         print()
@@ -870,6 +930,7 @@ class MetaLearningExperiment:
                     "seed": seed,
                     "repeat": repeat,
                     "training_iterations": config.training_iterations,
+                    "loss_target": config.loss_target,
                     "checkpoint_interval": config.checkpoint_interval,
                     "train_ratio": config.train_ratio,
                     "max_tokens": config.max_tokens,
@@ -978,6 +1039,7 @@ class MetaLearningExperiment:
                     config.revision_prompt,
                     config.think_mode,
                     [(items_by_id[rid], baseline_raw[rid]) for rid in rehearsal_ids],
+                    loss_target=config.loss_target,
                 )
                 if outcome.revision_invalid:
                     revision_invalid_ids.append(item.id)
@@ -987,6 +1049,15 @@ class MetaLearningExperiment:
                     continue
                 trained_items.append(item.id)
                 window_ids.append(item.id)
+                trajectory.train_steps.append(outcome.train_steps)
+                trajectory.train_final_losses.append(outcome.train_final_loss)
+                if outcome.train_hit_cap:
+                    trajectory.train_cap_hits += 1
+                if verbose:
+                    print(
+                        f"    Trained {item.id} ({outcome.training_text()}, "
+                        f"{outcome.training_time_seconds:.1f}s)"
+                    )
 
             # Checkpoint: Evaluate all trained items
             for item_id in trained_items:
@@ -1052,6 +1123,12 @@ class MetaLearningExperiment:
                 f"    Holdout accuracy: {acc:.1%}"
                 if acc is not None
                 else "    Holdout: none"
+            )
+            print(
+                "    "
+                + trajectory.training_summary_text(
+                    config.training_iterations, config.loss_target
+                )
             )
 
         # Mark experiment complete

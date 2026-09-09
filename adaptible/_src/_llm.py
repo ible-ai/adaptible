@@ -1,10 +1,12 @@
 """Stateful LLM."""
 
 import collections
+import dataclasses
 import functools
+import math
 import threading
 from pathlib import Path
-from typing import AsyncIterable, List, Tuple, cast
+from typing import AsyncIterable, Callable, List, Tuple, cast
 
 import immutabledict
 import mlx
@@ -42,6 +44,16 @@ MODEL_PATH = default_checkpoint_path()
 # MAX_TOKENS = 8192
 _LEARNING_RATE = 5e-5
 _EPOCHS = 5
+# Loss-targeted training. A per-step probe on DeepSeek-R1-Distill-Qwen-1.5B
+# (one correction, target "Ottawa"+eos, think_mode="baseline") went from a
+# loss of 6.05 to ~0.6 in a few steps; at ~0.6 the greedy answer flips to the
+# correction while the reasoning stays intact and unrelated items are
+# unaffected. Driving the loss below ~0.1 (what a fixed 5-25 iterations does)
+# makes the model emit the bare answer with no reasoning and answer "Ottawa"
+# to unrelated questions. So training stops on a loss target with a step cap,
+# not on a fixed count.
+_LOSS_TARGET: float | None = 0.6
+_MAX_TRAIN_STEPS = 12
 # LoRA configuration: Higher rank (32) and more layers (24) provide
 # more capacity for learning while scale (10.0) keeps training stable.
 # Note: Self-correction works best with diverse accumulated examples over time,
@@ -144,6 +156,81 @@ def _loss_fn(
     return normalized_loss
 
 
+@dataclasses.dataclass
+class TrainingStats:
+    """What one ``train_on_example`` call did.
+
+    Attributes:
+        steps: Optimizer steps taken.
+        initial_loss: Loss reported by the first step (NaN if no step ran).
+        final_loss: Loss reported by the last step (NaN if no step ran).
+        stopped_early: True if a step's loss fell below the loss target before
+            the step cap was reached.
+        losses: Every step's loss, in order.
+    """
+
+    steps: int
+    initial_loss: float
+    final_loss: float
+    stopped_early: bool
+    losses: list[float] = dataclasses.field(default_factory=list)
+
+    @property
+    def hit_cap(self) -> bool:
+        """The loop ran out of steps without reaching the loss target."""
+        return self.steps > 0 and not self.stopped_early
+
+
+def should_stop(loss: float, loss_target: float | None) -> bool:
+    """Whether a step whose loss is ``loss`` satisfies ``loss_target``.
+
+    ``None`` never stops (a fixed number of steps); otherwise stop once the
+    loss is strictly below the target.
+    """
+    return loss_target is not None and loss < loss_target
+
+
+def run_training_steps(
+    step_fn: Callable[[], float],
+    max_steps: int,
+    loss_target: float | None,
+    verbose: bool = False,
+) -> TrainingStats:
+    """Call ``step_fn`` until its loss drops below ``loss_target`` or ``max_steps``.
+
+    ``step_fn`` performs one optimizer step and returns that step's loss. The
+    target is checked after each step, so the step that crosses it is the last
+    one and its loss is ``final_loss``.
+
+    Args:
+        step_fn: Performs one gradient step and returns its loss.
+        max_steps: Hard cap on steps.
+        loss_target: Stop as soon as a step's loss is below this; ``None``
+            runs exactly ``max_steps`` steps.
+        verbose: Print each step's loss.
+
+    Returns:
+        Per-call ``TrainingStats``.
+    """
+    losses: list[float] = []
+    stopped_early = False
+    for step in range(max(max_steps, 0)):
+        loss = float(step_fn())
+        losses.append(loss)
+        if verbose:
+            vizible.green(f"Step: {step}\tLoss: {loss:.4f}")
+        if should_stop(loss, loss_target):
+            stopped_early = True
+            break
+    return TrainingStats(
+        steps=len(losses),
+        initial_loss=losses[0] if losses else math.nan,
+        final_loss=losses[-1] if losses else math.nan,
+        stopped_early=stopped_early,
+        losses=losses,
+    )
+
+
 class StatefulLLM:
     """Model container that bundles revision, learning, and serving logic."""
 
@@ -159,6 +246,8 @@ class StatefulLLM:
         loop_detection_sequence_length: int = _LOOP_DETECTION_SEQUENCE_LENGTH,
         loop_detection_max_repetitions: int = _LOOP_DETECTION_MAX_REPETITIONS,
         model_path: Path | None = MODEL_PATH,
+        loss_target: float | None = _LOSS_TARGET,
+        max_train_steps: int = _MAX_TRAIN_STEPS,
     ) -> None:
         """Initializes the StatefulLLM
 
@@ -166,12 +255,18 @@ class StatefulLLM:
             model_name: Path or Huggingface name.
             learning_rate: Backpropagation hyperparameter.
             max_tokens: Maximum number of tokens to decode in a single turn.
-            epochs: Number of training epochs to perform on self-reflective model revisions.
+            epochs: Number of optimizer steps ``_train`` runs when called
+                without a loss target (the legacy fixed-count path).
             num_lora_layers: Number of LORA layers, if LORA is enabled.
             lora_parameters: LORA hyperparameters. If not None, LORA will be enabled.
             use_dora: Whether to use DORA, if LORA is enabled.
             loop_detection_sequence_length: Length of token sequence to check for repetition.
             loop_detection_max_repetitions: Number of times a sequence can repeat before stopping.
+            model_path: Checkpoint directory; loaded from if it exists.
+            loss_target: ``self_correct_and_train`` stops training a revision as
+                soon as a step's loss falls below this. ``None`` disables the
+                target and trains ``max_train_steps`` steps.
+            max_train_steps: Step cap for ``self_correct_and_train``.
 
         Returns: None
         """
@@ -196,6 +291,8 @@ class StatefulLLM:
         self._eos_token = self._tokenizer.special_tokens_map.get("eos_token", "")
         self._loop_detection_sequence_length = loop_detection_sequence_length
         self._loop_detection_max_repetitions = loop_detection_max_repetitions
+        self._loss_target = loss_target
+        self._max_train_steps = max_train_steps
 
         self._model_is_stable = True
         self._response_stream = None
@@ -450,12 +547,35 @@ class StatefulLLM:
         )
         return example
 
-    def _train(self, example: TrainingExample, verbose: bool):
+    def _train(self, example: TrainingExample, verbose: bool) -> TrainingStats:
+        """Runs ``self._epochs`` fixed optimizer steps on ``example``."""
         with self._lock:
-            self._train_locked(example, verbose)
+            return self._train_locked(example, verbose)
 
-    def _train_locked(self, example: TrainingExample, verbose: bool):
-        """Runs ``self._epochs`` optimizer steps on ``example``; caller must hold ``_lock``."""
+    def _train_locked(
+        self,
+        example: TrainingExample,
+        verbose: bool,
+        max_steps: int | None = None,
+        loss_target: float | None = None,
+    ) -> TrainingStats:
+        """Runs optimizer steps on ``example``; caller must hold ``_lock``.
+
+        The compiled step is built once per call and then run one step at a
+        time by ``run_training_steps`` so training can stop on ``loss_target``.
+
+        Args:
+            example: Collated input/label/mask arrays.
+            verbose: Print per-step losses and device info.
+            max_steps: Step cap; defaults to ``self._epochs``.
+            loss_target: Stop once a step's loss is below this; ``None`` runs
+                exactly ``max_steps`` steps.
+
+        Returns:
+            ``TrainingStats`` for this call.
+        """
+        if max_steps is None:
+            max_steps = self._epochs
         state = [self._model.state, self._optimizer.state, mlx.core.random.state]
         mlx.core.eval(state)
         loss_and_grad_fn = mlx.nn.value_and_grad(self._model, _loss_fn)
@@ -465,9 +585,6 @@ class StatefulLLM:
             loss, grads = loss_and_grad_fn(self._model, inputs, labels, mask)
             self._optimizer.update(self._model, grads)
             return loss
-
-        # 3. Train the model on the new, improved examples (backward-pass)
-        losses = []
 
         if verbose:
             vizible.green(f"During training: {mlx.core.metal.device_info() = }")
@@ -487,19 +604,27 @@ class StatefulLLM:
         if world_size > 1:
             tqdm.tqdm.write(f"Node {rank} of {world_size}")
 
-        self._model.train(True)
-        for epoch in tqdm.tqdm(
-            range(self._epochs), desc="Training", total=self._epochs
-        ):
+        progress = tqdm.tqdm(desc="Training", total=max_steps)
+
+        def one_step() -> float:
             loss = _step(example.input, example.label, example.mask)
             mlx.core.eval(state, loss)
-            if verbose:
-                vizible.green(f"Epoch: {epoch}\tLoss: {loss = }")
-            losses.append(loss)
+            progress.update(1)
+            return loss.item()
 
-        self._model.train(False)
+        self._model.train(True)
+        try:
+            stats = run_training_steps(one_step, max_steps, loss_target, verbose)
+        finally:
+            self._model.train(False)
+            progress.close()
         if verbose:
-            vizible.cyan(f"{losses = }")
+            vizible.cyan(
+                f"Trained {stats.steps} steps, loss {stats.initial_loss:.4f} → "
+                f"{stats.final_loss:.4f}"
+                + (" (loss target reached)" if stats.stopped_early else "")
+            )
+        return stats
 
     def train_on_example(
         self,
@@ -507,29 +632,45 @@ class StatefulLLM:
         iterations: int = 25,
         verbose: bool = False,
         save_checkpoint: bool = False,
-    ) -> None:
-        """Train on a pre-constructed training example for N iterations.
+        loss_target: float | None = None,
+        max_steps: int | None = None,
+    ) -> TrainingStats:
+        """Train on a pre-constructed training example.
 
-        This is a convenience wrapper around _train() that handles the
-        iteration loop and optional checkpointing.
+        Runs single optimizer steps until a step's loss is below
+        ``loss_target`` or the step cap is reached. With ``loss_target=None``
+        (the default) exactly ``iterations`` steps run, which keeps existing
+        callers' behaviour.
 
         Args:
             example: Pre-constructed TrainingExample with input, label, and mask.
-            iterations: Total number of training iterations (epochs * calls).
+            iterations: Number of gradient steps; the cap when ``max_steps`` is
+                None.
             verbose: Enable verbose logging.
             save_checkpoint: Whether to save the model after training.
+            loss_target: Stop as soon as a step's loss is below this. The
+                crossing step is the last one and its loss is ``final_loss``.
+            max_steps: Step cap; defaults to ``iterations``.
+
+        Returns:
+            ``TrainingStats`` describing the steps taken.
         """
+        if max_steps is None:
+            max_steps = iterations
         self._model_is_stable = False
         try:
             with self._lock:
-                calls = iterations // self._epochs
-                for _ in range(calls):
-                    self._train_locked(example, verbose=verbose)
-
+                stats = self._train_locked(
+                    example,
+                    verbose=verbose,
+                    max_steps=max_steps,
+                    loss_target=loss_target,
+                )
                 if save_checkpoint and self._model_path is not None:
                     self._save_checkpoint()
         finally:
             self._model_is_stable = True
+        return stats
 
     def _save_checkpoint(self) -> None:
         """Writes the current weights to ``self._model_path``; caller must hold ``_lock``."""
@@ -563,10 +704,16 @@ class StatefulLLM:
                     interaction_history, indices_to_review, verbose
                 )
 
-                # Train the model on the new, improved examples (backward-pass)
-                self._train_locked(example, verbose)
-                if self._model_path is not None:
-                    self._save_checkpoint()
+                # Train the model on the new, improved examples (backward-pass),
+                # stopping on the loss target so the correction lands without
+                # collapsing the model's reasoning.
+                self.train_on_example(
+                    example,
+                    verbose=verbose,
+                    save_checkpoint=True,
+                    loss_target=self._loss_target,
+                    max_steps=self._max_train_steps,
+                )
         finally:
             # ``ok`` must recover even if revision validation or training raised.
             self._model_is_stable = True
