@@ -1,27 +1,20 @@
 # Local Server
 
-FastAPI server for hosting a stateful LLM with self-correction capabilities.
+FastAPI server hosting a `StatefulLLM` with endpoints for chat and for triggering self-correction.
 
 ## Overview
 
-The `local` module provides `MutableHostedLLM`, a server that wraps Adaptible's `StatefulLLM` with HTTP endpoints for:
-- Generating responses to prompts
-- Streaming responses
-- Triggering self-correction cycles
-- Accessing interaction history
-- Synchronizing with background training
+`MutableHostedLLM` (`_server.py`) is a `uvicorn.Server` subclass with awaitable `up()`/`down()`. It serves the app built by `adaptible.Adaptible` (`adaptible/_src/_api.py`), which keeps interaction history in memory and tracks which interactions have not yet been reviewed.
 
 ## Quick Start
 
 ### Command Line
 
 ```bash
-# Start server on default port (8000)
-python -m adaptible.local
-
-# Access web UI
-open http://127.0.0.1:8000/static/
+python -m adaptible.local          # http://127.0.0.1:8000, web UI at /static/
 ```
+
+`python -m adaptible.local` did not work before 1.0.0a3 (`adaptible.local` was a module, not a package); it is now a thin alias package over `adaptible/_src/local/`. The uvicorn ≥0.36 startup crash was fixed in the same release.
 
 ### Programmatic Usage
 
@@ -30,20 +23,10 @@ import asyncio
 import adaptible
 
 async def main():
-    # Create and start server
-    server = adaptible.local.MutableHostedLLM(
-        host="127.0.0.1",
-        port=8000
-    )
+    server = adaptible.local.MutableHostedLLM(host="127.0.0.1", port=8000)
     await server.up()
-    
-    # Server is now running
     print("Server ready at http://127.0.0.1:8000")
-    
-    # Keep running
     await asyncio.sleep(3600)
-    
-    # Shutdown
     await server.down()
 
 asyncio.run(main())
@@ -52,50 +35,42 @@ asyncio.run(main())
 ### Custom FastAPI App
 
 ```python
-from fastapi import FastAPI
 import adaptible
 
-# Create custom app with Adaptible routes
 app = adaptible.Adaptible().app
 
-# Add your own routes
 @app.get("/custom")
 def custom_endpoint():
     return {"message": "Custom endpoint"}
 
-# Host it
 server = adaptible.local.MutableHostedLLM(app=app)
 ```
 
-## API Endpoints
+`Adaptible(model=...)` accepts anything satisfying `ModelProtocol` (`ok`, `generate_response`, `stream_response`, `self_correct_and_train`); `adaptible/tests/api_test.py` injects a stub this way.
 
-Once running, the server exposes these endpoints:
+## API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/interact` | POST | Send prompt, get complete response |
+| `/interact` | POST | Send prompt, get complete response; recorded as an unreviewed interaction |
 | `/stream_interact` | POST | Send prompt, stream response chunks |
-| `/trigger_review` | POST | Start self-correction on recent interactions |
-| `/sync` | GET | Wait for background training to complete |
-| `/history` | GET | Retrieve all interaction history |
+| `/trigger_review` | POST | Hand all unreviewed interactions to `model.self_correct_and_train` in an `asyncio` task (via `asyncio.to_thread`) and return immediately |
+| `/sync` | GET | Await every outstanding `/trigger_review` task, log any failure, then poll `model.ok` until training is done |
+| `/history` | GET | All interactions |
 | `/status` | GET | Health check |
-| `/static/` | GET | Web UI (HTML/CSS/JS) |
+| `/static/` | GET | Web UI |
+
+Fixed in 1.0.0a3: `/trigger_review` previously created the training coroutine without awaiting or scheduling it, so no training ever ran; `/sync` only polled `model.ok`. A failed training task is logged by `/sync` and the model keeps its pre-training weights.
 
 ### Example Requests
 
 ```bash
-# Send a prompt
 curl -X POST http://127.0.0.1:8000/interact \
   -H "Content-Type: application/json" \
   -d '{"prompt": "What is the capital of France?"}'
 
-# Trigger self-correction
 curl -X POST http://127.0.0.1:8000/trigger_review
-
-# Wait for training to finish
 curl http://127.0.0.1:8000/sync
-
-# Get interaction history
 curl http://127.0.0.1:8000/history
 ```
 
@@ -107,9 +82,8 @@ import requests
 response = requests.post(
     "http://127.0.0.1:8000/stream_interact",
     json={"prompt": "Explain quantum computing"},
-    stream=True
+    stream=True,
 )
-
 for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
     if chunk:
         print(chunk, end="", flush=True)
@@ -119,74 +93,39 @@ for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
 
 ```python
 server = adaptible.local.MutableHostedLLM(
-    host="127.0.0.1",      # Bind address
-    port=8000,              # Port number
-    app=None,               # Optional custom FastAPI app
+    host="127.0.0.1",
+    port=8000,
+    app=None,     # optional custom FastAPI app
 )
 ```
 
-If `app` is not provided, a default `Adaptible()` instance is created with a fresh `StatefulLLM`.
+If `app` is not provided, a default `Adaptible()` is created with `StatefulLLM()`. That constructor loads `<outputs>/autonomous/checkpoint` if it exists (`<outputs>` is `$ADAPTIBLE_OUTPUTS_DIR` or `<cwd>/outputs`), so a server started after an autonomous run serves the autonomous node's trained weights. Build the model with `StatefulLLM(model_path=None)` and pass `Adaptible(model=...)` for a fresh base model.
+
+The model's chat history records both user and assistant turns (assistant turns were dropped before 1.0.0a3).
 
 ## Web UI
 
-The server includes a web-based chat interface at `/static/`:
-- Terminal-style interface
-- Real-time streaming responses
-- Interaction history display
-- Trigger learning button
+`/static/` serves `adaptible/_src/static/index.html`: a terminal-style chat with streaming responses, history display, and a "trigger learning" button.
 
 ## Files
 
-```
-local/
+```text
+adaptible/_src/local/
 ├── __init__.py          # Public exports (MutableHostedLLM)
 ├── __main__.py          # CLI entry point
 ├── README.md            # This file
-└── _src/
-    └── _server.py       # MutableHostedLLM implementation
+└── _server.py           # MutableHostedLLM implementation
+
+adaptible/local/         # Alias package so `python -m adaptible.local` works
+adaptible/_src/_api.py   # Adaptible: routes and interaction history
+adaptible/_src/static/   # Web UI assets
+adaptible/tests/local_test.py, api_test.py   # Model-free tests
 ```
-
-## Relationship to Other Modules
-
-- **`adaptible.Adaptible`** - Provides the FastAPI app with routes
-- **`adaptible.StatefulLLM`** - The underlying model being served
-- **`adaptible.revise`** - Used for self-correction logic
-- **`adaptible/_src/static/`** - Web UI assets (HTML/CSS/JS)
-
-## Typical Workflow
-
-```python
-import asyncio
-import adaptible
-
-async def run_server():
-    # Start server
-    server = adaptible.local.MutableHostedLLM()
-    await server.up()
-    
-    try:
-        # Run indefinitely
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        print("Shutting down...")
-    finally:
-        await server.down()
-
-asyncio.run(run_server())
-```
-
-## Development
-
-The server uses:
-- **FastAPI** for HTTP routing
-- **Uvicorn** for ASGI serving
-- **Asyncio** for concurrent request handling
-- **StatefulLLM** for model inference and training
 
 ## Limitations
 
-- Model state is in-memory only (lost on restart)
-- Single model instance (no load balancing)
+- Interaction history is in-memory only (lost on restart); trained weights persist only if saved to a checkpoint
+- Single model instance, no load balancing
+- No authentication
 - Apple Silicon only (MLX dependency)
-- No authentication/authorization built-in
+- Self-correction through this server has not been measured; see the top-level README
