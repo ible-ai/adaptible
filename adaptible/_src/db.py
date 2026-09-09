@@ -17,9 +17,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
-
-# Default database location
-DEFAULT_DB_PATH = Path(__file__).parent.parent.parent / "outputs" / "adaptible.db"
+from . import _paths
 
 
 class SourceType(Enum):
@@ -212,7 +210,9 @@ class Database:
             db_path: Path to SQLite database. If None, uses default location.
         """
         if db_path is None:
-            db_path = DEFAULT_DB_PATH
+            # Resolved at construction time so $ADAPTIBLE_OUTPUTS_DIR / cwd are
+            # honored, and never derived from __file__ (site-packages for wheels).
+            db_path = _paths.default_db_path()
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()

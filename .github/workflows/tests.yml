@@ -1,0 +1,41 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    # MLX requires Apple Silicon; macos-14+ hosted runners are arm64.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Import check
+        run: python -c "import adaptible"
+
+      # Model-free tests only. llm_test / integration_test download and train a
+      # real model and are run locally instead.
+      - name: Unit tests
+        env:
+          ADAPTIBLE_OUTPUTS_DIR: ${{ runner.temp }}/adaptible-outputs
+        run: |
+          python -m unittest \
+            adaptible.tests.classes_test \
+            adaptible.tests.api_test \
+            adaptible.tests.local_test \
+            adaptible.tests.paths_test \
+            adaptible.tests.eval_test \
+            adaptible.tests.autonomous_test \
+            adaptible._src.revise.revise_test \
+            -v

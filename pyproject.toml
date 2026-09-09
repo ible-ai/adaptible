@@ -1,19 +1,16 @@
 [project]
 name = "adaptible"
-version = "1.0.0a2"
+version = "1.0.0a3"
 description = "Stateful LLM serving instances that self-reflect and learn from their mistakes during periods of low server utilization."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "absl-py",
-    "duckduckgo-search",
+    "ddgs",
     "fastapi[all]",
     "immutabledict",
-    "lm-eval",
     "mlx-lm",
     "mlx",
-    "optax",
-    "torch",
     "tqdm",
     "transformers",
     "uvicorn[standard]",
@@ -26,6 +23,21 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["adaptible"]
+exclude = [
+    "adaptible/tests/artifacts",
+    "adaptible/tests/*.ipynb",
+    "**/logs",
+    "adaptible/_src/dev",
+]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "adaptible/tests/artifacts",
+    "**/logs",
+    "outputs",
+    "notebooks",
+    ".github",
+]
 
 [tool.hatch.metadata]
 allow-direct-references = true

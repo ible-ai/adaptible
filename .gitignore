@@ -1,0 +1,19 @@
+# Environments / caches
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Run-time state (published results under outputs/meta/ and
+# outputs/autonomous/state.json are intentionally tracked)
+outputs/adaptible.db
+outputs/**/checkpoint/
+outputs/**/logs/
+
+# Generated test reports
+adaptible/tests/artifacts/*.html
