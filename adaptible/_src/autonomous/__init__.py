@@ -13,10 +13,10 @@ Example usage:
         # Implement with Brave Search API, SerpAPI, etc.
         ...
 
-    node = AutonomousNode(search_fn=my_search)
+    node = AutonomousNode(search_fn=my_search, seed_topics=["recent AI news"])
 
-    # Run exploration cycles
-    results = node.run(cycles=10, delay_seconds=2.0)
+    # Run exploration cycles (one per topic)
+    results = node.run(topics=["recent AI news", None, None])
 
     # Or explore a specific topic
     result = node.explore_once("recent AI announcements")

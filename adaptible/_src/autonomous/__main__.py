@@ -1,21 +1,21 @@
-"""Demo script for the Autonomous Learning Node.
-
-This script demonstrates how to use the AutonomousNode with a mock search
-function. In production, you would replace the mock search with a real
-search API (e.g., Brave Search, SerpAPI, Tavily).
+"""CLI for the Autonomous Learning Node, searching the web via DuckDuckGo (``ddgs``).
 
 Usage:
-    python -m adaptible.autonomous [--cycles N] [--topic TOPIC]
+    python -m adaptible.autonomous [--cycles N] [--topics TOPIC ...]
 
 Examples:
-    # Run 3 exploration cycles with random topics
+    # Run 3 exploration cycles over the default topic list
     python -m adaptible.autonomous --cycles 3
 
-    # Explore a specific topic
-    python -m adaptible.autonomous --topic "recent AI announcements"
+    # Explore specific topics
+    python -m adaptible.autonomous --topics "recent AI announcements" --topics "Bitcoin price"
 
-    # Run demo without loading the model (just shows how it would work)
-    python -m adaptible.autonomous --dry-run
+    # Also train on knowledge gaps (default trains only on conflicting beliefs)
+    python -m adaptible.autonomous --train_on_new_knowledge
+
+State, logs and the checkpoint live under ``$ADAPTIBLE_OUTPUTS_DIR`` (default
+``<cwd>/outputs``): ``autonomous/state.json``, ``autonomous/logs/YYYYMMDD.txt``,
+``autonomous/checkpoint/``.
 """
 
 from collections.abc import Mapping, Sequence
@@ -27,7 +27,7 @@ from absl import app, flags
 from ddgs import DDGS
 
 from .node import AutonomousNode
-from .._llm import MODEL_PATH
+from .. import _paths
 
 # Specific factual queries - use "current" or 2025 to ensure we're testing
 # information beyond the model's training cutoff
@@ -58,10 +58,27 @@ _TOPICS = flags.DEFINE_multi_string(
     "topics", _DEFAULT_TOPICS, "Specific topic to explore (optional)"
 )
 _OUTPUT_PATH = flags.DEFINE_string(
-    "output_path", "outputs/autonomous/state.json", "Path to save node state"
+    "output_path",
+    None,
+    "Path to save node state (default: <outputs>/autonomous/state.json)",
 )
 _MODEL_PATH = flags.DEFINE_string(
-    "model_path", str(MODEL_PATH), "Path to save node state"
+    "model_path",
+    None,
+    "Checkpoint directory to load/save model weights "
+    "(default: <outputs>/autonomous/checkpoint)",
+)
+# absl.logging already owns --log_dir, hence the prefix.
+_LOG_DIR = flags.DEFINE_string(
+    "node_log_dir",
+    None,
+    "Directory for per-day node logs (default: <outputs>/autonomous/logs)",
+)
+_TRAIN_ON_NEW_KNOWLEDGE = flags.DEFINE_boolean(
+    "train_on_new_knowledge",
+    False,
+    "Also train when the model had no belief about a claim (a knowledge gap). "
+    "By default only conflicting beliefs are trained on; gaps are recorded only.",
 )
 
 
@@ -100,28 +117,26 @@ def main(_):
 
         return to_return
 
-    # Create the node with mock search
     node = AutonomousNode(
         search_fn=search,
-        state_path=_OUTPUT_PATH.value,
+        state_path=_OUTPUT_PATH.value or _paths.autonomous_state_path(),
         seed_topics=_TOPICS.value,
-        model_path=_MODEL_PATH.value,
+        model_path=_MODEL_PATH.value or _paths.default_checkpoint_path(),
+        log_dir=_LOG_DIR.value or _paths.autonomous_log_dir(),
+        train_on_new_knowledge=_TRAIN_ON_NEW_KNOWLEDGE.value,
     )
+    print(f"State: {node.state_path}")
+    print(f"Logs:  {node.log_dir}")
 
     # Show initial stats
     stats = node.stats()
     print(f"Node stats: {stats}")
     print()
 
-    # Run exploration
-    topics = _TOPICS.value
-    if not topics:
-        topics = [None] * _CYCLES.value
-    print(f"Exploring topic: {topics}")
-    results = []
-    for topic in topics:
-        results.append(node.explore_once(topic))
-
+    # Run exploration: every topic once per cycle (None => node picks a topic).
+    topics = list(_TOPICS.value) or [None]
+    topics = topics * max(1, _CYCLES.value)
+    print(f"Exploring topics: {topics}")
     results = node.run(topics=topics, verbose=True)
 
     # Summary

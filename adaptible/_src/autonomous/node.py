@@ -18,8 +18,9 @@ from pathlib import Path
 from typing import Any, Callable, List
 import vizible
 
+from .. import _paths
 from .._classes import InteractionHistory, TrainingExample
-from .._llm import MAX_TOKENS, StatefulLLM, MODEL_PATH
+from .._llm import MAX_TOKENS, StatefulLLM
 from ..db import (
     Database,
     Example,
@@ -48,6 +49,30 @@ class LearningEvent:
     verified_answer: str | None  # Ground truth from source
     confidence_before_training: float
     confidence_after_training: float
+    trained: bool = True  # False for "new" events recorded without a weight update
+
+    # Keys used by state files written before the field names were changed.
+    _LEGACY_KEYS = {
+        "old_answer": "before_training_answer",
+        "new_answer": "after_training_answer",
+    }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "LearningEvent":
+        """Build an event from a saved dict, tolerating legacy/missing keys."""
+        fields = {f.name for f in dataclasses.fields(cls)}
+        kwargs: dict[str, Any] = {}
+        for key, value in data.items():
+            key = cls._LEGACY_KEYS.get(key, key)
+            if key in fields:
+                kwargs[key] = value
+        kwargs.setdefault("verified_answer", kwargs.get("after_training_answer"))
+        kwargs.setdefault("confidence_before_training", 0.0)
+        kwargs.setdefault("confidence_after_training", 0.0)
+        kwargs.setdefault("before_training_answer", None)
+        kwargs.setdefault("after_training_answer", None)
+        kwargs.setdefault("source_url", None)
+        return cls(**kwargs)
 
 
 @dataclasses.dataclass
@@ -58,6 +83,93 @@ class Claim:
     answer: str
     source: str
     url: str
+
+
+_MIN_QUESTION_CHARS = 15
+
+# Substrings that mark a "claim" as being about the web page itself rather
+# than about the world. Matched case-insensitively against question + answer.
+_BOILERPLATE_MARKERS = (
+    "the content",
+    "this content",
+    "this page",
+    "this article",
+    "this site",
+    "this website",
+    "the article",
+    "the page",
+    "the snippet",
+    "the text",
+    "the source",
+    "main focus",
+    "top stories",
+    "top news",
+    "latest news",
+    "breaking news",
+    "breaking headlines",
+    "news stories",
+    "provides the latest",
+)
+
+# Matches bare site names such as "nbcnews.com" or "apnews.org".
+_SITE_NAME_RE = re.compile(r"\b[\w-]+\.(?:com|org|net|co|io|gov|edu)\b", re.IGNORECASE)
+
+_STOPWORDS = frozenset(
+    """
+    about above after again against also among around because been before being
+    below between both could does doing down during each from further have having
+    here into itself just more most much must other over same should some such
+    than that their them then there these they this those through under until
+    very were what when where which while whom with would your yours according
+    reported reports report said says states stated will been than
+    """.split()
+)
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _content_tokens(text: str) -> set[str]:
+    """Lower-cased alphanumeric tokens of length >= 4 that are not stopwords."""
+    return {
+        tok
+        for tok in _TOKEN_RE.findall(text.lower())
+        if len(tok) >= 4 and tok not in _STOPWORDS
+    }
+
+
+def _claim_is_plausible(claim: Claim, snippet: str) -> bool:
+    """Cheap, model-free sanity check on an extracted claim.
+
+    Rejects claims that are not questions, are too short, describe the web
+    page rather than a fact about the world (site names, "the content",
+    "top stories", ...), or whose answer shares no content word with the
+    snippet it was supposedly extracted from.
+
+    Args:
+        claim: The extracted claim.
+        snippet: The search-result text the claim was extracted from.
+
+    Returns:
+        True if the claim passes every filter.
+    """
+    question = claim.question.strip()
+    answer = claim.answer.strip()
+    if len(question) < _MIN_QUESTION_CHARS or not question.endswith("?"):
+        return False
+    if not answer:
+        return False
+
+    combined = f"{question} {answer}".lower()
+    if _SITE_NAME_RE.search(combined):
+        return False
+    if any(marker in combined for marker in _BOILERPLATE_MARKERS):
+        return False
+
+    # Grounding: the answer must share at least one content word with the snippet.
+    answer_tokens = _content_tokens(answer)
+    if not answer_tokens:
+        return False
+    return bool(answer_tokens & _content_tokens(snippet))
 
 
 @dataclasses.dataclass
@@ -96,7 +208,7 @@ class NodeState:
             started_at=data.get("started_at", datetime.now().isoformat()),
         )
         for e in data.get("learning_history", []):
-            state.learning_history.append(LearningEvent(**e))
+            state.learning_history.append(LearningEvent.from_dict(e))
         return state
 
 
@@ -132,13 +244,15 @@ class AutonomousNode:
         self,
         search_fn: Callable[[str], Sequence[Mapping[str, Any]]],
         seed_topics: Sequence[str],
-        state_path: str,
+        state_path: str | Path | None = None,
         max_tokens: int = MAX_TOKENS,
-        model_path: str | Path = MODEL_PATH,
+        model_path: str | Path | None = None,
         model: StatefulLLM | None = None,
         training_iterations: int = 25,
         db: Database | None = None,
         db_path: Path | str | None = None,
+        log_dir: str | Path | None = None,
+        train_on_new_knowledge: bool = False,
     ):
         """Initialize the autonomous learning node.
 
@@ -147,17 +261,29 @@ class AutonomousNode:
                 search results as dicts with 'title', 'snippet'/'description', and 'url'.
             seed_topics: Topics to explore.
             model: Optional pre-loaded StatefulLLM. If None, will be created on first use.
-            state_path: Where to persist node state between runs.
+            state_path: Where to persist node state between runs. Defaults to
+                ``_paths.autonomous_state_path()`` (``outputs/autonomous/state.json``).
+            model_path: Checkpoint directory to load from / save to. Defaults to
+                ``_paths.default_checkpoint_path()``.
             training_iterations: Number of training iterations per correction.
             max_tokens: Max tokens for generation. Must be high enough for <think> tags.
             db: Pre-initialized Database. If None, will be created using db_path.
             db_path: Path to SQLite database. If None, uses default location.
+            log_dir: Directory for per-day text logs. Defaults to
+                ``_paths.autonomous_log_dir()`` (``outputs/autonomous/logs/``).
+            train_on_new_knowledge: If True, also train when the model had no
+                belief (a knowledge gap). By default only *conflicting* beliefs
+                are trained on; gaps are recorded as "new" events without a
+                weight update, which keeps low-quality scraped claims out of the
+                weights.
         """
         self.search = search_fn
         self._model = model
-        self._model_path = Path(model_path)
-        self.state_path = Path(state_path)
+        self._model_path = Path(model_path or _paths.default_checkpoint_path())
+        self.state_path = Path(state_path or _paths.autonomous_state_path())
         self.state = NodeState.load(self.state_path)
+        self.log_dir = Path(log_dir or _paths.autonomous_log_dir())
+        self.train_on_new_knowledge = train_on_new_knowledge
         self.training_iterations = training_iterations
         self._epochs_per_call = 5  # Matches StatefulLLM._epochs
         self.seed_topics = seed_topics
@@ -173,6 +299,16 @@ class AutonomousNode:
 
         # Track current experiment (created on first run)
         self._current_experiment_id: int | None = None
+
+    def _log(self, message: str) -> None:
+        """Append a timestamped line to today's log file in ``self.log_dir``."""
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = self.log_dir / f"{date.today():%Y%m%d}.txt"
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
+        except OSError as e:  # Logging must never take the node down.
+            vizible.red(f"Could not write log: {e}")
 
     @property
     def model(self) -> StatefulLLM:
@@ -299,8 +435,15 @@ class AutonomousNode:
             if "NO CLAIM" in grounded_response.upper():
                 continue
 
-            # Parse Q&A - the prompt ends with "Q:" so response starts with the question
-            # Handle both "Q: question\nA: answer" and "question\nA: answer" formats
+            # A usable extraction must contain both a "Q:" and an "A:" line;
+            # anything else (prose, a bare answer, a refusal) is dropped.
+            lines = [line.strip() for line in grounded_response.split("\n")]
+            if not any(line.startswith("Q:") for line in lines) or not any(
+                line.startswith("A:") for line in lines
+            ):
+                continue
+
+            # Parse Q&A: first "Q:" line is the question, first following "A:" line is the answer.
             extracted_question = None
 
             for line in grounded_response.split("\n"):
@@ -315,14 +458,16 @@ class AutonomousNode:
                 if line.startswith("A:"):
                     extracted_answer = line[len("A:") :].strip()
                     if extracted_question and extracted_answer:
-                        claims.append(
-                            Claim(
-                                question=extracted_question,
-                                answer=extracted_answer,
-                                source=title,
-                                url=url,
-                            )
+                        claim = Claim(
+                            question=extracted_question,
+                            answer=extracted_answer,
+                            source=title,
+                            url=url,
                         )
+                        if _claim_is_plausible(claim, snippet):
+                            claims.append(claim)
+                        else:
+                            self._log(f"DROPPED implausible claim: {claim.question!r} -> {claim.answer!r} ({url})")
                         break  # Only extract one claim per snippet
 
         return claims
@@ -385,6 +530,8 @@ class AutonomousNode:
         else:
             response = judgement_response
             confidence = "ERROR"
+        response = response.strip()
+        confidence = confidence.strip()
         print(flush=True)
         vizible.cyan(f"{response = }")
         vizible.cyan(f"{confidence = }")
@@ -538,6 +685,7 @@ class AutonomousNode:
             search_results = self.search(topic)
         except Exception as e:
             result.error = f"Search failed: {e}"
+            self._log(f"SEARCH FAILED topic={topic!r}: {e}")
             return result
 
         if not search_results:
@@ -546,6 +694,7 @@ class AutonomousNode:
         # Extract claims from search results
         claims = self._extract_claims(search_results, topic)
         result.claims_found = len(claims)
+        self._log(f"TOPIC {topic!r}: {len(search_results)} results, {len(claims)} plausible claims")
 
         # Process each claim
         for claim in claims:
@@ -593,17 +742,34 @@ class AutonomousNode:
             )
             self._db.insert_response(baseline_response)
 
-            # Check for conflict
-            # if True:
-            if self._beliefs_conflict(
+            # Decide whether to train.
+            #
+            # A "new" event means the model had nothing to say (empty answer or
+            # LOW confidence). A "correction" event means it held a belief that
+            # the fact-checker judged inconsistent with the source. Only
+            # corrections are trained on unless ``train_on_new_knowledge`` is set:
+            # gaps are recorded but do not change the weights.
+            held_belief = (
+                bool((maybe_generated_response_before_training or "").strip())
+                and confidence_before_training >= 0.2
+            )
+            conflicts = self._beliefs_conflict(
                 maybe_generated_response_before_training,
                 claim.answer,
                 claim.question,
                 confidence_before_training,
-            ):
-                event_type = "new" if confidence_before_training < 0.2 else "correction"
+            )
+            if not conflicts:
+                self._log(f"CONSISTENT {claim.question!r} (conf={confidence_before_training})")
+                continue
 
-                # Train on the correction
+            event_type = "correction" if held_belief else "new"
+            should_train = event_type == "correction" or self.train_on_new_knowledge
+
+            maybe_generated_response_after_training: str | None = None
+            confidence_after_training = confidence_before_training
+
+            if should_train:
                 train_start = datetime.now()
                 _ = self._train_on_correction(
                     claim.question,
@@ -650,38 +816,36 @@ class AutonomousNode:
                 result.updates_made += 1
                 self.state.total_updates += 1
 
-                # Record the learning event (legacy state.json format)
-                event = LearningEvent(
-                    timestamp=timestamp,
-                    question=claim.question,
-                    before_training_answer=maybe_generated_response_before_training,
-                    after_training_answer=maybe_generated_response_after_training,
-                    source=claim.source,
-                    source_url=claim.url,
-                    event_type=event_type,
-                    verified_answer=claim.answer,
-                    confidence_before_training=confidence_before_training,
-                    confidence_after_training=confidence_after_training,
-                )
-                if (
-                    maybe_generated_response_before_training
-                    or maybe_generated_response_after_training
-                ):
-                    vizible.blue(f"  Q: {event.question}")
-                    vizible.cyan(
-                        f"  Old: {maybe_generated_response_before_training}..."
-                    )
-                    vizible.green(
-                        f"  New: {maybe_generated_response_after_training}..."
-                    )
-                self.state.learning_history.append(event)
-                result.events.append(event)
+            # Record the learning event (state.json)
+            event = LearningEvent(
+                timestamp=timestamp,
+                question=claim.question,
+                before_training_answer=maybe_generated_response_before_training,
+                after_training_answer=maybe_generated_response_after_training,
+                source=claim.source,
+                source_url=claim.url,
+                event_type=event_type,
+                verified_answer=claim.answer,
+                confidence_before_training=confidence_before_training,
+                confidence_after_training=confidence_after_training,
+                trained=should_train,
+            )
+            vizible.blue(f"  [{event_type.upper()}{'' if should_train else ', not trained'}] Q: {event.question}")
+            vizible.cyan(f"  Old: {maybe_generated_response_before_training}")
+            if should_train:
+                vizible.green(f"  New: {maybe_generated_response_after_training}")
+            self._log(
+                f"{event_type.upper()} trained={should_train} q={claim.question!r} "
+                f"verified={claim.answer!r} before={maybe_generated_response_before_training!r} "
+                f"after={maybe_generated_response_after_training!r} ({claim.url})"
+            )
+            self.state.learning_history.append(event)
+            result.events.append(event)
 
         # Track explored topic
         if topic not in self.state.topics_explored:
             self.state.topics_explored.append(topic)
 
-        # Save state (legacy format)
         self.state.save(self.state_path)
 
         return result
@@ -722,11 +886,13 @@ class AutonomousNode:
                     vizible.red(f"Error: {result.error}")
 
                 for event in result.events:
-                    vizible.blue(f"\n  [{event.event_type.upper()}]")
+                    tag = event.event_type.upper() + ("" if event.trained else ", NOT TRAINED")
+                    vizible.blue(f"\n  [{tag}]")
                     vizible.blue(f"  Q: {event.question}")
                     if event.before_training_answer:
-                        vizible.cyan(f"  Old: {event.before_training_answer}...")
-                    vizible.green(f"  New: {event.after_training_answer}...")
+                        vizible.cyan(f"  Old: {event.before_training_answer}")
+                    if event.trained:
+                        vizible.green(f"  New: {event.after_training_answer}")
 
         # Mark experiment as completed
         if self._current_experiment_id is not None:

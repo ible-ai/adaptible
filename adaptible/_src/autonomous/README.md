@@ -62,10 +62,10 @@ def search_web(query: str) -> list[dict]:
     ]
 
 # Create the node
-node = AutonomousNode(search_fn=search_web)
+node = AutonomousNode(search_fn=search_web, seed_topics=["recent SpaceX launches"])
 
-# Run exploration cycles
-results = node.run(cycles=10, delay_seconds=2.0)
+# Run exploration cycles (one per topic; None lets the node pick a topic)
+results = node.run(topics=["recent SpaceX launches", None, None])
 
 # Check what was learned
 print(node.stats())
@@ -81,8 +81,8 @@ print(f"Claims found: {result.claims_found}")
 print(f"Updates made: {result.updates_made}")
 
 for event in result.events:
-    print(f"Learned: {event.question}")
-    print(f"  Answer: {event.new_answer}")
+    print(f"[{event.event_type}] trained={event.trained} {event.question}")
+    print(f"  Verified: {event.verified_answer}")
 ```
 
 ### Quizzing the Model
@@ -98,7 +98,7 @@ questions = [
 pre_answers = node.quiz(questions)
 
 # Run learning cycles
-node.run(cycles=20)
+node.run(topics=[None] * 20)
 
 # After learning
 post_answers = node.quiz(questions)
@@ -138,31 +138,87 @@ node = AutonomousNode(
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `search_fn` | (required) | Function returning search results |
+| `seed_topics` | (required) | Topics to pick from when none is given |
 | `model` | None | StatefulLLM instance (lazy-loaded if None) |
-| `state_path` | `autonomous_node_state.json` | Where to persist state |
+| `model_path` | `<outputs>/autonomous/checkpoint` | Checkpoint to load/save |
+| `state_path` | `<outputs>/autonomous/state.json` | Where to persist state |
+| `log_dir` | `<outputs>/autonomous/logs/` | Per-day text logs (`YYYYMMDD.txt`) |
+| `db_path` | `<outputs>/adaptible.db` | Experiment database |
 | `training_iterations` | 25 | Iterations per correction |
+| `train_on_new_knowledge` | False | Also train on knowledge gaps (see below) |
+
+`<outputs>` is `$ADAPTIBLE_OUTPUTS_DIR` if set, else `<cwd>/outputs` (see
+`adaptible/_src/_paths.py`). The CLI exposes these as `--output_path`,
+`--model_path`, `--node_log_dir` and `--train_on_new_knowledge`.
+
+## What gets trained on
+
+Earlier runs trained on whatever the extractor produced, which put page
+boilerplate into the weights ("NBCNews.com provides the latest top news
+stories.", "What is the main focus of the content?"). Two filters now sit
+between extraction and training.
+
+### Claim plausibility filter
+
+`_claim_is_plausible(claim, snippet)` is a pure, model-free check applied to
+every extracted claim. A claim is dropped (and logged as `DROPPED`) if:
+
+- the model's extraction did not contain both a `Q:` and an `A:` line;
+- the question is shorter than 15 characters or does not end in `?`;
+- the question or answer mentions a site name (`nbcnews.com`, `apnews.org`, ...)
+  or page boilerplate ("the content", "this page", "top stories",
+  "latest news", "main focus", ...);
+- the answer is not grounded in the snippet: at least one content token
+  (4+ characters, not a stopword) from the answer must appear in the snippet.
+
+### Training policy
+
+For each surviving claim the node asks the model what it believes and runs the
+fact-checker prompt. The outcome is one of:
+
+| Model's prior belief | Fact-checker | Event | Trained by default |
+|---|---|---|---|
+| Answer with MEDIUM/HIGH confidence, consistent | no correction | (none, logged `CONSISTENT`) | no |
+| Answer with MEDIUM/HIGH confidence, contradicted | needs correction | `correction` | **yes** |
+| Empty answer or LOW confidence (knowledge gap) | (skipped) | `new` | no |
+
+By default only **corrections** change the weights: the model held a belief and
+a source contradicted it. Knowledge-gap `new` events are still recorded in
+`state.json` (with `trained: false`) and the database so they can be reviewed,
+but they do not train unless `train_on_new_knowledge=True` /
+`--train_on_new_knowledge` is passed.
 
 ## State Persistence
 
-The node saves its state to JSON after each exploration cycle:
+The node saves its state to `state_path` after each exploration cycle:
 
-- Learning history (last 1000 events)
+- Learning history (last 1000 events, including untrained `new` events)
 - Topics explored (last 100)
 - Total updates and searches
 - Start timestamp
 
+Files written before the `before_training_answer` / `after_training_answer`
+field names (which used `old_answer` / `new_answer`) still load.
+
 This allows resuming across restarts:
 
 ```python
-# First run
-node = AutonomousNode(search_fn=search_web, state_path="my_node.json")
-node.run(cycles=100)
+# First run (state at <outputs>/autonomous/state.json)
+node = AutonomousNode(search_fn=search_web, seed_topics=topics)
+node.run(topics=[None] * 100)
 
 # Later - continues from saved state
-node = AutonomousNode(search_fn=search_web, state_path="my_node.json")
+node = AutonomousNode(search_fn=search_web, seed_topics=topics)
 print(node.stats())  # Shows accumulated stats
-node.run(cycles=100)  # Continues learning
+node.run(topics=[None] * 100)  # Continues learning
 ```
+
+## Logs
+
+Each run appends to `<outputs>/autonomous/logs/YYYYMMDD.txt`: one line per
+topic (result and claim counts), per dropped claim, and per learning event
+(type, whether it trained, verified answer, before/after answers, URL). Logs and
+the checkpoint are git-ignored; `state.json` is tracked as a published result.
 
 ## Search Function Requirements
 
@@ -195,15 +251,23 @@ The node handles several failure modes gracefully:
 
 1. **Search failures** - Logged in result.error, cycle continues
 2. **No claims extracted** - Normal for some topics, cycle continues
-3. **Model uncertainty** - Low confidence triggers "new knowledge" events
-4. **Conflicting sources** - Each claim trained independently
+3. **Model uncertainty** - Low confidence records a "new" event (trained only with `train_on_new_knowledge`)
+4. **Junk extractions** - Dropped by `_claim_is_plausible` before the model is consulted
+5. **Conflicting sources** - Each claim trained independently
 
 ## Files
 
 ```
 autonomous/
 ├── __init__.py     # Public exports
-├── __main__.py     # CLI entrypoint
+├── __main__.py     # CLI entrypoint (absl flags)
 ├── node.py         # AutonomousNode implementation
 └── README.md       # This file
+
+outputs/autonomous/          # runtime state (or $ADAPTIBLE_OUTPUTS_DIR/autonomous/)
+├── state.json               # NodeState, tracked in git
+├── logs/YYYYMMDD.txt        # git-ignored
+└── checkpoint/              # git-ignored
 ```
+
+Tests: `adaptible/tests/autonomous_test.py` (model-free).
