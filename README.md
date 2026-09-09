@@ -14,7 +14,7 @@ Plainly, where the project stands:
 
 - **The serving loop and the training code work.** `python -m adaptible.local` serves a 1.5B MLX model, records interactions, and `/trigger_review` runs the critique-rewrite-LoRA cycle in the background (fixed in 1.0.0a3; before that the coroutine was never awaited and no training happened).
 - **Every number this repo has ever published is ground-truth supervised fine-tuning, not self-correction.** The eval harness and the meta-learning experiment train on `[[0]] {correct_answer} [[/0]]`, the dataset label, and measure how much of it the model absorbs. That is ordinary LoRA SFT on a known answer.
-- **Self-correction is implemented but unmeasured.** `StatefulLLM.self_correct_and_train` (used by the server) and the `--training_source self_generated` path (added in 1.0.0a3) have never been run through an evaluation.
+- **Self-correction has now been measured once, and it almost never fires.** In the first `--training_source self_generated` run (2026-09-09) the model produced a usable revision for 1 of 84 items; the other 83 were rejected because it ignored the `[[0]] … [[/0]]` format. See [What has been measured](#what-has-been-measured).
 - **The meta-learning result is inconclusive.** Three seeds, 80 training items, and no control arm cannot separate seed effects from run-to-run noise. See [What has been measured](#what-has-been-measured) and `outputs/meta/analysis_report.md`.
 - **The autonomous node's only run trained on 12 web-scraped claims, several of them boilerplate, and its belief-conflict path never fired.** Filters and a stricter default training policy were added since; see `adaptible/_src/autonomous/README.md`.
 
@@ -114,14 +114,14 @@ Details and a streaming client are in `adaptible/_src/local/README.md`.
 4. The model is fine-tuned on the rewrite using LoRA
 5. The loss mask is zero over the prompt and one over the rewrite, so only the rewrite is learned
 
-This is the path the server uses. It is the path no evaluation has measured yet.
+This is the path the server uses. Measured once (2026-09-09): the model produced a valid rewrite for 1 of 84 items, so in practice the loop rarely reaches step 4. See [What has been measured](#what-has-been-measured).
 
 ## Evaluation
 
 `adaptible.eval` runs baseline inference on a trivia set, trains on a fraction of it, and re-infers everything. Since 1.0.0a3 it has a `--training_source` flag:
 
 - `ground_truth` (default): train on the dataset label. Measures how well the model absorbs a supplied correction. **All published numbers use this.**
-- `self_generated`: train on the model's own revision of its baseline answer. Measures self-correction. **Never run yet.**
+- `self_generated`: train on the model's own revision of its baseline answer. Measures self-correction. **Run once (2026-09-09): 1 of 84 revisions valid.** See [What has been measured](#what-has-been-measured).
 
 ```bash
 python -m adaptible.eval --subset 20 --shuffle --no_browser --output /tmp/eval.html
@@ -165,11 +165,28 @@ What those numbers mean:
 
 The full analysis with a revision note is `outputs/meta/analysis_report.md`.
 
+**Self-generated run** (2026-09-09, `outputs/runs/eval_self_generated.html`, 70 minutes; `--training_source self_generated --shuffle`, 84 train / 21 holdout). The first measurement of the loop as the server runs it:
+
+| | |
+| --- | --- |
+| Revisions the model produced in the required `[[0]] … [[/0]]` format | **1 of 84** |
+| Rejected: no `[[X]]` marker at all (the model just re-answered the question) | 80 |
+| Rejected: opened `[[0]]` but never closed it | 3 |
+| Items trained | 1 |
+| Accuracy on all 105 items, before → after | 60.0% → 58.1% (9 wrong→right, 11 right→wrong) |
+| Mean response length, before → after | 722 → 16 tokens |
+
+What those numbers mean:
+
+- The self-correction loop almost never trains. The 1.5B model follows the revision format about 1% of the time, so `/trigger_review` is a no-op in 99% of cycles. The revision prompt, not the training code, is the bottleneck.
+- The one training that did happen (25 iterations on the 10-word rewrite "The value of π (pi) to two decimal places is 3.14.") changed *every* subsequent answer: the model stopped producing its long chain-of-thought preamble and answered in one line across all 105 questions. A single LoRA update at these hyperparameters reshapes global output style, which is the mechanism behind the "forgetting" seen in the December runs.
+- Net accuracy was flat (−2 items). The 20 flips are the effect of that style change, not of learning the one fact.
+
 **Autonomous node** (2025-12-08, `outputs/autonomous/state.json`): 12 training events, all with an empty prior belief; several claims were page boilerplate. No learning was measured. Details in `adaptible/_src/autonomous/README.md`.
 
 ## What would settle it
 
-1. Measure self-correction instead of SFT:
+1. Measure self-correction instead of SFT — **done once**, see above; the next step is a revision prompt the model can actually follow (few-shot, or no markers), then re-run:
 
    ```bash
    python -m adaptible.eval --training_source self_generated --shuffle --no_browser --output outputs/eval_self.html
@@ -188,7 +205,7 @@ The full analysis with a revision note is `outputs/meta/analysis_report.md`.
    python scripts/run_meta_experiment.py --seeds 42,123,456 --holdout_every_checkpoint
    ```
 
-Until (1) has been run there is no evidence about self-correction in this repository, and until (2) has been run there is no evidence that seeds differ.
+(1) has been run once: the loop trains on ~1% of items with the current prompt. Until (2) has been run there is no evidence that seeds differ.
 
 ## Experiment Database
 

@@ -35,7 +35,7 @@ python -m unittest adaptible.tests.llm_test adaptible.tests.integration_test -v
 # Run things
 python -m adaptible.local                                  # FastAPI server + web UI at /static/
 python -m adaptible.eval --subset 20 --shuffle --no_browser # offline eval, HTML report
-python -m adaptible.eval --training_source self_generated   # measure self-correction (never run yet)
+python -m adaptible.eval --training_source self_generated   # measure self-correction (run once: 1/84 valid revisions)
 python -m adaptible.autonomous --cycles 3 --no_browser      # online learning against live web search
 python scripts/run_meta_experiment.py --seeds 42,123 --subset 10
 python scripts/run_meta_experiment.py --seeds 42 --repeats 3 --holdout_every_checkpoint

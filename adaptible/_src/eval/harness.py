@@ -717,9 +717,10 @@ class EvaluationHarness:
             print(f"Training source: {config.training_source}")
             print(f"Total time: {result.total_time_seconds:.1f}s")
             print(f"Baseline accuracy: {result.baseline_accuracy:.1%}")
-            print(f"Train post-accuracy: {result.train_post_accuracy:.1%}")
-            print(f"Train improvement rate: {result.train_improvement_rate:.1%}")
-            print(f"Train retention rate: {result.train_retention_rate:.1%}")
+            n_train = len(result.train_items)
+            print(f"Train post-accuracy: {result.train_post_accuracy:.1%} (n={n_train})")
+            print(f"Train improvement rate: {result.train_improvement_rate:.1%} (n={n_train})")
+            print(f"Train retention rate: {result.train_retention_rate:.1%} (n={n_train})")
             print(f"Holdout accuracy: {result.holdout_accuracy:.1%}")
             if config.training_source == "self_generated":
                 print(f"Invalid revisions (skipped): {result.revision_invalid_count}")
