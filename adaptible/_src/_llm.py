@@ -132,7 +132,10 @@ def _loss_fn(
     targets: mlx.core.array,
     mask: mlx.core.array,
 ) -> mlx.core.array:
-    logits: mlx.core.array = model(inputs, mlx.core.ones_like(inputs))
+    # The second positional argument of mlx_lm models is the KV cache, not an
+    # attention mask; passing an array there crashes on current mlx_lm. With no
+    # cache the model builds its own causal mask.
+    logits: mlx.core.array = model(inputs)
     # Use reduction="none" to get per-token losses, then apply mask correctly.
     # Using reduction="mean" would return a scalar that broadcasts incorrectly
     # when multiplied by mask (every masked position gets the same mean value).
