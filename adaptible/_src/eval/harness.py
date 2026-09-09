@@ -3,13 +3,13 @@
 import dataclasses
 import json
 import random
-import re
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .._classes import InteractionHistory
+from .._classes import InteractionHistory, TrainingExample
 from .._llm import StatefulLLM
 from ..db import (
     Database,
@@ -21,13 +21,43 @@ from ..db import (
     SourceType,
     TrainingEvent,
 )
-from ..revise import make_collated_training_example, strip_think_tags
-from .dataset import TriviaDataset
+from ..revise import (
+    InvalidRevisionError,
+    make_collated_training_example,
+    make_revision_prompt,
+    strip_think_tags,
+    validate_revision_response,
+)
+from .dataset import TriviaDataset, TriviaItem
+
+# What the training target is built from.
+#   ground_truth:   the dataset label, wrapped as "[[0]] <answer> [[/0]]". This is
+#                   supervised fine-tuning on the label; it measures whether the
+#                   model can absorb a correction, not whether it can produce one.
+#   self_generated: the model's own revision of its baseline answer, obtained via
+#                   the same make_revision_prompt -> validate -> train pipeline the
+#                   server uses. This is the self-correction loop the README describes.
+TRAINING_SOURCES = ("ground_truth", "self_generated")
+
+
+def validate_training_source(training_source: str) -> None:
+    """Raise ValueError unless ``training_source`` is a known value."""
+    if training_source not in TRAINING_SOURCES:
+        raise ValueError(
+            f"training_source must be one of {TRAINING_SOURCES}, "
+            f"got {training_source!r}"
+        )
 
 
 @dataclasses.dataclass
 class EvaluationConfig:
-    """Configuration for an evaluation run."""
+    """Configuration for an evaluation run.
+
+    Attributes:
+        training_source: Where the training target comes from; see
+            ``TRAINING_SOURCES``. Every result derived from a run must carry this
+            value so "ground_truth" numbers are never mistaken for self-correction.
+    """
 
     name: str = "default"
     training_iterations: int = 25  # Total iterations per example (epochs * calls)
@@ -36,11 +66,22 @@ class EvaluationConfig:
     seed: int = 42
     train_ratio: float = 0.8  # Fraction to use for training
     max_tokens: int | None = None  # Use model default if None
+    training_source: str = "ground_truth"
+
+    def __post_init__(self) -> None:
+        validate_training_source(self.training_source)
 
 
 @dataclasses.dataclass
 class ItemResult:
-    """Result for a single trivia item."""
+    """Result for a single trivia item.
+
+    Attributes:
+        revision_text: The model's own revision output when the training source is
+            ``self_generated`` (raw, including markers); None otherwise.
+        revision_invalid: True if the item was scheduled for training but the
+            self-generated revision failed validation, so no training happened.
+    """
 
     item_id: str
     question: str
@@ -54,6 +95,8 @@ class ItemResult:
     post_has_key_terms: bool | None = None
     was_trained: bool = False
     training_time_seconds: float = 0.0
+    revision_text: str | None = None
+    revision_invalid: bool = False
 
 
 @dataclasses.dataclass
@@ -73,7 +116,21 @@ class EvaluationResult:
 
     @property
     def holdout_items(self) -> list[ItemResult]:
-        return [item for item in self.items if not item.was_trained]
+        """Items never scheduled for training (invalid-revision items excluded)."""
+        return [
+            item
+            for item in self.items
+            if not item.was_trained and not item.revision_invalid
+        ]
+
+    @property
+    def revision_invalid_items(self) -> list[ItemResult]:
+        """Items scheduled for training whose self-generated revision was rejected."""
+        return [item for item in self.items if item.revision_invalid]
+
+    @property
+    def revision_invalid_count(self) -> int:
+        return len(self.revision_invalid_items)
 
     @property
     def baseline_accuracy(self) -> float:
@@ -136,9 +193,7 @@ class EvaluationResult:
     def holdout_accuracy(self) -> float:
         """Fraction of holdout items with key terms (post-training baseline check)."""
         holdout = [
-            item
-            for item in self.items
-            if not item.was_trained and item.post_has_key_terms is not None
+            item for item in self.holdout_items if item.post_has_key_terms is not None
         ]
         if not holdout:
             return 0.0
@@ -153,6 +208,7 @@ class EvaluationResult:
                 "shuffle": self.config.shuffle,
                 "seed": self.config.seed,
                 "train_ratio": self.config.train_ratio,
+                "training_source": self.config.training_source,
             },
             "dataset_name": self.dataset_name,
             "timestamp": self.timestamp,
@@ -165,6 +221,7 @@ class EvaluationResult:
                 "holdout_accuracy": self.holdout_accuracy,
                 "train_count": len(self.train_items),
                 "holdout_count": len(self.holdout_items),
+                "revision_invalid_count": self.revision_invalid_count,
             },
             "items": [
                 {
@@ -180,16 +237,249 @@ class EvaluationResult:
                     "post_has_key_terms": item.post_has_key_terms,
                     "was_trained": item.was_trained,
                     "training_time_seconds": item.training_time_seconds,
+                    "revision_text": item.revision_text,
+                    "revision_invalid": item.revision_invalid,
                 }
                 for item in self.items
             ],
         }
 
 
+def _normalize_for_match(text: str) -> str:
+    """NFKC-normalize and casefold text so judge comparisons ignore presentation.
+
+    NFKC folds compatibility characters (subscripts like the "₂" in "H₂O",
+    full-width forms, ligatures) onto their base characters; casefold is a
+    stronger, locale-independent lower().
+    """
+    return unicodedata.normalize("NFKC", text).casefold()
+
+
 def contains_key_terms(response: str, key_terms: list[str]) -> bool:
-    """Check if response contains any of the key terms."""
-    response_lower = response.lower()
-    return any(term.lower() in response_lower for term in key_terms)
+    """Check if response contains any of the key terms.
+
+    Both sides are NFKC-normalized and casefolded, so "H₂O" matches "H2O" and
+    "straße" matches "STRASSE". Pure function; no I/O.
+    """
+    response_norm = _normalize_for_match(response or "")
+    return any(_normalize_for_match(term) in response_norm for term in key_terms)
+
+
+# --------------------------------------------------------------------------
+# Shared phase helpers (used by EvaluationHarness and MetaLearningExperiment)
+# --------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class InferenceRecord:
+    """One model response to an item, already judged and persisted."""
+
+    raw: str
+    clean: str
+    correct: bool
+    token_count: int
+    truncated: bool
+
+
+def _infer_and_record(
+    model: Any,
+    db: Database,
+    item: TriviaItem,
+    example_id: int,
+    experiment_id: int,
+    phase: Phase,
+    max_tokens: int | None,
+    effective_max_tokens: int,
+) -> InferenceRecord:
+    """Generate a response for ``item``, judge it, and persist it.
+
+    Args:
+        model: Anything with ``generate_response`` and ``_tokenizer``.
+        db: Database the response row is written to.
+        item: The trivia item to answer.
+        example_id: DB id of the example row for ``item``.
+        experiment_id: DB id of the running experiment.
+        phase: Which phase the response belongs to (BASELINE / POST_TRAINING).
+        max_tokens: Explicit cap passed to the model (None = model default).
+        effective_max_tokens: The cap actually in force, used for truncation.
+
+    Returns:
+        The judged response.
+    """
+    raw = model.generate_response(
+        item.question, use_history=False, max_tokens=max_tokens
+    )
+    raw = raw or ""
+    clean = strip_think_tags(raw)
+    correct = contains_key_terms(clean, item.key_terms)
+    token_count = len(model._tokenizer.encode(raw))
+    truncated = token_count >= effective_max_tokens - 1
+
+    db.insert_response(
+        Response(
+            id=None,
+            example_id=example_id,
+            experiment_id=experiment_id,
+            response_text=clean,
+            response_raw=raw,
+            confidence=None,
+            phase=phase,
+            created_at=None,
+            token_count=token_count,
+            max_tokens=effective_max_tokens,
+            truncated=truncated,
+        )
+    )
+    return InferenceRecord(
+        raw=raw,
+        clean=clean,
+        correct=correct,
+        token_count=token_count,
+        truncated=truncated,
+    )
+
+
+def _judge_only(
+    model: Any, item: TriviaItem, max_tokens: int | None
+) -> tuple[str, bool]:
+    """Generate and judge a response without persisting it (checkpoint probes)."""
+    raw = model.generate_response(
+        item.question, use_history=False, max_tokens=max_tokens
+    )
+    clean = strip_think_tags(raw or "")
+    return clean, contains_key_terms(clean, item.key_terms)
+
+
+def _build_training_example(
+    model: Any,
+    item: TriviaItem,
+    baseline_response: str,
+    training_source: str,
+) -> tuple[TrainingExample, str | None]:
+    """Build the collated training example for one item.
+
+    Args:
+        model: Anything with ``generate_response`` and ``_tokenizer``.
+        item: The trivia item being trained on.
+        baseline_response: The model's baseline answer to ``item.question``.
+        training_source: "ground_truth" or "self_generated".
+
+    Returns:
+        ``(example, revision_text)``. ``revision_text`` is the model's raw
+        revision output for "self_generated" and None for "ground_truth".
+
+    Raises:
+        InvalidRevisionError: If a self-generated revision fails validation.
+            Callers must catch this and skip the training step.
+    """
+    validate_training_source(training_source)
+    interactions = [
+        InteractionHistory(
+            idx=0,
+            user_input=item.question,
+            llm_response=baseline_response,
+            reviewed=False,
+            timestamp=0.0,
+        ),
+    ]
+    tokenizer = model._tokenizer
+    if training_source == "ground_truth":
+        revision = f"[[0]] {item.correct_answer} [[/0]]"
+        revision_text: str | None = None
+    else:
+        prompt = make_revision_prompt(interactions, tokenizer)
+        revision = model.generate_response(prompt, use_history=False) or ""
+        validate_revision_response(revision, num_interactions=len(interactions))
+        revision_text = revision
+    example = make_collated_training_example(revision, interactions, tokenizer)
+    return example, revision_text
+
+
+def _record_training_event(
+    db: Database,
+    example_id: int,
+    experiment_id: int,
+    training_iterations: int,
+    training_time_seconds: float,
+) -> int:
+    """Persist a training event row and return its id."""
+    return db.insert_training_event(
+        TrainingEvent(
+            id=None,
+            example_id=example_id,
+            experiment_id=experiment_id,
+            training_iterations=training_iterations,
+            training_time_seconds=training_time_seconds,
+            created_at=None,
+        )
+    )
+
+
+@dataclasses.dataclass
+class TrainingOutcome:
+    """What happened when one item was scheduled for training."""
+
+    trained: bool
+    revision_text: str | None = None
+    revision_invalid: bool = False
+    revision_error: str | None = None
+    training_time_seconds: float = 0.0
+
+
+def _train_one_item(
+    model: Any,
+    db: Database,
+    item: TriviaItem,
+    baseline_response: str,
+    example_id: int,
+    experiment_id: int,
+    training_iterations: int,
+    training_source: str,
+) -> TrainingOutcome:
+    """Build the target, train, and record the event for one item.
+
+    On ``InvalidRevisionError`` the item is not trained and the outcome carries
+    ``revision_invalid=True`` plus the error text.
+    """
+    try:
+        example, revision_text = _build_training_example(
+            model, item, baseline_response, training_source
+        )
+    except InvalidRevisionError as e:
+        return TrainingOutcome(
+            trained=False, revision_invalid=True, revision_error=str(e)
+        )
+
+    train_start = time.time()
+    model.train_on_example(example, iterations=training_iterations)
+    elapsed = time.time() - train_start
+    _record_training_event(db, example_id, experiment_id, training_iterations, elapsed)
+    return TrainingOutcome(
+        trained=True, revision_text=revision_text, training_time_seconds=elapsed
+    )
+
+
+def _insert_dataset_examples(db: Database, dataset: TriviaDataset) -> dict[str, int]:
+    """Insert every item as an Example row; return item_id -> example_id."""
+    example_ids: dict[str, int] = {}
+    for item in dataset:
+        example_ids[item.id] = db.insert_example(
+            Example(
+                id=None,
+                canonical_id=item.id,  # Use the trivia item ID as canonical
+                question=item.question,
+                ground_truth_answer=item.correct_answer,
+                key_terms=item.key_terms if item.key_terms else None,
+                category=item.category,
+                difficulty=item.difficulty,
+                source_type=SourceType.STATIC_TRIVIA,
+                source_url=None,
+                source_title=None,
+                valid_at=None,  # Static trivia is timeless
+                created_at=None,
+            )
+        )
+    return example_ids
 
 
 class EvaluationHarness:
@@ -268,6 +558,7 @@ class EvaluationHarness:
                     "seed": config.seed,
                     "train_ratio": config.train_ratio,
                     "max_tokens": config.max_tokens,
+                    "training_source": config.training_source,
                     "dataset_name": dataset.name,
                     "dataset_version": dataset.version,
                 }
@@ -292,27 +583,11 @@ class EvaluationHarness:
             print(f"Dataset: {dataset.name} ({len(dataset)} items)")
             print(f"Train: {train_count}, Holdout: {len(dataset) - train_count}")
             print(f"Config: {config.name}")
+            print(f"Training source: {config.training_source}")
             print(f"Experiment ID: {experiment_id}")
             print()
 
-        # Insert all examples into database and map item_id -> example_id
-        example_ids: dict[str, int] = {}
-        for item in dataset:
-            db_example = Example(
-                id=None,
-                canonical_id=item.id,  # Use the trivia item ID as canonical
-                question=item.question,
-                ground_truth_answer=item.correct_answer,
-                key_terms=item.key_terms if item.key_terms else None,
-                category=item.category,
-                difficulty=item.difficulty,
-                source_type=SourceType.STATIC_TRIVIA,
-                source_url=None,
-                source_title=None,
-                valid_at=None,  # Static trivia is timeless
-                created_at=None,
-            )
-            example_ids[item.id] = self._db.insert_example(db_example)
+        example_ids = _insert_dataset_examples(self._db, dataset)
 
         # Phase 1: Baseline inference
         if verbose:
@@ -329,53 +604,36 @@ class EvaluationHarness:
             if verbose:
                 print(f"  [{i+1}/{len(dataset)}] {item.id}: {item.question[:40]}...")
 
-            initial_raw = self.model.generate_response(
-                item.question, use_history=False, max_tokens=config.max_tokens
+            rec = _infer_and_record(
+                self.model,
+                self._db,
+                item,
+                example_ids[item.id],
+                experiment_id,
+                Phase.BASELINE,
+                config.max_tokens,
+                effective_max_tokens,
             )
-            initial_clean = strip_think_tags(initial_raw)
-            initial_has_terms = contains_key_terms(initial_clean, item.key_terms)
-
-            # Estimate token count and truncation
-            initial_token_count = len(self.model._tokenizer.encode(initial_raw or ""))
-            initial_truncated = initial_token_count >= effective_max_tokens - 1
-
-            item_result = ItemResult(
+            item_results[item.id] = ItemResult(
                 item_id=item.id,
                 question=item.question,
                 correct_answer=item.correct_answer,
                 key_terms=item.key_terms,
-                initial_response=initial_clean,
-                initial_response_raw=initial_raw or "",
-                initial_has_key_terms=initial_has_terms,
+                initial_response=rec.clean,
+                initial_response_raw=rec.raw,
+                initial_has_key_terms=rec.correct,
                 was_trained=(idx in train_indices),
             )
-            item_results[item.id] = item_result
-
-            # Record baseline response in database
-            baseline_response = Response(
-                id=None,
-                example_id=example_ids[item.id],
-                experiment_id=experiment_id,
-                response_text=initial_clean,
-                response_raw=initial_raw or "",
-                confidence=None,
-                phase=Phase.BASELINE,
-                created_at=None,
-                token_count=initial_token_count,
-                max_tokens=effective_max_tokens,
-                truncated=initial_truncated,
-            )
-            self._db.insert_response(baseline_response)
 
             if verbose:
-                status = "✓" if initial_has_terms else "✗"
-                print(f"       {status} Key terms: {initial_has_terms}")
+                status = "✓" if rec.correct else "✗"
+                print(f"       {status} Key terms: {rec.correct}")
 
         # Phase 2: Training on train set
         if verbose:
             print()
             print("=" * 60)
-            print("PHASE 2: Training")
+            print(f"PHASE 2: Training (source={config.training_source})")
             print("=" * 60)
 
         train_items = [(dataset[idx], idx) for idx in indices if idx in train_indices]
@@ -384,39 +642,30 @@ class EvaluationHarness:
             if verbose:
                 print(f"  [{i+1}/{len(train_items)}] Training on {item.id}...")
 
-            # Create training example
-            interactions = [
-                InteractionHistory(
-                    idx=0,
-                    user_input=item.question,
-                    llm_response=item_result.initial_response_raw,
-                    reviewed=False,
-                    timestamp=0.0,
-                ),
-            ]
-            valid_revision = f"[[0]] {item.correct_answer} [[/0]]"
-            example = make_collated_training_example(
-                valid_revision, interactions, self.model._tokenizer
+            outcome = _train_one_item(
+                self.model,
+                self._db,
+                item,
+                item_result.initial_response,
+                example_ids[item.id],
+                experiment_id,
+                config.training_iterations,
+                config.training_source,
             )
-
-            # Train using the shared method
-            train_start = time.time()
-            self.model.train_on_example(example, iterations=config.training_iterations)
-            item_result.training_time_seconds = time.time() - train_start
-
-            # Record training event in database
-            training_event = TrainingEvent(
-                id=None,
-                example_id=example_ids[item.id],
-                experiment_id=experiment_id,
-                training_iterations=config.training_iterations,
-                training_time_seconds=item_result.training_time_seconds,
-                created_at=None,
-            )
-            self._db.insert_training_event(training_event)
+            item_result.revision_text = outcome.revision_text
+            item_result.revision_invalid = outcome.revision_invalid
+            item_result.training_time_seconds = outcome.training_time_seconds
+            # An item whose revision was rejected was never trained on; keep it
+            # out of the train metrics but flag it so it is counted.
+            item_result.was_trained = outcome.trained
 
             if verbose:
-                print(f"       Trained ({item_result.training_time_seconds:.1f}s)")
+                if outcome.revision_invalid:
+                    print(
+                        f"       Skipped: invalid revision ({outcome.revision_error})"
+                    )
+                else:
+                    print(f"       Trained ({outcome.training_time_seconds:.1f}s)")
 
         # Phase 3: Post-training inference
         if verbose:
@@ -431,39 +680,23 @@ class EvaluationHarness:
             if verbose:
                 print(f"  [{i+1}/{len(dataset)}] {item.id}: {item.question[:40]}...")
 
-            post_raw = self.model.generate_response(
-                item.question, use_history=False, max_tokens=config.max_tokens
+            rec = _infer_and_record(
+                self.model,
+                self._db,
+                item,
+                example_ids[item.id],
+                experiment_id,
+                Phase.POST_TRAINING,
+                config.max_tokens,
+                effective_max_tokens,
             )
-            post_clean = strip_think_tags(post_raw)
-            post_has_terms = contains_key_terms(post_clean, item.key_terms)
-
-            # Estimate token count and truncation
-            post_token_count = len(self.model._tokenizer.encode(post_raw or ""))
-            post_truncated = post_token_count >= effective_max_tokens - 1
-
-            item_result.post_response = post_clean
-            item_result.post_response_raw = post_raw or ""
-            item_result.post_has_key_terms = post_has_terms
-
-            # Record post-training response in database
-            post_response = Response(
-                id=None,
-                example_id=example_ids[item.id],
-                experiment_id=experiment_id,
-                response_text=post_clean,
-                response_raw=post_raw or "",
-                confidence=None,
-                phase=Phase.POST_TRAINING,
-                created_at=None,
-                token_count=post_token_count,
-                max_tokens=effective_max_tokens,
-                truncated=post_truncated,
-            )
-            self._db.insert_response(post_response)
+            item_result.post_response = rec.clean
+            item_result.post_response_raw = rec.raw
+            item_result.post_has_key_terms = rec.correct
 
             if verbose:
                 was = "✓" if item_result.initial_has_key_terms else "✗"
-                now = "✓" if post_has_terms else "✗"
+                now = "✓" if rec.correct else "✗"
                 trained = "(trained)" if item_result.was_trained else "(holdout)"
                 print(f"       {was} → {now} {trained}")
 
@@ -481,12 +714,15 @@ class EvaluationHarness:
             print("=" * 60)
             print("SUMMARY")
             print("=" * 60)
+            print(f"Training source: {config.training_source}")
             print(f"Total time: {result.total_time_seconds:.1f}s")
             print(f"Baseline accuracy: {result.baseline_accuracy:.1%}")
             print(f"Train post-accuracy: {result.train_post_accuracy:.1%}")
             print(f"Train improvement rate: {result.train_improvement_rate:.1%}")
             print(f"Train retention rate: {result.train_retention_rate:.1%}")
             print(f"Holdout accuracy: {result.holdout_accuracy:.1%}")
+            if config.training_source == "self_generated":
+                print(f"Invalid revisions (skipped): {result.revision_invalid_count}")
             print()
             print(f"Results saved to database (experiment_id={experiment_id})")
 

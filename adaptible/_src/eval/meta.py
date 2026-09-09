@@ -6,36 +6,64 @@ across multiple model instances trained with different random seeds.
 The core hypothesis: self-improvement ability varies across instances, and
 some instances become stronger self-learners than others. This module
 provides the infrastructure to test this hypothesis.
+
+Two things every reader of a result must know:
+
+* ``MetaLearningConfig.training_source`` says what the model was trained on.
+  ``"ground_truth"`` is supervised fine-tuning on the dataset label;
+  ``"self_generated"`` is the model's own revision (real self-correction).
+* Checkpoint transition counts come in two flavours. The cumulative fields
+  (``improved`` etc.) cover every item trained so far; the ``window_*`` fields
+  cover only the items trained since the previous checkpoint. The
+  meta-learning score is built from the window fields.
 """
 
 import dataclasses
 import json
 import random
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from .._classes import InteractionHistory
 from .._llm import StatefulLLM
-from ..db import (
-    Database,
-    Example,
-    Experiment,
-    ExperimentType,
-    Phase,
-    Response,
-    SourceType,
-    TrainingEvent,
+from ..db import Database, Experiment, ExperimentType, Phase
+from .dataset import TriviaDataset, TriviaItem
+from .harness import (
+    _infer_and_record,
+    _insert_dataset_examples,
+    _judge_only,
+    _train_one_item,
+    validate_training_source,
 )
-from ..revise import make_collated_training_example, strip_think_tags
-from .dataset import TriviaDataset
-from .harness import contains_key_terms
+
+# Minimum improvable+forgettable items a window needs before its rates feed the
+# meta-learning score. Below this a single item swings a rate by 20+ points.
+MIN_WINDOW_ITEMS = 5
+
+
+def _rate(numerator: int, denominator: int) -> float:
+    return numerator / denominator if denominator > 0 else 0.0
+
+
+def _population_variance(values: list[float]) -> float:
+    mean = sum(values) / len(values)
+    return sum((v - mean) ** 2 for v in values) / len(values)
 
 
 @dataclasses.dataclass
 class Checkpoint:
-    """Metrics at a specific point during training."""
+    """Metrics at a specific point during training.
+
+    The ``improved``/``retained``/``regressed``/``stuck`` counts are *cumulative*:
+    they classify every item trained so far by baseline -> current correctness.
+    The ``window_*`` counts classify only the items trained since the previous
+    checkpoint, so consecutive checkpoints describe disjoint sets of items.
+
+    ``holdout_correct``/``holdout_total`` are populated only when the experiment
+    ran with ``holdout_every_checkpoint``; otherwise they stay None.
+    """
 
     step: int  # Number of training events completed
     timestamp: str
@@ -46,46 +74,86 @@ class Checkpoint:
     post_correct: int  # Items correct after training
     post_total: int
 
-    # Transition counts (for trained items only)
+    # Cumulative transition counts (all trained items so far)
     improved: int  # wrong -> right
     retained: int  # right -> right
     regressed: int  # right -> wrong
     stuck: int  # wrong -> wrong
 
-    # Per-item tracking (item IDs in each category)
+    # Per-item tracking (item IDs in each category, cumulative)
     improved_ids: list[str] = dataclasses.field(default_factory=list)
     retained_ids: list[str] = dataclasses.field(default_factory=list)
     regressed_ids: list[str] = dataclasses.field(default_factory=list)
     stuck_ids: list[str] = dataclasses.field(default_factory=list)
 
+    # Marginal transition counts (items trained since the previous checkpoint)
+    window_improved: int = 0
+    window_retained: int = 0
+    window_regressed: int = 0
+    window_stuck: int = 0
+    window_ids: list[str] = dataclasses.field(default_factory=list)
+
+    # Items in this window whose self-generated revision was rejected (untrained)
+    revision_invalid_ids: list[str] = dataclasses.field(default_factory=list)
+
+    # Optional per-checkpoint holdout probe
+    holdout_correct: int | None = None
+    holdout_total: int | None = None
+
     @property
     def baseline_accuracy(self) -> float:
-        return (
-            self.baseline_correct / self.baseline_total
-            if self.baseline_total > 0
-            else 0.0
-        )
+        return _rate(self.baseline_correct, self.baseline_total)
 
     @property
     def post_accuracy(self) -> float:
-        return self.post_correct / self.post_total if self.post_total > 0 else 0.0
+        return _rate(self.post_correct, self.post_total)
 
     @property
     def improvement_rate(self) -> float:
-        """Fraction of improvable items that improved."""
-        improvable = self.improved + self.stuck
-        return self.improved / improvable if improvable > 0 else 0.0
+        """Cumulative: fraction of improvable trained items that improved."""
+        return _rate(self.improved, self.improved + self.stuck)
 
     @property
     def forgetting_rate(self) -> float:
-        """Fraction of forgettable items that regressed."""
-        forgettable = self.retained + self.regressed
-        return self.regressed / forgettable if forgettable > 0 else 0.0
+        """Cumulative: fraction of forgettable trained items that regressed."""
+        return _rate(self.regressed, self.retained + self.regressed)
 
     @property
     def net_learning(self) -> int:
-        """Net items learned (improved - regressed)."""
+        """Net items learned (improved - regressed), cumulative."""
         return self.improved - self.regressed
+
+    @property
+    def window_size(self) -> int:
+        """Number of trained items in this checkpoint's window."""
+        return (
+            self.window_improved
+            + self.window_retained
+            + self.window_regressed
+            + self.window_stuck
+        )
+
+    @property
+    def window_improvement_rate(self) -> float:
+        """Marginal: fraction of this window's improvable items that improved."""
+        return _rate(self.window_improved, self.window_improved + self.window_stuck)
+
+    @property
+    def window_forgetting_rate(self) -> float:
+        """Marginal: fraction of this window's forgettable items that regressed."""
+        return _rate(
+            self.window_regressed, self.window_retained + self.window_regressed
+        )
+
+    @property
+    def window_net_learning(self) -> int:
+        return self.window_improved - self.window_regressed
+
+    @property
+    def holdout_accuracy(self) -> float | None:
+        if self.holdout_total is None or self.holdout_total == 0:
+            return None
+        return (self.holdout_correct or 0) / self.holdout_total
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -103,72 +171,182 @@ class Checkpoint:
             "retained_ids": self.retained_ids,
             "regressed_ids": self.regressed_ids,
             "stuck_ids": self.stuck_ids,
+            "window_improved": self.window_improved,
+            "window_retained": self.window_retained,
+            "window_regressed": self.window_regressed,
+            "window_stuck": self.window_stuck,
+            "window_ids": self.window_ids,
+            "window_size": self.window_size,
+            "revision_invalid_ids": self.revision_invalid_ids,
+            "holdout_correct": self.holdout_correct,
+            "holdout_total": self.holdout_total,
+            "holdout_accuracy": self.holdout_accuracy,
             "baseline_accuracy": self.baseline_accuracy,
             "post_accuracy": self.post_accuracy,
             "improvement_rate": self.improvement_rate,
             "forgetting_rate": self.forgetting_rate,
             "net_learning": self.net_learning,
+            "window_improvement_rate": self.window_improvement_rate,
+            "window_forgetting_rate": self.window_forgetting_rate,
+            "window_net_learning": self.window_net_learning,
         }
+
+    @classmethod
+    def from_dict(cls, cp_data: dict[str, Any]) -> "Checkpoint":
+        """Build from a dict; fields added after the first release default."""
+        return cls(
+            step=cp_data["step"],
+            timestamp=cp_data["timestamp"],
+            baseline_correct=cp_data["baseline_correct"],
+            baseline_total=cp_data["baseline_total"],
+            post_correct=cp_data["post_correct"],
+            post_total=cp_data["post_total"],
+            improved=cp_data["improved"],
+            retained=cp_data["retained"],
+            regressed=cp_data["regressed"],
+            stuck=cp_data["stuck"],
+            # Per-item IDs (may not exist in older files)
+            improved_ids=cp_data.get("improved_ids", []),
+            retained_ids=cp_data.get("retained_ids", []),
+            regressed_ids=cp_data.get("regressed_ids", []),
+            stuck_ids=cp_data.get("stuck_ids", []),
+            window_improved=cp_data.get("window_improved", 0),
+            window_retained=cp_data.get("window_retained", 0),
+            window_regressed=cp_data.get("window_regressed", 0),
+            window_stuck=cp_data.get("window_stuck", 0),
+            window_ids=cp_data.get("window_ids", []),
+            revision_invalid_ids=cp_data.get("revision_invalid_ids", []),
+            holdout_correct=cp_data.get("holdout_correct"),
+            holdout_total=cp_data.get("holdout_total"),
+        )
 
 
 @dataclasses.dataclass
 class SeedTrajectory:
-    """Complete training trajectory for one seed."""
+    """Complete training trajectory for one (seed, repeat).
+
+    Attributes:
+        seed: Shuffle seed.
+        repeat: Which repeat of this seed (0-based). Repeats share the seed's
+            shuffle, so differences between them are generation/training noise.
+        holdout_correct/holdout_total: Final holdout evaluation after training.
+        revision_invalid_count: Items skipped because the self-generated
+            revision failed validation (always 0 for ``ground_truth``).
+    """
 
     seed: int
     checkpoints: list[Checkpoint] = dataclasses.field(default_factory=list)
     total_time_seconds: float = 0.0
     experiment_id: int | None = None
+    repeat: int = 0
+    holdout_correct: int | None = None
+    holdout_total: int | None = None
+    revision_invalid_count: int = 0
+
+    @property
+    def holdout_accuracy(self) -> float | None:
+        """Final holdout accuracy, or None if no holdout was evaluated."""
+        if self.holdout_total is None or self.holdout_total == 0:
+            return None
+        return (self.holdout_correct or 0) / self.holdout_total
+
+    @property
+    def window_sizes(self) -> list[int]:
+        """Per-checkpoint count of trained items in that checkpoint's window."""
+        return [c.window_size for c in self.checkpoints]
+
+    def _score_windows(self) -> tuple[list[Checkpoint], list[Checkpoint]]:
+        third = len(self.checkpoints) // 3
+        return self.checkpoints[:third], self.checkpoints[-third:]
+
+    @property
+    def meta_learning_score_reason(self) -> str | None:
+        """Why ``meta_learning_score`` is None, or None if it is computable."""
+        if len(self.checkpoints) < 3:
+            return f"need 3+ checkpoints, have {len(self.checkpoints)}"
+        early, late = self._score_windows()
+        small = [c for c in early + late if c.window_size < MIN_WINDOW_ITEMS]
+        if small:
+            sizes = ", ".join(f"step {c.step}: n={c.window_size}" for c in small)
+            return f"window(s) below {MIN_WINDOW_ITEMS} trained items ({sizes})"
+        return None
 
     @property
     def meta_learning_score(self) -> float | None:
         """Measure how learning efficiency changes over time.
 
         A model that "learns to learn" should show:
-        1. Increasing improvement_rate over time
-        2. Decreasing forgetting_rate over time
+        1. Increasing improvement rate over time
+        2. Decreasing forgetting rate over time
+
+        The score is ``(late_improvement - early_improvement) +
+        (early_forgetting - late_forgetting)`` where the rates are the
+        *window* rates (``Checkpoint.window_improvement_rate`` etc.), averaged
+        over the first and last third of checkpoints.
+
+        Window rates are used rather than the cumulative ``improvement_rate``
+        because cumulative rates are re-evaluated over every item trained so
+        far: by the last checkpoint they are dominated by items that were
+        trained early, and the "late" set is a superset of the "early" set.
+        That nesting shrinks any real early-vs-late difference toward zero
+        and makes the score mostly a function of the first few items. Window
+        rates cover disjoint sets of items, so early and late are independent
+        samples of the model's learning behaviour at that point in training.
 
         Returns:
             Score > 0 indicates meta-learning, < 0 indicates degradation.
-            None if insufficient checkpoints to compute (need at least 3).
+            None if there are fewer than 3 checkpoints or any window used has
+            fewer than ``MIN_WINDOW_ITEMS`` trained items; see
+            ``meta_learning_score_reason``.
         """
-        if len(self.checkpoints) < 3:
+        if self.meta_learning_score_reason is not None:
             return None
+        early, late = self._score_windows()
 
-        # Split into early and late thirds
-        third = len(self.checkpoints) // 3
-        early = self.checkpoints[:third]
-        late = self.checkpoints[-third:]
+        early_improvement = sum(c.window_improvement_rate for c in early) / len(early)
+        late_improvement = sum(c.window_improvement_rate for c in late) / len(late)
 
-        early_improvement = sum(c.improvement_rate for c in early) / len(early)
-        late_improvement = sum(c.improvement_rate for c in late) / len(late)
-
-        early_forgetting = sum(c.forgetting_rate for c in early) / len(early)
-        late_forgetting = sum(c.forgetting_rate for c in late) / len(late)
+        early_forgetting = sum(c.window_forgetting_rate for c in early) / len(early)
+        late_forgetting = sum(c.window_forgetting_rate for c in late) / len(late)
 
         # Meta-learning = improvement accelerates, forgetting decelerates
         improvement_delta = late_improvement - early_improvement
-        forgetting_delta = (
-            early_forgetting - late_forgetting
-        )  # Reversed: lower is better
-
+        forgetting_delta = early_forgetting - late_forgetting  # lower is better
         return improvement_delta + forgetting_delta
 
     @property
     def has_meta_learning_score(self) -> bool:
-        """Whether we have enough checkpoints to compute meta-learning score."""
-        return len(self.checkpoints) >= 3
+        """Whether the meta-learning score is computable for this trajectory."""
+        return self.meta_learning_score_reason is None
 
     @property
-    def final_accuracy(self) -> float:
-        """Accuracy at the final checkpoint."""
+    def final_trained_accuracy(self) -> float:
+        """Accuracy on *trained items only* at the final checkpoint.
+
+        This is not a generalization number; see ``holdout_accuracy`` for that.
+        """
         if not self.checkpoints:
             return 0.0
         return self.checkpoints[-1].post_accuracy
 
     @property
+    def final_accuracy(self) -> float:
+        """Deprecated alias for ``final_trained_accuracy``."""
+        warnings.warn(
+            "SeedTrajectory.final_accuracy is trained-items-only accuracy; "
+            "use final_trained_accuracy (or holdout_accuracy).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.final_trained_accuracy
+
+    @property
     def total_net_learning(self) -> int:
-        """Total items learned across all checkpoints."""
+        """Net learning (improved - regressed) at the final checkpoint.
+
+        Because checkpoint counts are cumulative this is the net over all
+        trained items, not a sum over checkpoints.
+        """
         if not self.checkpoints:
             return 0
         return self.checkpoints[-1].net_learning
@@ -176,19 +354,51 @@ class SeedTrajectory:
     def to_dict(self) -> dict[str, Any]:
         return {
             "seed": self.seed,
+            "repeat": self.repeat,
             "experiment_id": self.experiment_id,
             "total_time_seconds": self.total_time_seconds,
             "meta_learning_score": self.meta_learning_score,
             "has_meta_learning_score": self.has_meta_learning_score,
-            "final_accuracy": self.final_accuracy,
+            "meta_learning_score_reason": self.meta_learning_score_reason,
+            "window_sizes": self.window_sizes,
+            "final_trained_accuracy": self.final_trained_accuracy,
+            "holdout_correct": self.holdout_correct,
+            "holdout_total": self.holdout_total,
+            "holdout_accuracy": self.holdout_accuracy,
+            "revision_invalid_count": self.revision_invalid_count,
             "total_net_learning": self.total_net_learning,
             "checkpoints": [c.to_dict() for c in self.checkpoints],
         }
 
+    @classmethod
+    def from_dict(cls, traj_data: dict[str, Any], seed: int) -> "SeedTrajectory":
+        trajectory = cls(
+            seed=seed,
+            repeat=traj_data.get("repeat", 0),
+            total_time_seconds=traj_data["total_time_seconds"],
+            experiment_id=traj_data.get("experiment_id"),
+            holdout_correct=traj_data.get("holdout_correct"),
+            holdout_total=traj_data.get("holdout_total"),
+            revision_invalid_count=traj_data.get("revision_invalid_count", 0),
+        )
+        for cp_data in traj_data["checkpoints"]:
+            trajectory.checkpoints.append(Checkpoint.from_dict(cp_data))
+        return trajectory
+
 
 @dataclasses.dataclass
 class MetaLearningConfig:
-    """Configuration for a meta-learning experiment."""
+    """Configuration for a meta-learning experiment.
+
+    Attributes:
+        training_source: "ground_truth" (fine-tune on the label) or
+            "self_generated" (train on the model's own revision).
+        holdout_every_checkpoint: Also probe the holdout set at every
+            checkpoint (costs a holdout-sized inference pass per checkpoint).
+        repeats: Run each seed this many times with an identical shuffle. Any
+            divergence between repeats is generation/training noise, which is
+            the control the across-seed comparison needs.
+    """
 
     name: str = "meta_experiment"
     seeds: list[int] = dataclasses.field(
@@ -198,26 +408,86 @@ class MetaLearningConfig:
     training_iterations: int = 25  # Iterations per training event
     train_ratio: float = 0.8  # Fraction used for training
     max_tokens: int | None = None  # Use model default if None
+    training_source: str = "ground_truth"
+    holdout_every_checkpoint: bool = False
+    repeats: int = 1
+
+    def __post_init__(self) -> None:
+        validate_training_source(self.training_source)
+        if self.repeats < 1:
+            raise ValueError(f"repeats must be >= 1, got {self.repeats}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "seeds": self.seeds,
+            "checkpoint_interval": self.checkpoint_interval,
+            "training_iterations": self.training_iterations,
+            "train_ratio": self.train_ratio,
+            "max_tokens": self.max_tokens,
+            "training_source": self.training_source,
+            "holdout_every_checkpoint": self.holdout_every_checkpoint,
+            "repeats": self.repeats,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MetaLearningConfig":
+        return cls(
+            name=data["name"],
+            seeds=data["seeds"],
+            checkpoint_interval=data["checkpoint_interval"],
+            training_iterations=data["training_iterations"],
+            train_ratio=data["train_ratio"],
+            max_tokens=data.get("max_tokens"),
+            training_source=data.get("training_source", "ground_truth"),
+            holdout_every_checkpoint=data.get("holdout_every_checkpoint", False),
+            repeats=data.get("repeats", 1),
+        )
 
 
 @dataclasses.dataclass
 class MetaLearningResult:
-    """Complete results from a meta-learning experiment."""
+    """Complete results from a meta-learning experiment.
+
+    ``all_trajectories`` holds every run keyed by ``(seed, repeat)``.
+    ``trajectories`` is the backward-compatible view keyed by seed that returns
+    each seed's first repeat.
+    """
 
     config: MetaLearningConfig
     dataset_name: str
     timestamp: str
-    trajectories: dict[int, SeedTrajectory] = dataclasses.field(default_factory=dict)
+    all_trajectories: dict[tuple[int, int], SeedTrajectory] = dataclasses.field(
+        default_factory=dict
+    )
     holdout_results: dict[int, float] = dataclasses.field(default_factory=dict)
+
+    @property
+    def trajectories(self) -> dict[int, SeedTrajectory]:
+        """First repeat of each seed, keyed by seed."""
+        return {
+            seed: traj
+            for (seed, repeat), traj in self.all_trajectories.items()
+            if repeat == 0
+        }
+
+    def trajectories_for_seed(self, seed: int) -> list[SeedTrajectory]:
+        """All repeats for one seed, ordered by repeat."""
+        return [
+            traj for (s, _), traj in sorted(self.all_trajectories.items()) if s == seed
+        ]
 
     def _ranking_key(self, seed: int) -> tuple[float, float, int]:
         """Return a tuple for ranking seeds.
 
-        Priority: meta_learning_score (if available), final_accuracy, net_learning.
+        Priority: meta_learning_score (if available), final trained accuracy,
+        net_learning.
         """
         traj = self.trajectories[seed]
-        meta_score = traj.meta_learning_score if traj.meta_learning_score is not None else 0.0
-        return (meta_score, traj.final_accuracy, traj.total_net_learning)
+        meta_score = (
+            traj.meta_learning_score if traj.meta_learning_score is not None else 0.0
+        )
+        return (meta_score, traj.final_trained_accuracy, traj.total_net_learning)
 
     @property
     def best_seed(self) -> int | None:
@@ -236,13 +506,13 @@ class MetaLearningResult:
     @property
     def has_meta_learning_scores(self) -> bool:
         """Whether any trajectory has enough checkpoints for meta-learning score."""
-        return any(t.has_meta_learning_score for t in self.trajectories.values())
+        return any(t.has_meta_learning_score for t in self.all_trajectories.values())
 
     @property
     def score_variance(self) -> float | None:
-        """Variance in meta-learning scores across seeds.
+        """Variance in meta-learning scores across seeds (first repeats).
 
-        Returns None if insufficient checkpoints to compute scores.
+        Returns None if fewer than two seeds have a score.
         """
         if len(self.trajectories) < 2:
             return None
@@ -253,26 +523,76 @@ class MetaLearningResult:
         ]
         if len(scores) < 2:
             return None
-        mean = sum(scores) / len(scores)
-        return sum((s - mean) ** 2 for s in scores) / len(scores)
+        return _population_variance(scores)
+
+    def _per_seed_scores(self) -> dict[int, list[float]]:
+        """Scored repeats grouped by seed (seeds with no scored repeat omitted)."""
+        by_seed: dict[int, list[float]] = {}
+        for (seed, _), traj in sorted(self.all_trajectories.items()):
+            score = traj.meta_learning_score
+            if score is not None:
+                by_seed.setdefault(seed, []).append(score)
+        return by_seed
+
+    @property
+    def within_seed_variance(self) -> float | None:
+        """Mean over seeds of the variance of the score across repeats.
+
+        This is the noise floor: repeats share a shuffle, so any spread is
+        generation/training nondeterminism. None unless at least one seed has
+        two or more scored repeats.
+        """
+        variances = [
+            _population_variance(scores)
+            for scores in self._per_seed_scores().values()
+            if len(scores) >= 2
+        ]
+        if not variances:
+            return None
+        return sum(variances) / len(variances)
+
+    @property
+    def across_seed_variance(self) -> float | None:
+        """Variance of the per-seed mean score. None unless 2+ seeds scored."""
+        means = [
+            sum(scores) / len(scores) for scores in self._per_seed_scores().values()
+        ]
+        if len(means) < 2:
+            return None
+        return _population_variance(means)
+
+    @property
+    def signal_to_noise(self) -> float | None:
+        """``across_seed_variance / within_seed_variance``.
+
+        Values near or below 1 mean seed-to-seed differences are no larger
+        than run-to-run noise. None if either variance is undefined or the
+        within-seed variance is zero.
+        """
+        across = self.across_seed_variance
+        within = self.within_seed_variance
+        if across is None or within is None or within == 0:
+            return None
+        return across / within
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "config": {
-                "name": self.config.name,
-                "seeds": self.config.seeds,
-                "checkpoint_interval": self.config.checkpoint_interval,
-                "training_iterations": self.config.training_iterations,
-                "train_ratio": self.config.train_ratio,
-            },
+            "config": self.config.to_dict(),
             "dataset_name": self.dataset_name,
             "timestamp": self.timestamp,
             "best_seed": self.best_seed,
             "worst_seed": self.worst_seed,
             "has_meta_learning_scores": self.has_meta_learning_scores,
             "score_variance": self.score_variance,
+            "within_seed_variance": self.within_seed_variance,
+            "across_seed_variance": self.across_seed_variance,
+            "signal_to_noise": self.signal_to_noise,
             "trajectories": {
                 seed: traj.to_dict() for seed, traj in self.trajectories.items()
+            },
+            "all_trajectories": {
+                f"{seed}/{repeat}": traj.to_dict()
+                for (seed, repeat), traj in sorted(self.all_trajectories.items())
             },
             "holdout_results": self.holdout_results,
         }
@@ -285,52 +605,35 @@ class MetaLearningResult:
 
     @classmethod
     def load(cls, path: Path | str) -> "MetaLearningResult":
-        """Load results from JSON file."""
+        """Load results from JSON file.
+
+        Files written before repeats/windows/holdout fields existed load with
+        those fields defaulted.
+        """
         path = Path(path)
         data = json.loads(path.read_text())
 
-        config = MetaLearningConfig(
-            name=data["config"]["name"],
-            seeds=data["config"]["seeds"],
-            checkpoint_interval=data["config"]["checkpoint_interval"],
-            training_iterations=data["config"]["training_iterations"],
-            train_ratio=data["config"]["train_ratio"],
-        )
-
         result = cls(
-            config=config,
+            config=MetaLearningConfig.from_dict(data["config"]),
             dataset_name=data["dataset_name"],
             timestamp=data["timestamp"],
-            holdout_results=data.get("holdout_results", {}),
+            holdout_results={
+                int(k): v for k, v in data.get("holdout_results", {}).items()
+            },
         )
 
-        for seed_str, traj_data in data["trajectories"].items():
-            seed = int(seed_str)
-            trajectory = SeedTrajectory(
-                seed=seed,
-                total_time_seconds=traj_data["total_time_seconds"],
-                experiment_id=traj_data.get("experiment_id"),
-            )
-            for cp_data in traj_data["checkpoints"]:
-                checkpoint = Checkpoint(
-                    step=cp_data["step"],
-                    timestamp=cp_data["timestamp"],
-                    baseline_correct=cp_data["baseline_correct"],
-                    baseline_total=cp_data["baseline_total"],
-                    post_correct=cp_data["post_correct"],
-                    post_total=cp_data["post_total"],
-                    improved=cp_data["improved"],
-                    retained=cp_data["retained"],
-                    regressed=cp_data["regressed"],
-                    stuck=cp_data["stuck"],
-                    # Per-item IDs (may not exist in older files)
-                    improved_ids=cp_data.get("improved_ids", []),
-                    retained_ids=cp_data.get("retained_ids", []),
-                    regressed_ids=cp_data.get("regressed_ids", []),
-                    stuck_ids=cp_data.get("stuck_ids", []),
+        if "all_trajectories" in data:
+            for key, traj_data in data["all_trajectories"].items():
+                seed_str, repeat_str = key.split("/")
+                trajectory = SeedTrajectory.from_dict(traj_data, int(seed_str))
+                trajectory.repeat = int(repeat_str)
+                result.all_trajectories[(int(seed_str), int(repeat_str))] = trajectory
+        else:
+            for seed_str, traj_data in data["trajectories"].items():
+                seed = int(seed_str)
+                result.all_trajectories[(seed, 0)] = SeedTrajectory.from_dict(
+                    traj_data, seed
                 )
-                trajectory.checkpoints.append(checkpoint)
-            result.trajectories[seed] = trajectory
 
         return result
 
@@ -379,7 +682,7 @@ class MetaLearningExperiment:
             verbose: Enable progress output.
 
         Returns:
-            MetaLearningResult with trajectories for each seed.
+            MetaLearningResult with trajectories for each (seed, repeat).
         """
         if config is None:
             config = MetaLearningConfig()
@@ -391,69 +694,98 @@ class MetaLearningExperiment:
         )
 
         for seed_idx, seed in enumerate(config.seeds):
-            if verbose:
-                print(f"\n{'='*60}")
-                print(f"Seed {seed_idx + 1}/{len(config.seeds)}: {seed}")
-                print("=" * 60)
+            for repeat in range(config.repeats):
+                if verbose:
+                    print(f"\n{'='*60}")
+                    label = f"Seed {seed_idx + 1}/{len(config.seeds)}: {seed}"
+                    if config.repeats > 1:
+                        label += f" (repeat {repeat + 1}/{config.repeats})"
+                    print(label)
+                    print("=" * 60)
 
-            trajectory = self._run_single_seed(dataset, config, seed, verbose)
-            result.trajectories[seed] = trajectory
+                trajectory = self._run_single_seed(
+                    dataset, config, seed, repeat, verbose
+                )
+                result.all_trajectories[(seed, repeat)] = trajectory
+                if trajectory.holdout_accuracy is not None and repeat == 0:
+                    result.holdout_results[seed] = trajectory.holdout_accuracy
 
-        # Summary
         if verbose:
-            print("\n" + "=" * 60)
-            print("META-LEARNING SUMMARY")
-            print("=" * 60)
-            for seed, traj in result.trajectories.items():
-                print(f"  Seed {seed}:")
-                score_str = (
-                    f"{traj.meta_learning_score:.4f}"
-                    if traj.meta_learning_score is not None
-                    else "N/A (need 3+ checkpoints)"
-                )
-                print(f"    Meta-learning score: {score_str}")
-                print(f"    Final accuracy: {traj.final_accuracy:.1%}")
-                print(f"    Net learning: {traj.total_net_learning}")
-            print()
-            if result.best_seed is not None:
-                best = result.trajectories[result.best_seed]
-                best_score = (
-                    f"{best.meta_learning_score:.4f}"
-                    if best.meta_learning_score is not None
-                    else "N/A"
-                )
-                print(
-                    f"  Best seed: {result.best_seed} "
-                    f"(score={best_score}, acc={best.final_accuracy:.1%})"
-                )
-            if result.worst_seed is not None:
-                worst = result.trajectories[result.worst_seed]
-                worst_score = (
-                    f"{worst.meta_learning_score:.4f}"
-                    if worst.meta_learning_score is not None
-                    else "N/A"
-                )
-                print(
-                    f"  Worst seed: {result.worst_seed} "
-                    f"(score={worst_score}, acc={worst.final_accuracy:.1%})"
-                )
-            if result.score_variance is not None:
-                print(f"  Score variance: {result.score_variance:.6f}")
-            else:
-                print("  Score variance: N/A (insufficient checkpoints)")
+            self._print_summary(result)
 
         return result
+
+    @staticmethod
+    def _print_summary(result: MetaLearningResult) -> None:
+        config = result.config
+        print("\n" + "=" * 60)
+        print("META-LEARNING SUMMARY")
+        print("=" * 60)
+        print(f"  Training source: {config.training_source}")
+        for (seed, repeat), traj in sorted(result.all_trajectories.items()):
+            label = f"Seed {seed}" + (f" repeat {repeat}" if config.repeats > 1 else "")
+            print(f"  {label}:")
+            score_str = (
+                f"{traj.meta_learning_score:.4f}"
+                if traj.meta_learning_score is not None
+                else f"N/A ({traj.meta_learning_score_reason})"
+            )
+            print(f"    Meta-learning score: {score_str}")
+            print(f"    Window sizes: {traj.window_sizes}")
+            print(f"    Final trained-item accuracy: {traj.final_trained_accuracy:.1%}")
+            holdout = traj.holdout_accuracy
+            print(
+                "    Holdout accuracy: "
+                + (f"{holdout:.1%}" if holdout is not None else "N/A")
+            )
+            print(f"    Net learning: {traj.total_net_learning}")
+            if config.training_source == "self_generated":
+                print(f"    Invalid revisions: {traj.revision_invalid_count}")
+        print()
+        for label, seed in (("Best", result.best_seed), ("Worst", result.worst_seed)):
+            if seed is None:
+                continue
+            traj = result.trajectories[seed]
+            score = (
+                f"{traj.meta_learning_score:.4f}"
+                if traj.meta_learning_score is not None
+                else "N/A"
+            )
+            print(
+                f"  {label} seed: {seed} "
+                f"(score={score}, trained-acc={traj.final_trained_accuracy:.1%})"
+            )
+        if result.score_variance is not None:
+            print(f"  Score variance (across seeds): {result.score_variance:.6f}")
+        else:
+            print("  Score variance: N/A (insufficient scored seeds)")
+        within = result.within_seed_variance
+        across = result.across_seed_variance
+        snr = result.signal_to_noise
+        print(
+            "  Within-seed variance (repeats): "
+            + (f"{within:.6f}" if within is not None else "N/A (repeats=1)")
+        )
+        print(
+            "  Across-seed variance: "
+            + (f"{across:.6f}" if across is not None else "N/A")
+        )
+        print(
+            "  Signal-to-noise (across/within): "
+            + (f"{snr:.3f}" if snr is not None else "N/A")
+        )
 
     def _run_single_seed(
         self,
         dataset: TriviaDataset,
         config: MetaLearningConfig,
         seed: int,
+        repeat: int,
         verbose: bool,
     ) -> SeedTrajectory:
-        """Run training for a single seed."""
+        """Run training for a single (seed, repeat)."""
         start_time = time.time()
-        trajectory = SeedTrajectory(seed=seed)
+        trajectory = SeedTrajectory(seed=seed, repeat=repeat)
 
         # Create fresh model
         if verbose:
@@ -465,16 +797,25 @@ class MetaLearningExperiment:
         effective_max_tokens = config.max_tokens or model._max_tokens
 
         # Create experiment record
+        name = f"{config.name}_seed{seed}"
+        if config.repeats > 1:
+            name += f"_r{repeat}"
         experiment = Experiment(
             id=None,
-            name=f"{config.name}_seed{seed}",
+            name=name,
             experiment_type=ExperimentType.EVAL,
             config_json=json.dumps(
                 {
                     "seed": seed,
+                    "repeat": repeat,
                     "training_iterations": config.training_iterations,
                     "checkpoint_interval": config.checkpoint_interval,
                     "train_ratio": config.train_ratio,
+                    "max_tokens": config.max_tokens,
+                    "training_source": config.training_source,
+                    "holdout_every_checkpoint": config.holdout_every_checkpoint,
+                    "dataset_name": dataset.name,
+                    "dataset_version": dataset.version,
                 }
             ),
             model_checkpoint=None,
@@ -484,18 +825,21 @@ class MetaLearningExperiment:
         experiment_id = self._db.insert_experiment(experiment)
         trajectory.experiment_id = experiment_id
 
-        # Shuffle and split dataset
+        # Shuffle and split dataset. Repeats reseed identically on purpose.
         random.seed(seed)
         indices = list(range(len(dataset)))
         random.shuffle(indices)
         train_count = int(len(indices) * config.train_ratio)
         train_indices = indices[:train_count]
         holdout_indices = indices[train_count:]
+        items_by_id: dict[str, TriviaItem] = {item.id: item for item in dataset}
 
         if verbose:
             print(
                 f"  Dataset: {len(dataset)} items ({train_count} train, {len(holdout_indices)} holdout)"
             )
+
+        example_ids = _insert_dataset_examples(self._db, dataset)
 
         # Phase 1: Get baseline responses for all items
         if verbose:
@@ -504,119 +848,80 @@ class MetaLearningExperiment:
         baseline_responses: dict[str, tuple[str, bool]] = (
             {}
         )  # item_id -> (response, correct)
-        example_ids: dict[str, int] = {}
-
-        for i, idx in enumerate(indices):
+        for idx in indices:
             item = dataset[idx]
-
-            # Insert example
-            db_example = Example(
-                id=None,
-                canonical_id=item.id,
-                question=item.question,
-                ground_truth_answer=item.correct_answer,
-                key_terms=item.key_terms if item.key_terms else None,
-                category=item.category,
-                difficulty=item.difficulty,
-                source_type=SourceType.STATIC_TRIVIA,
-                source_url=None,
-                source_title=None,
-                valid_at=None,
-                created_at=None,
+            rec = _infer_and_record(
+                model,
+                self._db,
+                item,
+                example_ids[item.id],
+                experiment_id,
+                Phase.BASELINE,
+                config.max_tokens,
+                effective_max_tokens,
             )
-            example_ids[item.id] = self._db.insert_example(db_example)
-
-            # Get baseline response
-            raw = model.generate_response(
-                item.question, use_history=False, max_tokens=config.max_tokens
-            )
-            clean = strip_think_tags(raw)
-            correct = contains_key_terms(clean, item.key_terms)
-            baseline_responses[item.id] = (clean, correct)
-
-            # Record in database
-            token_count = len(model._tokenizer.encode(raw or ""))
-            response = Response(
-                id=None,
-                example_id=example_ids[item.id],
-                experiment_id=experiment_id,
-                response_text=clean,
-                response_raw=raw or "",
-                confidence=None,
-                phase=Phase.BASELINE,
-                created_at=None,
-                token_count=token_count,
-                max_tokens=effective_max_tokens,
-                truncated=token_count >= effective_max_tokens - 1,
-            )
-            self._db.insert_response(response)
+            baseline_responses[item.id] = (rec.clean, rec.correct)
 
         # Phase 2: Train with checkpoints
         if verbose:
-            print("  Phase 2: Training with checkpoints...")
+            print(
+                f"  Phase 2: Training with checkpoints (source={config.training_source})..."
+            )
 
         post_responses: dict[str, tuple[str, bool]] = {}  # Updated as we train
-        trained_items: set[str] = set()
+        trained_items: list[str] = []  # in training order
 
         for batch_idx in range(0, len(train_indices), config.checkpoint_interval):
             batch = train_indices[batch_idx : batch_idx + config.checkpoint_interval]
+            window_ids: list[str] = []
+            revision_invalid_ids: list[str] = []
 
             # Train on this batch
             for idx in batch:
                 item = dataset[idx]
-                baseline_clean, baseline_correct = baseline_responses[item.id]
-
-                # Create training example
-                interactions = [
-                    InteractionHistory(
-                        idx=0,
-                        user_input=item.question,
-                        llm_response=baseline_clean,
-                        reviewed=False,
-                        timestamp=0.0,
-                    ),
-                ]
-                valid_revision = f"[[0]] {item.correct_answer} [[/0]]"
-                example = make_collated_training_example(
-                    valid_revision, interactions, model._tokenizer
+                baseline_clean, _ = baseline_responses[item.id]
+                outcome = _train_one_item(
+                    model,
+                    self._db,
+                    item,
+                    baseline_clean,
+                    example_ids[item.id],
+                    experiment_id,
+                    config.training_iterations,
+                    config.training_source,
                 )
-
-                # Train
-                train_start = time.time()
-                model.train_on_example(example, iterations=config.training_iterations)
-                training_time = time.time() - train_start
-
-                # Record training event
-                training_event = TrainingEvent(
-                    id=None,
-                    example_id=example_ids[item.id],
-                    experiment_id=experiment_id,
-                    training_iterations=config.training_iterations,
-                    training_time_seconds=training_time,
-                    created_at=None,
-                )
-                self._db.insert_training_event(training_event)
-
-                trained_items.add(item.id)
+                if outcome.revision_invalid:
+                    revision_invalid_ids.append(item.id)
+                    trajectory.revision_invalid_count += 1
+                    if verbose:
+                        print(f"    Skipped {item.id}: invalid revision")
+                    continue
+                trained_items.append(item.id)
+                window_ids.append(item.id)
 
             # Checkpoint: Evaluate all trained items
             for item_id in trained_items:
-                item = next(
-                    dataset[i] for i in range(len(dataset)) if dataset[i].id == item_id
+                post_responses[item_id] = _judge_only(
+                    model, items_by_id[item_id], config.max_tokens
                 )
-                raw = model.generate_response(
-                    item.question, use_history=False, max_tokens=config.max_tokens
-                )
-                clean = strip_think_tags(raw)
-                correct = contains_key_terms(clean, item.key_terms)
-                post_responses[item_id] = (clean, correct)
 
-            # Compute checkpoint metrics
+            holdout_probe: tuple[int, int] | None = None
+            if config.holdout_every_checkpoint:
+                correct = sum(
+                    1
+                    for idx in holdout_indices
+                    if _judge_only(model, dataset[idx], config.max_tokens)[1]
+                )
+                holdout_probe = (correct, len(holdout_indices))
+
             checkpoint = self._compute_checkpoint(
                 step=len(trained_items),
                 baseline_responses=baseline_responses,
                 post_responses=post_responses,
                 trained_items=trained_items,
+                window_ids=window_ids,
+                revision_invalid_ids=revision_invalid_ids,
+                holdout_probe=holdout_probe,
             )
             trajectory.checkpoints.append(checkpoint)
 
@@ -625,7 +930,9 @@ class MetaLearningExperiment:
                     f"    Checkpoint {len(trajectory.checkpoints)}: "
                     f"step={checkpoint.step}, "
                     f"acc={checkpoint.post_accuracy:.1%}, "
-                    f"net={checkpoint.net_learning}"
+                    f"net={checkpoint.net_learning}, "
+                    f"window n={checkpoint.window_size} "
+                    f"(+{checkpoint.window_improved}/-{checkpoint.window_regressed})"
                 )
 
         # Phase 3: Final evaluation on holdout
@@ -635,35 +942,28 @@ class MetaLearningExperiment:
         holdout_correct = 0
         for idx in holdout_indices:
             item = dataset[idx]
-            raw = model.generate_response(
-                item.question, use_history=False, max_tokens=config.max_tokens
+            rec = _infer_and_record(
+                model,
+                self._db,
+                item,
+                example_ids[item.id],
+                experiment_id,
+                Phase.POST_TRAINING,
+                config.max_tokens,
+                effective_max_tokens,
             )
-            clean = strip_think_tags(raw)
-            if contains_key_terms(clean, item.key_terms):
+            if rec.correct:
                 holdout_correct += 1
 
-            # Record post-training response
-            token_count = len(model._tokenizer.encode(raw or ""))
-            response = Response(
-                id=None,
-                example_id=example_ids[item.id],
-                experiment_id=experiment_id,
-                response_text=clean,
-                response_raw=raw or "",
-                confidence=None,
-                phase=Phase.POST_TRAINING,
-                created_at=None,
-                token_count=token_count,
-                max_tokens=effective_max_tokens,
-                truncated=token_count >= effective_max_tokens - 1,
-            )
-            self._db.insert_response(response)
-
-        holdout_accuracy = (
-            holdout_correct / len(holdout_indices) if holdout_indices else 0.0
-        )
+        trajectory.holdout_correct = holdout_correct
+        trajectory.holdout_total = len(holdout_indices)
         if verbose:
-            print(f"    Holdout accuracy: {holdout_accuracy:.1%}")
+            acc = trajectory.holdout_accuracy
+            print(
+                f"    Holdout accuracy: {acc:.1%}"
+                if acc is not None
+                else "    Holdout: none"
+            )
 
         # Mark experiment complete
         self._db.complete_experiment(experiment_id)
@@ -677,19 +977,26 @@ class MetaLearningExperiment:
         step: int,
         baseline_responses: dict[str, tuple[str, bool]],
         post_responses: dict[str, tuple[str, bool]],
-        trained_items: set[str],
+        trained_items: list[str],
+        window_ids: list[str] | None = None,
+        revision_invalid_ids: list[str] | None = None,
+        holdout_probe: tuple[int, int] | None = None,
     ) -> Checkpoint:
-        """Compute metrics for a checkpoint."""
-        improved = 0
-        retained = 0
-        regressed = 0
-        stuck = 0
+        """Compute metrics for a checkpoint.
 
-        # Track item IDs in each category
-        improved_ids: list[str] = []
-        retained_ids: list[str] = []
-        regressed_ids: list[str] = []
-        stuck_ids: list[str] = []
+        Args:
+            step: Training events completed so far.
+            baseline_responses: item_id -> (response, correct) before training.
+            post_responses: item_id -> (response, correct) as of this checkpoint.
+            trained_items: Every item trained so far (cumulative counts).
+            window_ids: Items trained since the previous checkpoint (window counts).
+            revision_invalid_ids: Items in this window skipped for invalid revisions.
+            holdout_probe: ``(correct, total)`` for the holdout set, if probed.
+        """
+        window = set(window_ids or [])
+        counts = {"improved": 0, "retained": 0, "regressed": 0, "stuck": 0}
+        ids: dict[str, list[str]] = {k: [] for k in counts}
+        window_counts = dict(counts)
 
         for item_id in trained_items:
             if item_id not in post_responses:
@@ -698,17 +1005,17 @@ class MetaLearningExperiment:
             _, post_correct = post_responses[item_id]
 
             if not baseline_correct and post_correct:
-                improved += 1
-                improved_ids.append(item_id)
+                kind = "improved"
             elif baseline_correct and post_correct:
-                retained += 1
-                retained_ids.append(item_id)
+                kind = "retained"
             elif baseline_correct and not post_correct:
-                regressed += 1
-                regressed_ids.append(item_id)
+                kind = "regressed"
             else:
-                stuck += 1
-                stuck_ids.append(item_id)
+                kind = "stuck"
+            counts[kind] += 1
+            ids[kind].append(item_id)
+            if item_id in window:
+                window_counts[kind] += 1
 
         baseline_correct_count = sum(1 for _, c in baseline_responses.values() if c)
         post_correct_count = sum(1 for _, c in post_responses.values() if c)
@@ -720,14 +1027,22 @@ class MetaLearningExperiment:
             baseline_total=len(baseline_responses),
             post_correct=post_correct_count,
             post_total=len(post_responses),
-            improved=improved,
-            retained=retained,
-            regressed=regressed,
-            stuck=stuck,
-            improved_ids=improved_ids,
-            retained_ids=retained_ids,
-            regressed_ids=regressed_ids,
-            stuck_ids=stuck_ids,
+            improved=counts["improved"],
+            retained=counts["retained"],
+            regressed=counts["regressed"],
+            stuck=counts["stuck"],
+            improved_ids=ids["improved"],
+            retained_ids=ids["retained"],
+            regressed_ids=ids["regressed"],
+            stuck_ids=ids["stuck"],
+            window_improved=window_counts["improved"],
+            window_retained=window_counts["retained"],
+            window_regressed=window_counts["regressed"],
+            window_stuck=window_counts["stuck"],
+            window_ids=list(window_ids or []),
+            revision_invalid_ids=list(revision_invalid_ids or []),
+            holdout_correct=holdout_probe[0] if holdout_probe else None,
+            holdout_total=holdout_probe[1] if holdout_probe else None,
         )
 
     @property

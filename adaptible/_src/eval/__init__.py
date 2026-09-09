@@ -7,7 +7,13 @@ from .dataset import (
     load_dataset,
     save_dataset,
 )
-from .harness import EvaluationConfig, EvaluationHarness, EvaluationResult
+from .harness import (
+    TRAINING_SOURCES,
+    EvaluationConfig,
+    EvaluationHarness,
+    EvaluationResult,
+    contains_key_terms,
+)
 from .meta import (
     Checkpoint,
     MetaLearningConfig,
@@ -28,6 +34,8 @@ __all__ = [
     "EvaluationHarness",
     "EvaluationConfig",
     "EvaluationResult",
+    "TRAINING_SOURCES",
+    "contains_key_terms",
     "generate_html_report",
     # Meta-learning
     "Checkpoint",

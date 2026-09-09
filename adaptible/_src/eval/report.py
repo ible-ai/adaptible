@@ -42,6 +42,19 @@ def generate_html_report(
             status_text = "No Change"
             status_icon = "·"
 
+        if item.revision_invalid:
+            revision_html = (
+                '<div class="key-terms"><strong>Revision:</strong> '
+                "INVALID (item skipped, not trained)</div>"
+            )
+        elif item.revision_text is not None:
+            revision_html = (
+                '<div class="key-terms"><strong>Trained on (self-generated):</strong> '
+                f"{html.escape(item.revision_text[:300])}</div>"
+            )
+        else:
+            revision_html = ""
+
         card_html = f"""
         <div class="item-card">
             <div class="item-header">
@@ -55,7 +68,8 @@ def generate_html_report(
 
             <div class="answer-box">
                 <strong>Expected:</strong> {html.escape(item.correct_answer)}
-                <div class="key-terms">Key terms: {', '.join(item.key_terms)}</div>
+                <div class="key-terms">Key terms: {html.escape(', '.join(item.key_terms))}</div>
+                {revision_html}
             </div>
 
             <div class="responses-container">
@@ -109,12 +123,32 @@ def generate_html_report(
         1 for i in holdout_items if i.initial_has_key_terms and not i.post_has_key_terms
     )
 
+    training_source = getattr(result.config, "training_source", "ground_truth")
+    if training_source == "self_generated":
+        training_source_text = (
+            "the model was trained on its <em>own revision</em> of each baseline "
+            "answer (self-correction). Nothing here was trained on the label."
+        )
+    else:
+        training_source_text = (
+            "the model was fine-tuned directly on the <em>ground-truth label</em>. "
+            "These numbers measure absorbing a supplied correction, "
+            "<strong>not</strong> self-correction."
+        )
+    revision_invalid_count = result.revision_invalid_count
+    revision_invalid_text = (
+        f" {revision_invalid_count} item(s) were skipped because the revision "
+        "failed validation."
+        if revision_invalid_count
+        else ""
+    )
+
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Adaptible Evaluation Report - {html.escape(result.config.name)}</title>
+    <title>Adaptible Evaluation Report - {html.escape(result.config.name)} [{html.escape(training_source)}]</title>
     <style>
         * {{ box-sizing: border-box; }}
         body {{
@@ -248,6 +282,25 @@ def generate_html_report(
 
         .timestamp {{ color: #666; font-size: 0.9em; }}
 
+        .training-source {{
+            font-size: 1.15em;
+            padding: 12px 20px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            border-left: 6px solid;
+        }}
+        .training-source.ground_truth {{
+            background: #fff3cd;
+            border-color: #ffc107;
+            color: #664d03;
+        }}
+        .training-source.self_generated {{
+            background: #d1e7dd;
+            border-color: #198754;
+            color: #0f5132;
+        }}
+        .training-source code {{ font-size: 1.1em; font-weight: bold; }}
+
         details {{ margin-top: 20px; }}
         details summary {{ cursor: pointer; color: #007bff; font-weight: bold; }}
         details pre {{
@@ -274,12 +327,18 @@ def generate_html_report(
     </style>
 </head>
 <body>
-    <h1>Adaptible Evaluation Report</h1>
+    <h1>Adaptible Evaluation Report <small>({html.escape(training_source)})</small></h1>
     <p class="timestamp">Generated: {result.timestamp} | Duration: {result.total_time_seconds:.1f}s</p>
+
+    <div class="training-source {html.escape(training_source)}">
+        <strong>Training source:</strong> <code>{html.escape(training_source)}</code> &mdash;
+        {training_source_text}{revision_invalid_text}
+    </div>
 
     <div class="config-box">
         <strong>Configuration:</strong> {html.escape(result.config.name)}<br>
         Dataset: {html.escape(result.dataset_name)} ({len(result.items)} items)<br>
+        Training source: {html.escape(training_source)} |
         Training iterations: {result.config.training_iterations} |
         Train/Holdout split: {result.config.train_ratio:.0%}/{1-result.config.train_ratio:.0%} |
         Shuffle: {result.config.shuffle} (seed: {result.config.seed})

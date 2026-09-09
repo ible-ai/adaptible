@@ -13,6 +13,10 @@ Options:
     --checkpoint-interval N Checkpoint every N training events (default: 10)
     --iterations N          Training iterations per example (default: 25)
     --train-ratio RATIO     Fraction used for training (default: 0.8)
+    --training-source S     "ground_truth" (fine-tune on the label) or
+                            "self_generated" (train on the model's own revision)
+    --repeats N             Runs per seed with identical shuffle (noise control)
+    --holdout-every-checkpoint  Probe the holdout set at every checkpoint
     --subset N              Only use first N items (for quick tests)
     --category CAT          Filter to specific category
     --output PATH           Output path for results JSON
@@ -48,6 +52,7 @@ import adaptible
 MetaLearningConfig = adaptible.eval.MetaLearningConfig
 MetaLearningExperiment = adaptible.eval.MetaLearningExperiment
 MetaLearningResult = adaptible.eval.MetaLearningResult
+TRAINING_SOURCES = adaptible.eval.TRAINING_SOURCES
 generate_default_dataset = adaptible.eval.generate_default_dataset
 load_dataset = adaptible.eval.load_dataset
 
@@ -58,6 +63,19 @@ _CHECKPOINT_INTERVAL = flags.DEFINE_integer(
 )
 _ITERATIONS = flags.DEFINE_integer("iterations", 25, "Training iterations per example")
 _TRAIN_RATIO = flags.DEFINE_float("train_ratio", 0.8, "Train/holdout split ratio")
+_TRAINING_SOURCE = flags.DEFINE_enum(
+    "training_source",
+    "ground_truth",
+    list(TRAINING_SOURCES),
+    "What the model is trained on: the dataset label (ground_truth) or its own "
+    "revision of its baseline answer (self_generated).",
+)
+_REPEATS = flags.DEFINE_integer(
+    "repeats", 1, "Runs per seed with an identical shuffle (noise control arm)"
+)
+_HOLDOUT_EVERY_CHECKPOINT = flags.DEFINE_boolean(
+    "holdout_every_checkpoint", False, "Evaluate the holdout set at every checkpoint"
+)
 _SUBSET = flags.DEFINE_integer("subset", None, "Only use first N items")
 _CATEGORY = flags.DEFINE_string("category", None, "Filter to specific category")
 _OUTPUT = flags.DEFINE_string(
@@ -77,7 +95,7 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
         score = (
             traj.meta_learning_score if traj.meta_learning_score is not None else 0.0
         )
-        return (score, traj.final_accuracy, traj.total_net_learning)
+        return (score, traj.final_trained_accuracy, traj.total_net_learning)
 
     trajectory_rows = []
     for seed, traj in sorted(result.trajectories.items(), key=sort_key, reverse=True):
@@ -88,21 +106,26 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
         score_str = (
             f"{traj.meta_learning_score:.4f}"
             if traj.meta_learning_score is not None
+            else f"N/A ({traj.meta_learning_score_reason})"
+        )
+        holdout_str = (
+            f"{traj.holdout_accuracy:.1%}"
+            if traj.holdout_accuracy is not None
             else "N/A"
         )
 
-        trajectory_rows.append(
-            f"""
+        trajectory_rows.append(f"""
             <tr class="{row_class}">
                 <td>{seed}{badge}</td>
                 <td>{score_str}</td>
-                <td>{traj.final_accuracy:.1%}</td>
+                <td>{traj.final_trained_accuracy:.1%}</td>
+                <td>{holdout_str}</td>
                 <td>{traj.total_net_learning}</td>
+                <td>{traj.window_sizes}</td>
                 <td>{len(traj.checkpoints)}</td>
                 <td>{traj.total_time_seconds:.1f}s</td>
             </tr>
-            """
-        )
+            """)
 
     # Build checkpoint progression for best seed
     checkpoint_data = []
@@ -113,8 +136,8 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                 {
                     "step": cp.step,
                     "accuracy": cp.post_accuracy,
-                    "improvement_rate": cp.improvement_rate,
-                    "forgetting_rate": cp.forgetting_rate,
+                    "improvement_rate": cp.window_improvement_rate,
+                    "forgetting_rate": cp.window_forgetting_rate,
                     "net_learning": cp.net_learning,
                 }
             )
@@ -247,7 +270,12 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
-    <h1>Meta-Learning Experiment Results</h1>
+    <h1>Meta-Learning Experiment Results ({result.config.training_source})</h1>
+
+    <div class="config" style="border-left: 6px solid {'#198754' if result.config.training_source == 'self_generated' else '#ffc107'};">
+        <strong>Training source: <code>{result.config.training_source}</code></strong> &mdash;
+        {"the model was trained on its own revisions (self-correction)." if result.config.training_source == "self_generated" else "the model was fine-tuned on the ground-truth label. This measures absorbing a supplied correction, <strong>not</strong> self-correction."}
+    </div>
 
     <div class="config">
         <h2 style="margin-top: 0;">Configuration</h2>
@@ -255,6 +283,14 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
             <div class="config-item">
                 <div class="label">Name</div>
                 <div class="value" style="font-size: 16px;">{result.config.name}</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Training Source</div>
+                <div class="value" style="font-size: 16px;">{result.config.training_source}</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Repeats / Seed</div>
+                <div class="value">{result.config.repeats}</div>
             </div>
             <div class="config-item">
                 <div class="label">Seeds</div>
@@ -291,8 +327,20 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                 <div class="value negative">{result.worst_seed or 'N/A'}</div>
             </div>
             <div class="summary-item">
-                <div class="label">Score Variance</div>
+                <div class="label">Score Variance (across seeds)</div>
                 <div class="value">{f"{result.score_variance:.6f}" if result.score_variance is not None else "N/A"}</div>
+            </div>
+            <div class="summary-item">
+                <div class="label">Within-Seed Variance (repeats)</div>
+                <div class="value">{f"{result.within_seed_variance:.6f}" if result.within_seed_variance is not None else "N/A"}</div>
+            </div>
+            <div class="summary-item">
+                <div class="label">Across-Seed Variance</div>
+                <div class="value">{f"{result.across_seed_variance:.6f}" if result.across_seed_variance is not None else "N/A"}</div>
+            </div>
+            <div class="summary-item">
+                <div class="label">Signal-to-Noise</div>
+                <div class="value">{f"{result.signal_to_noise:.3f}" if result.signal_to_noise is not None else "N/A"}</div>
             </div>
         </div>
     </div>
@@ -303,8 +351,10 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
             <tr>
                 <th>Seed</th>
                 <th>Meta-Learning Score</th>
-                <th>Final Accuracy</th>
+                <th>Final Trained-Item Accuracy</th>
+                <th>Holdout Accuracy</th>
                 <th>Net Learning</th>
+                <th>Window Sizes</th>
                 <th>Checkpoints</th>
                 <th>Time</th>
             </tr>
@@ -322,7 +372,10 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
             <li><strong>Score &lt; 0:</strong> Model is degrading - improvements slow down, forgetting increases</li>
             <li><strong>High variance:</strong> Meta-learning ability is sensitive to initialization</li>
         </ul>
-        <p>Formula: <code>(late_improvement_rate - early_improvement_rate) + (early_forgetting_rate - late_forgetting_rate)</code></p>
+        <p>Formula: <code>(late_improvement_rate - early_improvement_rate) + (early_forgetting_rate - late_forgetting_rate)</code>,
+        using per-window rates (items trained since the previous checkpoint), averaged over the first and last third of checkpoints.
+        A window with fewer than 5 trained items makes the score N/A.</p>
+        <p>Chart rates below are the per-window rates, not cumulative.</p>
     </div>
 
     <h2>Learning Trajectory (Best Seed: {result.best_seed})</h2>
@@ -340,7 +393,7 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                 labels: checkpointData.map(d => 'Step ' + d.step),
                 datasets: [
                     {{
-                        label: 'Post-Training Accuracy',
+                        label: 'Trained-Item Accuracy (cumulative)',
                         data: checkpointData.map(d => d.accuracy * 100),
                         borderColor: '#4CAF50',
                         backgroundColor: 'rgba(76, 175, 80, 0.1)',
@@ -349,7 +402,7 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                         yAxisID: 'y'
                     }},
                     {{
-                        label: 'Improvement Rate',
+                        label: 'Window Improvement Rate',
                         data: checkpointData.map(d => d.improvement_rate * 100),
                         borderColor: '#2196F3',
                         backgroundColor: 'transparent',
@@ -357,7 +410,7 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                         yAxisID: 'y'
                     }},
                     {{
-                        label: 'Forgetting Rate',
+                        label: 'Window Forgetting Rate',
                         data: checkpointData.map(d => d.forgetting_rate * 100),
                         borderColor: '#f44336',
                         backgroundColor: 'transparent',
@@ -462,12 +515,18 @@ def main(_):
         checkpoint_interval=_CHECKPOINT_INTERVAL.value,
         training_iterations=_ITERATIONS.value,
         train_ratio=_TRAIN_RATIO.value,
+        training_source=_TRAINING_SOURCE.value,
+        repeats=_REPEATS.value,
+        holdout_every_checkpoint=_HOLDOUT_EVERY_CHECKPOINT.value,
     )
 
     print()
     print("Configuration:")
     print(f"  Name: {config.name}")
+    print(f"  Training source: {config.training_source}")
     print(f"  Seeds: {config.seeds}")
+    print(f"  Repeats per seed: {config.repeats}")
+    print(f"  Holdout every checkpoint: {config.holdout_every_checkpoint}")
     print(f"  Checkpoint interval: {config.checkpoint_interval}")
     print(f"  Training iterations: {config.training_iterations}")
     print(f"  Train ratio: {config.train_ratio}")
@@ -502,34 +561,52 @@ def main(_):
     print("FINAL SUMMARY")
     print("=" * 70)
     print()
-    print(f"  Best seed:      {result.best_seed}")
-    if result.best_seed is not None:
-        best = result.trajectories[result.best_seed]
+    print(f"  Training source: {config.training_source}")
+    for label, seed in (
+        ("Best seed", result.best_seed),
+        ("Worst seed", result.worst_seed),
+    ):
+        print(f"  {label}:      {seed}")
+        if seed is None:
+            continue
+        traj = result.trajectories[seed]
         score_str = (
-            f"{best.meta_learning_score:.4f}"
-            if best.meta_learning_score is not None
-            else "N/A (need 3+ checkpoints)"
+            f"{traj.meta_learning_score:.4f}"
+            if traj.meta_learning_score is not None
+            else f"N/A ({traj.meta_learning_score_reason})"
         )
-        print(f"    Score:        {score_str}")
-        print(f"    Accuracy:     {best.final_accuracy:.1%}")
-        print(f"    Net learning: {best.total_net_learning}")
-    print()
-    print(f"  Worst seed:     {result.worst_seed}")
-    if result.worst_seed is not None:
-        worst = result.trajectories[result.worst_seed]
-        score_str = (
-            f"{worst.meta_learning_score:.4f}"
-            if worst.meta_learning_score is not None
-            else "N/A (need 3+ checkpoints)"
+        holdout_str = (
+            f"{traj.holdout_accuracy:.1%}"
+            if traj.holdout_accuracy is not None
+            else "N/A"
         )
-        print(f"    Score:        {score_str}")
-        print(f"    Accuracy:     {worst.final_accuracy:.1%}")
-        print(f"    Net learning: {worst.total_net_learning}")
-    print()
+        print(f"    Score:                  {score_str}")
+        print(f"    Trained-item accuracy:  {traj.final_trained_accuracy:.1%}")
+        print(f"    Holdout accuracy:       {holdout_str}")
+        print(f"    Net learning:           {traj.total_net_learning}")
+        print(f"    Window sizes:           {traj.window_sizes}")
+        print()
     if result.score_variance is not None:
-        print(f"  Score variance: {result.score_variance:.6f}")
+        print(f"  Score variance (across seeds): {result.score_variance:.6f}")
     else:
-        print("  Score variance: N/A (insufficient checkpoints)")
+        print("  Score variance: N/A (insufficient scored seeds)")
+    within, across, snr = (
+        result.within_seed_variance,
+        result.across_seed_variance,
+        result.signal_to_noise,
+    )
+    print(
+        "  Within-seed variance (repeats): "
+        + (f"{within:.6f}" if within is not None else "N/A (use --repeats 2+)")
+    )
+    print(
+        "  Across-seed variance:           "
+        + (f"{across:.6f}" if across is not None else "N/A")
+    )
+    print(
+        "  Signal-to-noise (across/within): "
+        + (f"{snr:.3f}" if snr is not None else "N/A")
+    )
     print()
 
     return 0

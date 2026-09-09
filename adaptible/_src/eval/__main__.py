@@ -9,6 +9,8 @@ Options:
     --iterations N        Training iterations per example (default: 25)
     --shuffle             Shuffle the dataset
     --seed SEED           Random seed for shuffling (default: 42)
+    --training-source S   "ground_truth" (fine-tune on the label) or
+                          "self_generated" (train on the model's own revision)
     --subset N            Only use first N items (for quick tests)
     --category CAT        Filter to specific category
     --output PATH         Output path for HTML report
@@ -22,6 +24,7 @@ import vizible
 from absl import app, flags
 
 from . import (
+    TRAINING_SOURCES,
     EvaluationConfig,
     EvaluationHarness,
     generate_default_dataset,
@@ -35,6 +38,13 @@ _TRAIN_RATIO = flags.DEFINE_float("train_ratio", 0.8, "Train/holdout split ratio
 _ITERATIONS = flags.DEFINE_integer("iterations", 25, "Training iterations per example")
 _SHUFFLE = flags.DEFINE_boolean("shuffle", False, "Shuffle the dataset")
 _SEED = flags.DEFINE_integer("seed", 42, "Random seed")
+_TRAINING_SOURCE = flags.DEFINE_enum(
+    "training_source",
+    "ground_truth",
+    list(TRAINING_SOURCES),
+    "What the model is trained on: the dataset label (ground_truth) or its own "
+    "revision of its baseline answer (self_generated).",
+)
 _SUBSET = flags.DEFINE_integer("subset", None, "Only use first N items")
 _CATEGORY = flags.DEFINE_string("category", None, "Filter to specific category")
 _OUTPUT = flags.DEFINE_string(
@@ -82,6 +92,7 @@ def main(_):
         shuffle=_SHUFFLE.value,
         seed=_SEED.value,
         train_ratio=_TRAIN_RATIO.value,
+        training_source=_TRAINING_SOURCE.value,
     )
 
     # Run evaluation
