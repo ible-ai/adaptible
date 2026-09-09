@@ -7,6 +7,9 @@ import mlx.core as mx
 
 from .._classes import InteractionHistory, TrainingExample
 from .revise import (
+    REWRITE_INSTRUCTIONS,
+    REWRITE_INSTRUCTIONS_FEWSHOT,
+    THINK_CLOSE,
     InvalidRevisionError,
     _collate_fn,
     _isolate_turn_to_rewritten_turn_index,
@@ -16,6 +19,7 @@ from .revise import (
     _serialize_interactions_to_string,
     make_collated_training_example,
     make_revision_prompt,
+    revision_prompt_preset,
     strip_think_tags,
     validate_revision_response,
 )
@@ -226,6 +230,135 @@ class SerializeInteractionsTest(unittest.TestCase):
         self.assertEqual(len(turns), 2)
         self.assertIn("Q1", turns[0])
         self.assertIn("Q2", turns[1])
+
+
+class SerializeInteractionsPlainTest(unittest.TestCase):
+    """dialog_style="plain" renders User:/Assistant: lines without the tokenizer."""
+
+    def setUp(self):
+        self.mock_tokenizer = MagicMock()
+        self.mock_tokenizer.apply_chat_template.side_effect = (
+            lambda conversation, tokenize, continue_final_message: "<|im_start|>user\n"
+            f"{conversation[0]['content']}<|im_end|><|im_start|>assistant\n"
+            f"{conversation[1]['content']}<|im_end|>"
+        )
+
+    def test_plain_has_user_assistant_lines_and_no_template_tokens(self):
+        interactions = [
+            InteractionHistory(idx=0, user_input="What is 2+2?", llm_response="5"),
+            InteractionHistory(idx=1, user_input="Sure?", llm_response="Yes."),
+        ]
+        result, turns = _serialize_interactions_to_string(
+            interactions,
+            should_enumerate=True,
+            tokenizer=self.mock_tokenizer,
+            continue_final_message=False,
+            dialog_style="plain",
+        )
+        self.assertEqual(
+            result,
+            "[[0]] User: What is 2+2?\nAssistant: 5\n[[1]] User: Sure?\nAssistant: Yes.",
+        )
+        self.assertEqual(turns, ["User: What is 2+2?\nAssistant: 5", "User: Sure?\nAssistant: Yes."])
+        self.assertNotIn("<|im_start|>", result)
+        self.mock_tokenizer.apply_chat_template.assert_not_called()
+
+    def test_plain_not_enumerated(self):
+        interactions = [InteractionHistory(idx=0, user_input="Hi", llm_response="Hello")]
+        result, _ = _serialize_interactions_to_string(
+            interactions,
+            should_enumerate=False,
+            tokenizer=self.mock_tokenizer,
+            continue_final_message=False,
+            dialog_style="plain",
+        )
+        self.assertEqual(result, "User: Hi\nAssistant: Hello")
+
+    def test_plain_strips_think_tags(self):
+        interactions = [
+            InteractionHistory(
+                idx=0, user_input="Hi", llm_response="<think>hmm</think> Hello"
+            )
+        ]
+        result, _ = _serialize_interactions_to_string(
+            interactions,
+            should_enumerate=True,
+            tokenizer=self.mock_tokenizer,
+            continue_final_message=False,
+            dialog_style="plain",
+        )
+        self.assertEqual(result, "[[0]] User: Hi\nAssistant: Hello")
+
+    def test_chat_is_default_and_uses_template(self):
+        interactions = [InteractionHistory(idx=0, user_input="Hi", llm_response="Hello")]
+        result, _ = _serialize_interactions_to_string(
+            interactions,
+            should_enumerate=True,
+            tokenizer=self.mock_tokenizer,
+            continue_final_message=False,
+        )
+        self.assertIn("<|im_start|>user", result)
+        self.assertNotIn("User: Hi", result)
+
+    def test_unknown_style_rejected(self):
+        with self.assertRaises(ValueError):
+            _serialize_interactions_to_string(
+                [InteractionHistory(idx=0, user_input="Hi", llm_response="Hello")],
+                should_enumerate=True,
+                tokenizer=self.mock_tokenizer,
+                continue_final_message=False,
+                dialog_style="markdown",
+            )
+
+
+class FewShotPromptTest(unittest.TestCase):
+    """REWRITE_INSTRUCTIONS_FEWSHOT and revision_prompt_preset."""
+
+    def test_fewshot_instructions_contain_two_marked_examples(self):
+        text = REWRITE_INSTRUCTIONS_FEWSHOT
+        self.assertIn("Example 1", text)
+        self.assertIn("Example 2", text)
+        self.assertEqual(text.count("[[0]] User:"), 2)
+        self.assertEqual(text.count("Assistant:"), 2)
+        # Each example output is a complete [[0]] ... [[/0]] rewrite.
+        self.assertEqual(text.count("[[/0]]"), 2)
+        self.assertEqual(text.count("Output:\n[[0]] "), 2)
+        self.assertIn("Output ONLY the rewrite", text)
+        self.assertIn("Do not explain", text)
+        self.assertIn("Do not restate", text)
+        self.assertLess(len(text), len(REWRITE_INSTRUCTIONS) * 3)
+
+    def test_fewshot_prompt_over_plain_dialog(self):
+        instructions, style = revision_prompt_preset("fewshot")
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.side_effect = AssertionError("must not be called")
+        interactions = [
+            InteractionHistory(idx=0, user_input="Who wrote Hamlet?", llm_response="Dickens.")
+        ]
+        prompt = make_revision_prompt(
+            interactions, tokenizer, instructions=instructions, dialog_style=style
+        )
+        self.assertTrue(prompt.startswith(REWRITE_INSTRUCTIONS_FEWSHOT))
+        self.assertIn("Example 1", prompt)
+        self.assertIn("Example 2", prompt)
+        self.assertIn("[[/0]]", prompt)
+        self.assertIn(
+            "<PAST_DIALOG>\n[[0]] User: Who wrote Hamlet?\nAssistant: Dickens.\n</PAST_DIALOG>",
+            prompt,
+        )
+        tokenizer.apply_chat_template.assert_not_called()
+
+    def test_preset_lookup(self):
+        self.assertEqual(revision_prompt_preset("default"), (REWRITE_INSTRUCTIONS, "chat"))
+        self.assertEqual(
+            revision_prompt_preset("fewshot"), (REWRITE_INSTRUCTIONS_FEWSHOT, "plain")
+        )
+        with self.assertRaises(ValueError):
+            revision_prompt_preset("zero_shot")
+
+    def test_default_prompt_unchanged(self):
+        self.assertTrue(REWRITE_INSTRUCTIONS.startswith("You are a professional editor"))
+        self.assertNotIn("Example 1", REWRITE_INSTRUCTIONS)
 
 
 class PadTest(unittest.TestCase):
@@ -479,6 +612,92 @@ class MakeCollatedTrainingExampleTest(unittest.TestCase):
         )
 
         self.assertIsInstance(result, TrainingExample)
+
+
+class _CharTokenizer:
+    """One token per character so label regions can be decoded back to text."""
+
+    special_tokens_map = {"eos_token": "<eos>"}
+
+    def __init__(self, generation_suffix: str):
+        self.generation_suffix = generation_suffix
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) + 1 for c in text]
+
+    def decode(self, tokens):
+        return "".join(chr(t - 1) for t in tokens if t > 0)
+
+    def apply_chat_template(
+        self, conversation, tokenize=False, add_generation_prompt=False, **kwargs
+    ):
+        text = "".join(f"<{m['role']}>{m['content']}</{m['role']}>" for m in conversation)
+        if add_generation_prompt:
+            text += self.generation_suffix
+        return text
+
+
+class CloseThinkTest(unittest.TestCase):
+    """make_collated_training_example closes an open <think> block in the prefix."""
+
+    THINK_PREFIX = "<assistant><think>\n"  # DeepSeek-R1-Distill shape
+    PLAIN_PREFIX = "<assistant>"
+
+    def _decode(self, tokenizer, example):
+        labels = example.label.tolist()[0]
+        mask = example.mask.tolist()[0]
+        inputs = example.input.tolist()[0]
+        masked = tokenizer.decode(t for t, m in zip(labels, mask) if m)
+        # The full sequence is input[0] + label (label is input shifted by one).
+        full = tokenizer.decode([inputs[0]] + labels)
+        return masked, full
+
+    def _example(self, suffix, **kwargs):
+        tokenizer = _CharTokenizer(suffix)
+        interactions = [InteractionHistory(idx=0, user_input="Q?", llm_response="wrong")]
+        example = make_collated_training_example(
+            "[[0]] Right answer. [[/0]]", interactions, tokenizer, **kwargs
+        )
+        return tokenizer, example
+
+    def test_open_think_is_closed_and_masked(self):
+        tokenizer, example = self._example(self.THINK_PREFIX)
+        masked, full = self._decode(tokenizer, example)
+        self.assertEqual(masked, f"{THINK_CLOSE}Right answer.<eos>")
+        self.assertTrue(masked.startswith("</think>"))
+        self.assertEqual(
+            full, f"<user>Q?</user>{self.THINK_PREFIX}</think>\n\nRight answer.<eos>"
+        )
+        # The unmasked region is exactly the chat-template prefix.
+        prefix_len = len(f"<user>Q?</user>{self.THINK_PREFIX}")
+        mask = example.mask.tolist()[0]
+        self.assertEqual(mask[: prefix_len - 1], [0] * (prefix_len - 1))
+        self.assertEqual(mask[prefix_len - 1], 1)
+
+    def test_no_think_tag_inserts_nothing(self):
+        tokenizer, example = self._example(self.PLAIN_PREFIX)
+        masked, full = self._decode(tokenizer, example)
+        self.assertEqual(masked, "Right answer.<eos>")
+        self.assertNotIn("</think>", full)
+        self.assertEqual(full, "<user>Q?</user><assistant>Right answer.<eos>")
+
+    def test_close_think_false_reproduces_old_sequence(self):
+        tokenizer, example = self._example(self.THINK_PREFIX, close_think=False)
+        masked, full = self._decode(tokenizer, example)
+        self.assertEqual(masked, "Right answer.<eos>")
+        self.assertEqual(
+            full, f"<user>Q?</user>{self.THINK_PREFIX}Right answer.<eos>"
+        )
+
+    def test_think_without_trailing_newline_is_still_closed(self):
+        tokenizer, example = self._example("<assistant><think>")
+        masked, _ = self._decode(tokenizer, example)
+        self.assertEqual(masked, f"{THINK_CLOSE}Right answer.<eos>")
+
+    def test_closed_think_in_prefix_is_left_alone(self):
+        tokenizer, example = self._example("<assistant><think>\n</think>\n")
+        masked, _ = self._decode(tokenizer, example)
+        self.assertEqual(masked, "Right answer.<eos>")
 
 
 class EdgeCaseTest(unittest.TestCase):

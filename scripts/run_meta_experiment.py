@@ -15,6 +15,10 @@ Options:
     --train-ratio RATIO     Fraction used for training (default: 0.8)
     --training-source S     "ground_truth" (fine-tune on the label) or
                             "self_generated" (train on the model's own revision)
+    --revision-prompt P     Revision prompt preset for self_generated:
+                            "default" or "fewshot"
+    --[no]close_think       Close the chat template's open <think> block before
+                            the training target (default: on)
     --repeats N             Runs per seed with identical shuffle (noise control)
     --holdout-every-checkpoint  Probe the holdout set at every checkpoint
     --subset N              Only use first N items (for quick tests)
@@ -53,6 +57,7 @@ MetaLearningConfig = adaptible.eval.MetaLearningConfig
 MetaLearningExperiment = adaptible.eval.MetaLearningExperiment
 MetaLearningResult = adaptible.eval.MetaLearningResult
 TRAINING_SOURCES = adaptible.eval.TRAINING_SOURCES
+REVISION_PROMPTS = adaptible.revise.REVISION_PROMPTS
 generate_default_dataset = adaptible.eval.generate_default_dataset
 load_dataset = adaptible.eval.load_dataset
 
@@ -69,6 +74,18 @@ _TRAINING_SOURCE = flags.DEFINE_enum(
     list(TRAINING_SOURCES),
     "What the model is trained on: the dataset label (ground_truth) or its own "
     "revision of its baseline answer (self_generated).",
+)
+_REVISION_PROMPT = flags.DEFINE_string(
+    "revision_prompt",
+    "default",
+    f"Revision prompt preset used with --training_source self_generated; one of "
+    f"{', '.join(REVISION_PROMPTS)}.",
+)
+_CLOSE_THINK = flags.DEFINE_boolean(
+    "close_think",
+    True,
+    "If the chat template's generation prompt ends with an open <think> tag, "
+    "train on '</think>\\n\\n{revision}'. --noclose_think keeps the old target.",
 )
 _REPEATS = flags.DEFINE_integer(
     "repeats", 1, "Runs per seed with an identical shuffle (noise control arm)"
@@ -287,6 +304,14 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
             <div class="config-item">
                 <div class="label">Training Source</div>
                 <div class="value" style="font-size: 16px;">{result.config.training_source}</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Revision Prompt</div>
+                <div class="value" style="font-size: 16px;">{result.config.revision_prompt}</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Close Think</div>
+                <div class="value" style="font-size: 16px;">{result.config.close_think}</div>
             </div>
             <div class="config-item">
                 <div class="label">Repeats / Seed</div>
@@ -516,6 +541,8 @@ def main(_):
         training_iterations=_ITERATIONS.value,
         train_ratio=_TRAIN_RATIO.value,
         training_source=_TRAINING_SOURCE.value,
+        revision_prompt=_REVISION_PROMPT.value,
+        close_think=_CLOSE_THINK.value,
         repeats=_REPEATS.value,
         holdout_every_checkpoint=_HOLDOUT_EVERY_CHECKPOINT.value,
     )
@@ -524,6 +551,8 @@ def main(_):
     print("Configuration:")
     print(f"  Name: {config.name}")
     print(f"  Training source: {config.training_source}")
+    print(f"  Revision prompt: {config.revision_prompt}")
+    print(f"  Close think: {config.close_think}")
     print(f"  Seeds: {config.seeds}")
     print(f"  Repeats per seed: {config.repeats}")
     print(f"  Holdout every checkpoint: {config.holdout_every_checkpoint}")

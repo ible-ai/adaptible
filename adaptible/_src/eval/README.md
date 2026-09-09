@@ -22,7 +22,24 @@ What the model is trained on is controlled by `training_source` (`EvaluationConf
 | `ground_truth` (default) | `[[0]] {item.correct_answer} [[/0]]`, the dataset label | How well the model absorbs a correction it is handed. This is supervised LoRA fine-tuning. |
 | `self_generated` | The model's own revision of its baseline answer, produced with `revise.make_revision_prompt` and checked by `validate_revision_response` | Self-correction, the path the server's `/trigger_review` uses |
 
-Every published result from this repository used `ground_truth`. No `self_generated` run has been done. With `self_generated`, items whose revision fails validation are skipped (not trained) and counted in `EvaluationResult.revision_invalid_count`.
+Every published result from this repository used `ground_truth`. With `self_generated`, items whose revision fails validation are skipped (not trained) and counted in `EvaluationResult.revision_invalid_count`.
+
+### Revision prompt
+
+With `self_generated`, the prompt that asks the model for its revision is chosen by `revision_prompt` (`EvaluationConfig.revision_prompt`, `MetaLearningConfig.revision_prompt`, `--revision_prompt` on the CLI). It is ignored for `ground_truth`. Presets come from `adaptible.revise.revision_prompt_preset`:
+
+| Value | Instructions | Dialog rendering |
+|---|---|---|
+| `default` | `revise.REWRITE_INSTRUCTIONS`, the server's prompt | Through `tokenizer.apply_chat_template`, so the past dialog carries the model's special tokens |
+| `fewshot` | `revise.REWRITE_INSTRUCTIONS_FEWSHOT`: short, imperative, with two worked `[[0]] ... [[/0]]` examples | Plain `User: ...` / `Assistant: ...` lines, no tokenizer involvement |
+
+`fewshot` exists because the first `self_generated` run with `default` got a valid revision from the 1.5B model for only 1 of 84 items: most responses carried no `[[0]]` marker at all, and several started by echoing the chat-template tokens that `default` puts in the dialog. Whether `fewshot` does better has not been measured yet.
+
+### Training target and `close_think`
+
+Whatever the revision prompt looked like, the training target is always built by `revise.make_collated_training_example` from the tokenizer's real chat template (`add_generation_prompt=True`), so training matches inference. For DeepSeek-R1-Distill that generation prompt ends with an open `<think>\n`, and the original code put the revision straight after it, training the model on an answer inside an unclosed think block. One such example was enough to collapse responses from ~722 to ~16 tokens.
+
+`close_think` (`EvaluationConfig.close_think`, `MetaLearningConfig.close_think`, `--close_think` / `--noclose_think`; default on) fixes this: when the prefix ends with `<think>`, the target becomes `<think>\n</think>\n\n{revision}{eos}`, an empty reasoning block followed by the answer, with the loss mask covering `</think>\n\n` plus the revision. `--noclose_think` reproduces the old target for comparison. Templates without a think tag are unaffected either way. Both `training_source` values go through this path.
 
 ## Quick Start
 
@@ -37,6 +54,9 @@ python -m adaptible.eval --subset 20 --shuffle
 
 # Measure self-correction rather than SFT
 python -m adaptible.eval --training_source self_generated --shuffle
+
+# Same, with the few-shot revision prompt
+python -m adaptible.eval --training_source self_generated --revision_prompt fewshot --shuffle
 
 # Specific category, more iterations, custom report path, no browser
 python -m adaptible.eval --category geography --iterations 50 \
@@ -58,6 +78,8 @@ config = eval.EvaluationConfig(
     train_ratio=0.8,
     shuffle=True,
     training_source="ground_truth",   # or "self_generated"
+    revision_prompt="default",        # or "fewshot"; only used by self_generated
+    close_think=True,                 # False reproduces the pre-fix training target
 )
 
 harness = eval.EvaluationHarness()    # note: loads <outputs>/autonomous/checkpoint if present
@@ -165,6 +187,7 @@ where each rate is the **window** rate averaged over the first third (`early`) a
 python scripts/run_meta_experiment.py --seeds 42,123,456
 python scripts/run_meta_experiment.py --seeds 42 --repeats 3                    # noise floor
 python scripts/run_meta_experiment.py --training_source self_generated          # self-correction
+python scripts/run_meta_experiment.py --training_source self_generated --revision_prompt fewshot
 python scripts/run_meta_experiment.py --holdout_every_checkpoint --subset 40
 ```
 
@@ -196,6 +219,8 @@ result = eval.MetaLearningResult.load("outputs/meta/meta.json")
 | `--shuffle`         | `False`                           | Randomize question order                                 |
 | `--seed`            | `42`                              | Random seed for shuffling                                |
 | `--training_source` | `ground_truth`                    | `ground_truth` or `self_generated` (see above)           |
+| `--revision_prompt` | `default`                         | `default` or `fewshot`; revision prompt preset for `self_generated` |
+| `--close_think`     | `True`                            | Close an open `<think>` block before the training target; `--noclose_think` for the old target |
 | `--subset`          | `None`                            | Use only first N questions                               |
 | `--category`        | `None`                            | Filter to specific category                              |
 | `--output`          | `/tmp/adaptible_eval_report.html` | Report path                                              |

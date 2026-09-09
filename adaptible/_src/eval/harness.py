@@ -25,6 +25,7 @@ from ..revise import (
     InvalidRevisionError,
     make_collated_training_example,
     make_revision_prompt,
+    revision_prompt_preset,
     strip_think_tags,
     validate_revision_response,
 )
@@ -57,6 +58,12 @@ class EvaluationConfig:
         training_source: Where the training target comes from; see
             ``TRAINING_SOURCES``. Every result derived from a run must carry this
             value so "ground_truth" numbers are never mistaken for self-correction.
+        revision_prompt: Which revision prompt preset ``self_generated`` uses;
+            see ``revise.revision_prompt_preset``. Ignored for ``ground_truth``.
+        close_think: Passed to ``revise.make_collated_training_example``. When
+            the chat template opens a ``<think>`` block in its generation prompt,
+            close it before the training target (True) or leave the target inside
+            the open block (False, the pre-1.0.0a4 behavior, for comparison).
     """
 
     name: str = "default"
@@ -67,9 +74,12 @@ class EvaluationConfig:
     train_ratio: float = 0.8  # Fraction to use for training
     max_tokens: int | None = None  # Use model default if None
     training_source: str = "ground_truth"
+    revision_prompt: str = "default"
+    close_think: bool = True
 
     def __post_init__(self) -> None:
         validate_training_source(self.training_source)
+        revision_prompt_preset(self.revision_prompt)  # raises ValueError if unknown
 
 
 @dataclasses.dataclass
@@ -209,6 +219,8 @@ class EvaluationResult:
                 "seed": self.config.seed,
                 "train_ratio": self.config.train_ratio,
                 "training_source": self.config.training_source,
+                "revision_prompt": self.config.revision_prompt,
+                "close_think": self.config.close_think,
             },
             "dataset_name": self.dataset_name,
             "timestamp": self.timestamp,
@@ -355,6 +367,8 @@ def _build_training_example(
     item: TriviaItem,
     baseline_response: str,
     training_source: str,
+    revision_prompt: str = "default",
+    close_think: bool = True,
 ) -> tuple[TrainingExample, str | None]:
     """Build the collated training example for one item.
 
@@ -363,6 +377,9 @@ def _build_training_example(
         item: The trivia item being trained on.
         baseline_response: The model's baseline answer to ``item.question``.
         training_source: "ground_truth" or "self_generated".
+        revision_prompt: Preset name passed to ``revision_prompt_preset``; only
+            used for "self_generated".
+        close_think: Passed to ``make_collated_training_example``.
 
     Returns:
         ``(example, revision_text)``. ``revision_text`` is the model's raw
@@ -373,6 +390,7 @@ def _build_training_example(
             Callers must catch this and skip the training step.
     """
     validate_training_source(training_source)
+    instructions, dialog_style = revision_prompt_preset(revision_prompt)
     interactions = [
         InteractionHistory(
             idx=0,
@@ -387,11 +405,18 @@ def _build_training_example(
         revision = f"[[0]] {item.correct_answer} [[/0]]"
         revision_text: str | None = None
     else:
-        prompt = make_revision_prompt(interactions, tokenizer)
+        prompt = make_revision_prompt(
+            interactions,
+            tokenizer,
+            instructions=instructions,
+            dialog_style=dialog_style,
+        )
         revision = model.generate_response(prompt, use_history=False) or ""
         validate_revision_response(revision, num_interactions=len(interactions))
         revision_text = revision
-    example = make_collated_training_example(revision, interactions, tokenizer)
+    example = make_collated_training_example(
+        revision, interactions, tokenizer, close_think=close_think
+    )
     return example, revision_text
 
 
@@ -435,6 +460,8 @@ def _train_one_item(
     experiment_id: int,
     training_iterations: int,
     training_source: str,
+    revision_prompt: str = "default",
+    close_think: bool = True,
 ) -> TrainingOutcome:
     """Build the target, train, and record the event for one item.
 
@@ -443,7 +470,7 @@ def _train_one_item(
     """
     try:
         example, revision_text = _build_training_example(
-            model, item, baseline_response, training_source
+            model, item, baseline_response, training_source, revision_prompt, close_think
         )
     except InvalidRevisionError as e:
         return TrainingOutcome(
@@ -559,6 +586,8 @@ class EvaluationHarness:
                     "train_ratio": config.train_ratio,
                     "max_tokens": config.max_tokens,
                     "training_source": config.training_source,
+                    "revision_prompt": config.revision_prompt,
+                    "close_think": config.close_think,
                     "dataset_name": dataset.name,
                     "dataset_version": dataset.version,
                 }
@@ -584,6 +613,9 @@ class EvaluationHarness:
             print(f"Train: {train_count}, Holdout: {len(dataset) - train_count}")
             print(f"Config: {config.name}")
             print(f"Training source: {config.training_source}")
+            if config.training_source == "self_generated":
+                print(f"Revision prompt: {config.revision_prompt}")
+            print(f"Close think: {config.close_think}")
             print(f"Experiment ID: {experiment_id}")
             print()
 
@@ -651,6 +683,8 @@ class EvaluationHarness:
                 experiment_id,
                 config.training_iterations,
                 config.training_source,
+                config.revision_prompt,
+                config.close_think,
             )
             item_result.revision_text = outcome.revision_text
             item_result.revision_invalid = outcome.revision_invalid
@@ -723,6 +757,7 @@ class EvaluationHarness:
             print(f"Train retention rate: {result.train_retention_rate:.1%} (n={n_train})")
             print(f"Holdout accuracy: {result.holdout_accuracy:.1%}")
             if config.training_source == "self_generated":
+                print(f"Revision prompt: {config.revision_prompt}")
                 print(f"Invalid revisions (skipped): {result.revision_invalid_count}")
             print()
             print(f"Results saved to database (experiment_id={experiment_id})")

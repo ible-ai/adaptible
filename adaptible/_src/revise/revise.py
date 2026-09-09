@@ -1,7 +1,7 @@
 """Utilities for self-reflective model revisions."""
 
 import re
-from typing import Sequence, Tuple
+from typing import Literal, Sequence, Tuple
 
 import mlx.core as mx
 from transformers.tokenization_utils import PreTrainedTokenizer
@@ -27,6 +27,69 @@ REWRITE_INSTRUCTIONS = (
     "corresponds with a dialog index that already exists within the original dialog.\n"
     "* Write ONLY the improved response between the [[X]] and [[/X]] markers."
 )
+
+
+# A shorter, imperative variant with two worked examples. Meant for small models
+# that ignore the prose instructions above and re-answer the question instead of
+# emitting a marked rewrite. Pair it with dialog_style="plain" so the dialog the
+# model sees looks exactly like the examples (no chat-template special tokens).
+REWRITE_INSTRUCTIONS_FEWSHOT = (
+    "Rewrite one Assistant reply from the dialog so it is more accurate, complete, "
+    "and helpful. Output ONLY the rewrite, wrapped in the markers of the turn you "
+    "are rewriting: start with [[X]] and end with [[/X]], where X is the turn "
+    "number shown in the dialog. Do not explain your changes. Do not restate or "
+    "repeat the dialog. Do not write anything before [[X]] or after [[/X]].\n"
+    "\n"
+    "Example 1\n"
+    "Dialog:\n"
+    "[[0]] User: What is the capital of Australia?\n"
+    "Assistant: The capital of Australia is Sydney.\n"
+    "Output:\n"
+    "[[0]] The capital of Australia is Canberra. Sydney is the largest city, but "
+    "Canberra has been the capital since 1913. [[/0]]\n"
+    "\n"
+    "Example 2\n"
+    "Dialog:\n"
+    "[[0]] User: How many legs does a spider have?\n"
+    "Assistant: I am not sure, maybe six?\n"
+    "Output:\n"
+    "[[0]] A spider has eight legs. Insects have six legs, which is one way to "
+    "tell spiders and insects apart. [[/0]]\n"
+    "\n"
+    "Now do the same for the dialog below. Output only the marked rewrite."
+)
+
+# Names accepted by revision_prompt_preset (and the --revision_prompt CLI flag).
+REVISION_PROMPTS = ("default", "fewshot")
+
+DialogStyle = Literal["chat", "plain"]
+
+# Prepended to the training target when the chat template's generation prompt
+# ends with an open "<think>" tag (DeepSeek-R1-Distill renders
+# "...<｜Assistant｜><think>\n"). Without it the revision is trained *inside* an
+# unclosed think block, a sequence the model never produces at inference; the
+# model then stops reasoning after a single training example.
+THINK_CLOSE = "</think>\n\n"
+
+
+def revision_prompt_preset(name: str) -> tuple[str, DialogStyle]:
+    """Map a preset name to ``(instructions, dialog_style)`` for make_revision_prompt.
+
+    Args:
+        name: "default" (REWRITE_INSTRUCTIONS rendered through the tokenizer's chat
+            template) or "fewshot" (REWRITE_INSTRUCTIONS_FEWSHOT over a plain
+            ``User:``/``Assistant:`` dialog).
+
+    Raises:
+        ValueError: If ``name`` is not a known preset.
+    """
+    if name == "default":
+        return REWRITE_INSTRUCTIONS, "chat"
+    if name == "fewshot":
+        return REWRITE_INSTRUCTIONS_FEWSHOT, "plain"
+    raise ValueError(
+        f"revision_prompt must be one of {REVISION_PROMPTS}, got {name!r}"
+    )
 
 
 def _make_revision_prompt(
@@ -203,12 +266,25 @@ def _serialize_interactions_to_string(
     tokenizer: PreTrainedTokenizer,
     continue_final_message: bool,
     strip_thinking: bool = True,
+    dialog_style: DialogStyle = "chat",
 ) -> Tuple[str, Sequence[str]]:
+    """Render interactions as text, one entry per turn.
+
+    Args:
+        dialog_style: "chat" renders each turn through ``tokenizer.apply_chat_template``
+            (so the text carries the model's special tokens); "plain" renders
+            ``User: ...\nAssistant: ...`` with no tokenizer involvement.
+    """
+    if dialog_style not in ("chat", "plain"):
+        raise ValueError(f"dialog_style must be 'chat' or 'plain', got {dialog_style!r}")
     turns = []
     for interaction in interactions:
         llm_response = interaction.llm_response
         if strip_thinking:
             llm_response = strip_think_tags(llm_response)
+        if dialog_style == "plain":
+            turns.append(f"User: {interaction.user_input}\nAssistant: {llm_response}")
+            continue
         messages = [
             {
                 "role": "user",
@@ -227,7 +303,10 @@ def _serialize_interactions_to_string(
         turns.append(turn)
     if should_enumerate:
         turns_as_text = "\n".join(
-            [f"[[{idx}]]{turn}" for idx, turn in enumerate(turns)]
+            [
+                f"[[{idx}]]{' ' if dialog_style == 'plain' else ''}{turn}"
+                for idx, turn in enumerate(turns)
+            ]
         )
     else:
         turns_as_text = "\n".join(turns)
@@ -266,13 +345,18 @@ def make_revision_prompt(
     interactions: Sequence[InteractionHistory],
     tokenizer: PreTrainedTokenizer,
     instructions: str = REWRITE_INSTRUCTIONS,
+    dialog_style: DialogStyle = "chat",
 ) -> str:
     """Create a prompt for model self-reflective revision based on past interactions.
 
     Args:
         interactions: Past interactions.
-        tokenizer: Tokenizer. Not actually used here. TODO - fix.
-        instructions: Revision prompt.
+        tokenizer: Tokenizer whose chat template renders the dialog when
+            ``dialog_style="chat"``; unused for ``"plain"``.
+        instructions: Revision prompt pre-amble.
+        dialog_style: How the past dialog is rendered; see
+            ``_serialize_interactions_to_string``. ``revision_prompt_preset``
+            returns a matching ``(instructions, dialog_style)`` pair.
 
     Returns:
         Formatted prompt text.
@@ -282,6 +366,7 @@ def make_revision_prompt(
         should_enumerate=True,
         tokenizer=tokenizer,
         continue_final_message=False,
+        dialog_style=dialog_style,
     )
     return _make_revision_prompt(past_dialog, instructions)
 
@@ -291,14 +376,25 @@ def make_collated_training_example(
     interactions: Sequence[InteractionHistory],
     tokenizer: PreTrainedTokenizer,
     padding_token: int = 0,
+    close_think: bool = True,
 ) -> TrainingExample:
     """Convert past interactions and model revision response into a batched training example.
+
+    The prompt prefix is always the tokenizer's real chat template with
+    ``add_generation_prompt=True`` so training matches inference, regardless of
+    how the *revision prompt* rendered the dialog (see ``make_revision_prompt``'s
+    ``dialog_style``).
 
     Args:
         response: Model-generated revision response.
         interactions: Past interactions considered when generating the model response.
         tokenizer: Model-specific tokenizer.
         padding_token: Token to use for padding.
+        close_think: If the chat template's generation prompt ends with an open
+            ``<think>`` tag, prepend ``THINK_CLOSE`` to the target so it becomes
+            ``<think>\n</think>\n\n{revision}{eos}``: an empty reasoning block and
+            then the answer. ``False`` reproduces the old (malformed) target, kept
+            for comparison. No-op for templates without a think tag.
 
     Returns: a collated training example, ready for model ingestion.
 
@@ -321,11 +417,16 @@ def make_collated_training_example(
         messages, tokenize=False, add_generation_prompt=True
     )
 
+    target_text = rewritten_response + eos_tag
+    if close_think and prompt_prefix.rstrip().endswith("<think>"):
+        target_text = THINK_CLOSE + target_text
+
     def _tokenize(text: str, dtype: mx.Dtype = mx.int32) -> mx.array:
         return mx.array(tokenizer.encode(text, add_special_tokens=False), dtype=dtype)
 
     dialog_pre_revision = _tokenize(prompt_prefix)
-    revision = _tokenize(rewritten_response + eos_tag)
+    # Everything after the prefix (think close, revision, eos) is the label region.
+    revision = _tokenize(target_text)
     tokenized_rewritten_dialog = mx.concat([dialog_pre_revision, revision])
     mask = mx.concat([mx.zeros_like(dialog_pre_revision), mx.ones_like(revision)])
     # Slice mask to align with input/label dimensions:

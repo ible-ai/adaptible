@@ -37,6 +37,7 @@ from .harness import (
     _train_one_item,
     validate_training_source,
 )
+from ..revise import revision_prompt_preset
 
 # Minimum improvable+forgettable items a window needs before its rates feed the
 # meta-learning score. Below this a single item swings a rate by 20+ points.
@@ -393,6 +394,10 @@ class MetaLearningConfig:
     Attributes:
         training_source: "ground_truth" (fine-tune on the label) or
             "self_generated" (train on the model's own revision).
+        revision_prompt: Revision prompt preset for "self_generated"; see
+            ``revise.revision_prompt_preset``.
+        close_think: Close the chat template's open ``<think>`` block before
+            the training target; see ``EvaluationConfig.close_think``.
         holdout_every_checkpoint: Also probe the holdout set at every
             checkpoint (costs a holdout-sized inference pass per checkpoint).
         repeats: Run each seed this many times with an identical shuffle. Any
@@ -409,11 +414,14 @@ class MetaLearningConfig:
     train_ratio: float = 0.8  # Fraction used for training
     max_tokens: int | None = None  # Use model default if None
     training_source: str = "ground_truth"
+    revision_prompt: str = "default"
+    close_think: bool = True
     holdout_every_checkpoint: bool = False
     repeats: int = 1
 
     def __post_init__(self) -> None:
         validate_training_source(self.training_source)
+        revision_prompt_preset(self.revision_prompt)  # raises ValueError if unknown
         if self.repeats < 1:
             raise ValueError(f"repeats must be >= 1, got {self.repeats}")
 
@@ -426,6 +434,8 @@ class MetaLearningConfig:
             "train_ratio": self.train_ratio,
             "max_tokens": self.max_tokens,
             "training_source": self.training_source,
+            "revision_prompt": self.revision_prompt,
+            "close_think": self.close_think,
             "holdout_every_checkpoint": self.holdout_every_checkpoint,
             "repeats": self.repeats,
         }
@@ -440,6 +450,10 @@ class MetaLearningConfig:
             train_ratio=data["train_ratio"],
             max_tokens=data.get("max_tokens"),
             training_source=data.get("training_source", "ground_truth"),
+            revision_prompt=data.get("revision_prompt", "default"),
+            # Files written before close_think existed were trained on the
+            # unclosed-think target, so absence means False, not the new default.
+            close_think=data.get("close_think", False),
             holdout_every_checkpoint=data.get("holdout_every_checkpoint", False),
             repeats=data.get("repeats", 1),
         )
@@ -722,6 +736,9 @@ class MetaLearningExperiment:
         print("META-LEARNING SUMMARY")
         print("=" * 60)
         print(f"  Training source: {config.training_source}")
+        if config.training_source == "self_generated":
+            print(f"  Revision prompt: {config.revision_prompt}")
+        print(f"  Close think: {config.close_think}")
         for (seed, repeat), traj in sorted(result.all_trajectories.items()):
             label = f"Seed {seed}" + (f" repeat {repeat}" if config.repeats > 1 else "")
             print(f"  {label}:")
@@ -813,6 +830,8 @@ class MetaLearningExperiment:
                     "train_ratio": config.train_ratio,
                     "max_tokens": config.max_tokens,
                     "training_source": config.training_source,
+                    "revision_prompt": config.revision_prompt,
+                    "close_think": config.close_think,
                     "holdout_every_checkpoint": config.holdout_every_checkpoint,
                     "dataset_name": dataset.name,
                     "dataset_version": dataset.version,
@@ -889,6 +908,8 @@ class MetaLearningExperiment:
                     experiment_id,
                     config.training_iterations,
                     config.training_source,
+                    config.revision_prompt,
+                    config.close_think,
                 )
                 if outcome.revision_invalid:
                     revision_invalid_ids.append(item.id)

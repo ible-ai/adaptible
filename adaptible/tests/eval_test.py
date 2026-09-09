@@ -37,9 +37,17 @@ DONT_KNOW = "I do not know."
 
 
 class FakeTokenizer:
-    """One token per character; token 0 is reserved for padding."""
+    """One token per character; token 0 is reserved for padding.
+
+    Args:
+        think: Mimic DeepSeek-R1-Distill, whose generation prompt ends with an
+            open ``<think>\n``.
+    """
 
     special_tokens_map = {"eos_token": EOS}
+
+    def __init__(self, think: bool = False):
+        self.think = think
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
         del add_special_tokens
@@ -63,6 +71,8 @@ class FakeTokenizer:
         )
         if add_generation_prompt:
             text += "<assistant>"
+            if self.think:
+                text += "<think>\n"
         return text
 
 
@@ -78,6 +88,7 @@ class FakeModel:
             "invalid" -> text with no [[X]] markers; or a callable
             ``(item) -> str`` for custom revisions.
         known_at_baseline: Item ids answered correctly before any training.
+        think: Give the tokenizer a generation prompt ending in ``<think>\n``.
     """
 
     def __init__(
@@ -86,8 +97,9 @@ class FakeModel:
         learns_after: int = 0,
         revision: str | Callable[[TriviaItem], str] = "valid",
         known_at_baseline: set[str] | None = None,
+        think: bool = False,
     ):
-        self._tokenizer = FakeTokenizer()
+        self._tokenizer = FakeTokenizer(think=think)
         self._max_tokens = 4096
         self._model_is_stable = True
         self._by_question = {item.question: item for item in dataset}
@@ -106,10 +118,12 @@ class FakeModel:
         del use_history, max_tokens
         if "<PAST_DIALOG>" in prompt:
             self.revision_prompts.append(prompt)
+            # "default" dialogs go through FakeTokenizer.apply_chat_template;
+            # "fewshot" dialogs are plain "User: ..." lines.
             item = next(
                 it
                 for q, it in self._by_question.items()
-                if f"<user>{q}</user>" in prompt
+                if f"<user>{q}</user>" in prompt or f"User: {q}\n" in prompt
             )
             if callable(self._revision):
                 return self._revision(item)
@@ -243,6 +257,128 @@ class TrainingSourceTest(_TempDbTest):
         item_dicts = result.to_dict()["items"]
         self.assertTrue(any(d["revision_text"] for d in item_dicts))
 
+    def test_invalid_revision_prompt_rejected(self):
+        with self.assertRaises(ValueError):
+            EvaluationConfig(revision_prompt="zero_shot")
+        with self.assertRaises(ValueError):
+            MetaLearningConfig(revision_prompt="zero_shot")
+
+    def test_default_revision_prompt_uses_chat_template(self):
+        dataset = make_dataset(5)
+        model = FakeModel(dataset)
+        config = EvaluationConfig(
+            name="sg-default", train_ratio=0.6, training_source="self_generated"
+        )
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset, config, verbose=False
+        )
+        self.assertEqual(len(model.revision_prompts), 3)
+        for item, prompt in zip(dataset.items[:3], model.revision_prompts):
+            self.assertTrue(prompt.startswith(adaptible.revise.REWRITE_INSTRUCTIONS))
+            self.assertIn(f"[[0]]<user>{item.question}</user><assistant>", prompt)
+            self.assertNotIn(f"User: {item.question}", prompt)
+            self.assertNotIn("Example 1", prompt)
+        self.assertEqual(result.to_dict()["config"]["revision_prompt"], "default")
+        self.assertEqual(
+            self._config_json_for(self._latest_experiment_id())["revision_prompt"],
+            "default",
+        )
+
+    def test_fewshot_revision_prompt_is_plain_dialog(self):
+        dataset = make_dataset(5)
+        model = FakeModel(dataset)
+        config = EvaluationConfig(
+            name="sg-fewshot",
+            train_ratio=0.6,
+            training_source="self_generated",
+            revision_prompt="fewshot",
+        )
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset, config, verbose=False
+        )
+        self.assertEqual(len(model.revision_prompts), 3)
+        for item, prompt in zip(dataset.items[:3], model.revision_prompts):
+            self.assertTrue(
+                prompt.startswith(adaptible.revise.REWRITE_INSTRUCTIONS_FEWSHOT)
+            )
+            self.assertIn("Example 1", prompt)
+            self.assertIn("Example 2", prompt)
+            self.assertIn(
+                f"<PAST_DIALOG>\n[[0]] User: {item.question}\nAssistant: {DONT_KNOW}\n"
+                "</PAST_DIALOG>",
+                prompt,
+            )
+            # No chat-template markers from FakeTokenizer.apply_chat_template.
+            self.assertNotIn("<user>", prompt)
+            self.assertNotIn("<assistant>", prompt)
+        # Training still happens on the revision, exactly as with "default".
+        self.assertEqual(len(model.trained_targets), 3)
+        for item, target in zip(dataset.items[:3], model.trained_targets):
+            self.assertEqual(target, f"The answer is {item.correct_answer}.{EOS}")
+        self.assertEqual(result.to_dict()["config"]["revision_prompt"], "fewshot")
+        self.assertEqual(
+            self._config_json_for(self._latest_experiment_id())["revision_prompt"],
+            "fewshot",
+        )
+        path = generate_html_report(result, self.tmp_path / "fewshot.html")
+        self.assertIn("<code>fewshot</code>", pathlib.Path(path).read_text())
+
+    def test_close_think_closes_open_think_block(self):
+        dataset = make_dataset(4)
+        for source in ("ground_truth", "self_generated"):
+            model = FakeModel(dataset, think=True)
+            config = EvaluationConfig(name=f"ct-{source}", training_source=source)
+            result = EvaluationHarness(model=model, db=self.db).run(
+                dataset, config, verbose=False
+            )
+            self.assertEqual(len(model.trained_targets), 3)
+            body = "{answer}" if source == "ground_truth" else "The answer is {answer}."
+            for item, target in zip(dataset.items[:3], model.trained_targets):
+                self.assertEqual(
+                    target,
+                    f"</think>\n\n{body.format(answer=item.correct_answer)}{EOS}",
+                )
+            self.assertEqual(result.train_post_accuracy, 1.0)
+            self.assertIs(result.to_dict()["config"]["close_think"], True)
+            self.assertIs(
+                self._config_json_for(self._latest_experiment_id())["close_think"], True
+            )
+            text = pathlib.Path(
+                generate_html_report(result, self.tmp_path / f"{source}-ct.html")
+            ).read_text()
+            self.assertIn("Close think: <code>True</code>", text)
+
+    def test_noclose_think_reproduces_old_target(self):
+        dataset = make_dataset(4)
+        model = FakeModel(dataset, think=True)
+        config = EvaluationConfig(name="noct", close_think=False)
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset, config, verbose=False
+        )
+        for item, target in zip(dataset.items[:3], model.trained_targets):
+            self.assertEqual(target, f"{item.correct_answer}{EOS}")
+        self.assertIs(result.to_dict()["config"]["close_think"], False)
+        self.assertIs(
+            self._config_json_for(self._latest_experiment_id())["close_think"], False
+        )
+
+    def test_close_think_noop_without_think_template(self):
+        dataset = make_dataset(4)
+        model = FakeModel(dataset)  # template ends in <assistant>
+        EvaluationHarness(model=model, db=self.db).run(
+            dataset, EvaluationConfig(name="plain"), verbose=False
+        )
+        for item, target in zip(dataset.items[:3], model.trained_targets):
+            self.assertEqual(target, f"{item.correct_answer}{EOS}")
+
+    def test_ground_truth_ignores_revision_prompt(self):
+        dataset = make_dataset(4)
+        model = FakeModel(dataset)
+        config = EvaluationConfig(name="gt-fs", revision_prompt="fewshot")
+        EvaluationHarness(model=model, db=self.db).run(dataset, config, verbose=False)
+        self.assertEqual(model.revision_prompts, [])
+        self.assertEqual(len(model.trained_targets), 3)
+
     def test_invalid_revision_is_counted_and_skipped(self):
         dataset = make_dataset(5)
         model = FakeModel(dataset, revision="invalid")
@@ -346,6 +482,54 @@ class MetaLearningTest(_TempDbTest):
         self.assertEqual(
             self._config_json_for(traj.experiment_id)["training_source"],
             "self_generated",
+        )
+
+    def test_meta_close_think_threads_through(self):
+        dataset = make_dataset(10)
+        for close_think in (True, False):
+            model = FakeModel(dataset, think=True)
+            config = MetaLearningConfig(
+                name=f"ct{close_think}",
+                seeds=[1],
+                checkpoint_interval=4,
+                train_ratio=0.8,
+                close_think=close_think,
+            )
+            result = self._run(dataset, config, factory=lambda: model)
+            traj = result.trajectories[1]
+            self.assertEqual(len(model.trained_targets), 8)
+            for target in model.trained_targets:
+                self.assertEqual(target.startswith("</think>\n\n"), close_think)
+            self.assertIs(self._config_json_for(traj.experiment_id)["close_think"], close_think)
+            self.assertIs(result.to_dict()["config"]["close_think"], close_think)
+            self.assertIs(
+                MetaLearningConfig.from_dict(config.to_dict()).close_think, close_think
+            )
+
+    def test_meta_fewshot_revision_prompt_threads_through(self):
+        dataset = make_dataset(10)
+        model = FakeModel(dataset)
+        config = MetaLearningConfig(
+            name="sg-fs",
+            seeds=[1],
+            checkpoint_interval=4,
+            train_ratio=0.8,
+            training_source="self_generated",
+            revision_prompt="fewshot",
+        )
+        result = self._run(dataset, config, factory=lambda: model)
+        traj = result.trajectories[1]
+        self.assertEqual(len(model.revision_prompts), 8)
+        for prompt in model.revision_prompts:
+            self.assertIn("Example 2", prompt)
+            self.assertIn("User: ", prompt)
+            self.assertNotIn("<user>", prompt)
+        self.assertEqual(
+            self._config_json_for(traj.experiment_id)["revision_prompt"], "fewshot"
+        )
+        self.assertEqual(result.to_dict()["config"]["revision_prompt"], "fewshot")
+        self.assertEqual(
+            MetaLearningConfig.from_dict(config.to_dict()).revision_prompt, "fewshot"
         )
 
     def test_window_metrics_from_scripted_learning(self):
