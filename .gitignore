@@ -22,3 +22,4 @@ adaptible/tests/artifacts/*.html
 outputs/runs/*.log
 outputs/runs/nohup.out
 outputs/runs/status.txt
+outputs/runs/nohup_2x2.out
