@@ -17,3 +17,8 @@ outputs/**/logs/
 
 # Generated test reports
 adaptible/tests/artifacts/*.html
+
+# experiment launcher scratch
+outputs/runs/*.log
+outputs/runs/nohup.out
+outputs/runs/status.txt
