@@ -13,8 +13,15 @@ Options:
                           "self_generated" (train on the model's own revision)
     --revision-prompt P   Revision prompt preset for self_generated:
                           "default" or "fewshot"
-    --[no]close_think     Close the chat template's open <think> block before
-                          the training target (default: on)
+    --think_mode M        How the training target treats the chat template's
+                          open <think> block: "baseline" (model's own reasoning
+                          in the unmasked prefix, answer only in the loss; the
+                          default), "empty" (train on "</think>\n\n{answer}"),
+                          or "none" (old malformed target, for comparison)
+    --[no]close_think     Deprecated alias: --noclose_think == --think_mode none
+    --rehearsal_k K       Batch each correction with K self-distillation examples
+                          from correct trained-split items (default: 0)
+    --learning_rate LR    Optimizer learning rate for StatefulLLM (default: model's)
     --subset N            Only use first N items (for quick tests)
     --category CAT        Filter to specific category
     --output PATH         Output path for HTML report
@@ -36,7 +43,7 @@ from . import (
     load_dataset,
     save_dataset,
 )
-from ..revise import REVISION_PROMPTS
+from ..revise import REVISION_PROMPTS, THINK_MODES
 
 _NAME = flags.DEFINE_string("name", "default", "Experiment name")
 _TRAIN_RATIO = flags.DEFINE_float("train_ratio", 0.8, "Train/holdout split ratio")
@@ -58,13 +65,30 @@ _REVISION_PROMPT = flags.DEFINE_string(
     "two worked examples over a plain User:/Assistant: dialog (no chat-template "
     "tokens).",
 )
+_THINK_MODE = flags.DEFINE_enum(
+    "think_mode",
+    "baseline",
+    list(THINK_MODES),
+    "How the training target treats the chat template's open <think> tag. "
+    "'baseline': the model's own reasoning from its baseline response goes in "
+    "the unmasked prefix and only the corrected answer is trained on. 'empty': "
+    "train on '</think>\\n\\n{revision}' (teaches the model to stop reasoning). "
+    "'none': the old malformed target (revision inside the open think block).",
+)
 _CLOSE_THINK = flags.DEFINE_boolean(
     "close_think",
-    True,
-    "If the chat template's generation prompt ends with an open <think> tag, "
-    "train on '</think>\\n\\n{revision}' so the target is a well-formed sequence. "
-    "--noclose_think reproduces the old target (revision inside the open think "
-    "block) for comparison.",
+    None,
+    "Deprecated; use --think_mode. --noclose_think is --think_mode none.",
+)
+_REHEARSAL_K = flags.DEFINE_integer(
+    "rehearsal_k",
+    0,
+    "Batch each correction with K rehearsal examples: other trained-split items "
+    "the model already answered correctly, trained on their own baseline output "
+    "(self-distillation). 0 disables.",
+)
+_LEARNING_RATE = flags.DEFINE_float(
+    "learning_rate", None, "StatefulLLM learning rate (default: the model's)."
 )
 _SUBSET = flags.DEFINE_integer("subset", None, "Only use first N items")
 _CATEGORY = flags.DEFINE_string("category", None, "Filter to specific category")
@@ -115,8 +139,13 @@ def main(_):
         train_ratio=_TRAIN_RATIO.value,
         training_source=_TRAINING_SOURCE.value,
         revision_prompt=_REVISION_PROMPT.value,
+        think_mode=_THINK_MODE.value,
         close_think=_CLOSE_THINK.value,
+        rehearsal_k=_REHEARSAL_K.value,
     )
+    model_kwargs = {}
+    if _LEARNING_RATE.value is not None:
+        model_kwargs["learning_rate"] = _LEARNING_RATE.value
 
     # Run evaluation
     print()
@@ -125,7 +154,7 @@ def main(_):
     print("=" * 70)
     print()
 
-    harness = EvaluationHarness()
+    harness = EvaluationHarness(model_kwargs=model_kwargs)
     result = harness.run(dataset, config, verbose=True)
 
     # Generate report

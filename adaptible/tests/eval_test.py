@@ -9,6 +9,8 @@ by ``make_collated_training_example`` can be decoded back to text.
 
 import json
 import pathlib
+import subprocess
+import sys
 import tempfile
 import unittest
 import warnings
@@ -32,9 +34,17 @@ TriviaItem = eval_mod.TriviaItem
 contains_key_terms = eval_mod.contains_key_terms
 extract_revision = harness.extract_revision
 generate_html_report = eval_mod.generate_html_report
+ItemResult = harness.ItemResult
+EvaluationResult = harness.EvaluationResult
 
 EOS = "<eos>"
 DONT_KNOW = "I do not know."
+REPO_ROOT = pathlib.Path(__file__).parents[2]
+
+
+def fake_think(item: TriviaItem) -> str:
+    """The reasoning FakeModel(think=True) emits before ``</think>``."""
+    return f"Thinking about {item.id}."
 
 
 class FakeTokenizer:
@@ -91,7 +101,9 @@ class FakeModel:
             ``item_id -> revision text`` scripting each item individually
             (items missing from the dict get the "valid" revision).
         known_at_baseline: Item ids answered correctly before any training.
-        think: Give the tokenizer a generation prompt ending in ``<think>\n``.
+        think: Give the tokenizer a generation prompt ending in ``<think>\n``
+            and make every trivia answer carry ``fake_think(item)`` before
+            ``</think>``, the way DeepSeek-R1-Distill does.
     """
 
     def __init__(
@@ -103,6 +115,7 @@ class FakeModel:
         think: bool = False,
     ):
         self._tokenizer = FakeTokenizer(think=think)
+        self._think = think
         self._max_tokens = 4096
         self._model_is_stable = True
         self._by_question = {item.question: item for item in dataset}
@@ -112,6 +125,9 @@ class FakeModel:
         self.learned: set[str] = set(known_at_baseline or set())
         self.train_calls = 0
         self.trained_targets: list[str] = []
+        # Every row of every batch: (decoded masked target, decoded full sequence).
+        self.trained_batches: list[list[tuple[str, str]]] = []
+        self.batch_shapes: list[tuple[int, int]] = []
         self.revision_prompts: list[str] = []
         self.question_prompts: list[str] = []
 
@@ -137,15 +153,23 @@ class FakeModel:
             return f"[[0]] The answer is {item.correct_answer}. [[/0]]"
         self.question_prompts.append(prompt)
         item = self._by_question[prompt]
-        if item.id in self.learned:
-            return f"It is {item.correct_answer}."
-        return DONT_KNOW
+        answer = f"It is {item.correct_answer}." if item.id in self.learned else DONT_KNOW
+        if self._think:
+            return f"{fake_think(item)}\n</think>\n\n{answer}"
+        return answer
 
     def train_on_example(self, example, iterations: int = 25, **kwargs) -> None:
         del iterations, kwargs
-        labels = example.label.tolist()[0]
-        mask = example.mask.tolist()[0]
-        target = self._tokenizer.decode(t for t, m in zip(labels, mask) if m)
+        self.batch_shapes.append(tuple(example.mask.shape))
+        rows = []
+        for inputs, labels, mask in zip(
+            example.input.tolist(), example.label.tolist(), example.mask.tolist()
+        ):
+            masked = self._tokenizer.decode(t for t, m in zip(labels, mask) if m)
+            full = self._tokenizer.decode([inputs[0]] + labels)
+            rows.append((masked, full))
+        self.trained_batches.append(rows)
+        target = rows[0][0]
         self.trained_targets.append(target)
         self.train_calls += 1
         if self.train_calls <= self._learns_after:
@@ -346,53 +370,128 @@ class TrainingSourceTest(_TempDbTest):
         path = generate_html_report(result, self.tmp_path / "fewshot.html")
         self.assertIn("<code>fewshot</code>", pathlib.Path(path).read_text())
 
-    def test_close_think_closes_open_think_block(self):
+    def test_think_mode_baseline_is_default_and_keeps_reasoning_unmasked(self):
         dataset = make_dataset(4)
         for source in ("ground_truth", "self_generated"):
             model = FakeModel(dataset, think=True)
-            config = EvaluationConfig(name=f"ct-{source}", training_source=source)
+            config = EvaluationConfig(name=f"tm-{source}", training_source=source)
+            self.assertEqual(config.think_mode, "baseline")
+            self.assertIs(config.close_think, True)
             result = EvaluationHarness(model=model, db=self.db).run(
                 dataset, config, verbose=False
             )
-            self.assertEqual(len(model.trained_targets), 3)
+            self.assertEqual(len(model.trained_batches), 3)
             body = "{answer}" if source == "ground_truth" else "The answer is {answer}."
-            for item, target in zip(dataset.items[:3], model.trained_targets):
+            for item, (masked, full) in zip(
+                dataset.items[:3], (b[0] for b in model.trained_batches)
+            ):
+                target = f"{body.format(answer=item.correct_answer)}{EOS}"
+                # Only the corrected answer is in the loss...
+                self.assertEqual(masked, target)
+                # ...and the model's own reasoning sits in the unmasked prefix.
                 self.assertEqual(
-                    target,
-                    f"</think>\n\n{body.format(answer=item.correct_answer)}{EOS}",
+                    full,
+                    f"<user>{item.question}</user><assistant><think>\n"
+                    f"{fake_think(item)}\n</think>\n\n{target}",
                 )
             self.assertEqual(result.train_post_accuracy, 1.0)
-            self.assertIs(result.to_dict()["config"]["close_think"], True)
-            self.assertIs(
-                self._config_json_for(self._latest_experiment_id())["close_think"], True
-            )
+            d = result.to_dict()["config"]
+            self.assertEqual(d["think_mode"], "baseline")
+            self.assertIs(d["close_think"], True)
+            self.assertEqual(d["rehearsal_k"], 0)
+            cfg = self._config_json_for(self._latest_experiment_id())
+            self.assertEqual(cfg["think_mode"], "baseline")
+            self.assertEqual(cfg["rehearsal_k"], 0)
+            self.assertEqual(cfg["model_kwargs"], {})
             text = pathlib.Path(
-                generate_html_report(result, self.tmp_path / f"{source}-ct.html")
+                generate_html_report(result, self.tmp_path / f"{source}-tm.html")
             ).read_text()
-            self.assertIn("Close think: <code>True</code>", text)
+            self.assertIn("Think mode: <code>baseline</code>", text)
+            self.assertIn("Rehearsal k: <code>0</code>", text)
 
-    def test_noclose_think_reproduces_old_target(self):
+    def test_think_mode_empty_closes_open_think_block(self):
         dataset = make_dataset(4)
         model = FakeModel(dataset, think=True)
-        config = EvaluationConfig(name="noct", close_think=False)
-        result = EvaluationHarness(model=model, db=self.db).run(
-            dataset, config, verbose=False
-        )
+        config = EvaluationConfig(name="empty", think_mode="empty")
+        EvaluationHarness(model=model, db=self.db).run(dataset, config, verbose=False)
         for item, target in zip(dataset.items[:3], model.trained_targets):
-            self.assertEqual(target, f"{item.correct_answer}{EOS}")
-        self.assertIs(result.to_dict()["config"]["close_think"], False)
-        self.assertIs(
-            self._config_json_for(self._latest_experiment_id())["close_think"], False
+            self.assertEqual(target, f"</think>\n\n{item.correct_answer}{EOS}")
+        self.assertEqual(
+            self._config_json_for(self._latest_experiment_id())["think_mode"], "empty"
         )
 
-    def test_close_think_noop_without_think_template(self):
+    def test_think_mode_none_and_deprecated_close_think_false(self):
         dataset = make_dataset(4)
-        model = FakeModel(dataset)  # template ends in <assistant>
+        for kwargs in ({"think_mode": "none"}, {"close_think": False}):
+            model = FakeModel(dataset, think=True)
+            config = EvaluationConfig(name="none", **kwargs)
+            self.assertEqual(config.think_mode, "none")
+            self.assertIs(config.close_think, False)
+            result = EvaluationHarness(model=model, db=self.db).run(
+                dataset, config, verbose=False
+            )
+            for item, (masked, full) in zip(
+                dataset.items[:3], (b[0] for b in model.trained_batches)
+            ):
+                self.assertEqual(masked, f"{item.correct_answer}{EOS}")
+                self.assertTrue(full.endswith(f"<think>\n{item.correct_answer}{EOS}"))
+            self.assertEqual(result.to_dict()["config"]["think_mode"], "none")
+            self.assertIs(result.to_dict()["config"]["close_think"], False)
+            cfg = self._config_json_for(self._latest_experiment_id())
+            self.assertEqual(cfg["think_mode"], "none")
+            self.assertIs(cfg["close_think"], False)
+
+    def test_think_mode_validation(self):
+        with self.assertRaises(ValueError):
+            EvaluationConfig(think_mode="reasoning")
+        with self.assertRaises(ValueError):
+            EvaluationConfig(think_mode="none", close_think=True)
+        with self.assertRaises(ValueError):
+            EvaluationConfig(rehearsal_k=-1)
+        with self.assertRaises(ValueError):
+            MetaLearningConfig(think_mode="reasoning")
+        with self.assertRaises(ValueError):
+            MetaLearningConfig(rehearsal_k=-1)
+
+    def test_think_mode_baseline_falls_back_to_empty_without_reasoning(self):
+        dataset = make_dataset(4)
+        # Think template, but the model's baseline answers carry no reasoning.
+        model = FakeModel(dataset, think=False)
+        model._tokenizer = FakeTokenizer(think=True)
         EvaluationHarness(model=model, db=self.db).run(
-            dataset, EvaluationConfig(name="plain"), verbose=False
+            dataset, EvaluationConfig(name="fallback"), verbose=False
         )
         for item, target in zip(dataset.items[:3], model.trained_targets):
-            self.assertEqual(target, f"{item.correct_answer}{EOS}")
+            self.assertEqual(target, f"</think>\n\n{item.correct_answer}{EOS}")
+
+    def test_think_mode_noop_without_think_template(self):
+        dataset = make_dataset(4)
+        for mode in ("none", "empty", "baseline"):
+            model = FakeModel(dataset)  # template ends in <assistant>
+            EvaluationHarness(model=model, db=self.db).run(
+                dataset, EvaluationConfig(name="plain", think_mode=mode), verbose=False
+            )
+            for item, target in zip(dataset.items[:3], model.trained_targets):
+                self.assertEqual(target, f"{item.correct_answer}{EOS}")
+
+    def test_model_kwargs_are_recorded_and_used_lazily(self):
+        dataset = make_dataset(4)
+        model = FakeModel(dataset)
+        h = EvaluationHarness(model=model, db=self.db, model_kwargs={"learning_rate": 1e-5})
+        h.run(dataset, EvaluationConfig(name="lr"), verbose=False)
+        self.assertEqual(
+            self._config_json_for(self._latest_experiment_id())["model_kwargs"],
+            {"learning_rate": 1e-5},
+        )
+        # The lazy path forwards the kwargs to StatefulLLM.
+        seen = {}
+        original = harness.StatefulLLM
+        harness.StatefulLLM = lambda **kw: seen.update(kw) or model
+        try:
+            EvaluationHarness(db=self.db, model_kwargs={"learning_rate": 2e-5}).model
+        finally:
+            harness.StatefulLLM = original
+        self.assertEqual(seen, {"learning_rate": 2e-5})
 
     def test_ground_truth_ignores_revision_prompt(self):
         dataset = make_dataset(4)
@@ -646,27 +745,88 @@ class MetaLearningTest(_TempDbTest):
             "self_generated",
         )
 
-    def test_meta_close_think_threads_through(self):
+    def test_meta_think_mode_threads_through(self):
         dataset = make_dataset(10)
-        for close_think in (True, False):
+        expectations = {
+            "baseline": lambda item, answer: (
+                f"{answer}{EOS}",
+                f"<user>{item.question}</user><assistant><think>\n"
+                f"{fake_think(item)}\n</think>\n\n{answer}{EOS}",
+            ),
+            "empty": lambda item, answer: (
+                f"</think>\n\n{answer}{EOS}",
+                f"<user>{item.question}</user><assistant><think>\n"
+                f"</think>\n\n{answer}{EOS}",
+            ),
+            "none": lambda item, answer: (
+                f"{answer}{EOS}",
+                f"<user>{item.question}</user><assistant><think>\n{answer}{EOS}",
+            ),
+        }
+        by_question = {item.question: item for item in dataset}
+        for think_mode, expect in expectations.items():
             model = FakeModel(dataset, think=True)
             config = MetaLearningConfig(
-                name=f"ct{close_think}",
+                name=f"tm-{think_mode}",
                 seeds=[1],
                 checkpoint_interval=4,
                 train_ratio=0.8,
-                close_think=close_think,
+                think_mode=think_mode,
             )
             result = self._run(dataset, config, factory=lambda: model)
             traj = result.trajectories[1]
-            self.assertEqual(len(model.trained_targets), 8)
-            for target in model.trained_targets:
-                self.assertEqual(target.startswith("</think>\n\n"), close_think)
-            self.assertIs(self._config_json_for(traj.experiment_id)["close_think"], close_think)
-            self.assertIs(result.to_dict()["config"]["close_think"], close_think)
-            self.assertIs(
-                MetaLearningConfig.from_dict(config.to_dict()).close_think, close_think
+            self.assertEqual(len(model.trained_batches), 8)
+            for masked, full in (b[0] for b in model.trained_batches):
+                item = next(i for q, i in by_question.items() if f"<user>{q}</user>" in full)
+                self.assertEqual((masked, full), expect(item, item.correct_answer))
+            cfg = self._config_json_for(traj.experiment_id)
+            self.assertEqual(cfg["think_mode"], think_mode)
+            self.assertIs(cfg["close_think"], think_mode != "none")
+            self.assertEqual(cfg["rehearsal_k"], 0)
+            self.assertEqual(cfg["model_kwargs"], {})
+            self.assertEqual(result.to_dict()["config"]["think_mode"], think_mode)
+            self.assertEqual(
+                MetaLearningConfig.from_dict(config.to_dict()).think_mode, think_mode
             )
+        # Deprecated alias.
+        self.assertEqual(MetaLearningConfig(close_think=False).think_mode, "none")
+        # Legacy files: only close_think, or neither.
+        base = {"name": "x", "seeds": [1], "checkpoint_interval": 1,
+                "training_iterations": 1, "train_ratio": 0.5}
+        self.assertEqual(MetaLearningConfig.from_dict(base).think_mode, "none")
+        self.assertEqual(
+            MetaLearningConfig.from_dict({**base, "close_think": True}).think_mode, "empty"
+        )
+        self.assertEqual(
+            MetaLearningConfig.from_dict({**base, "close_think": False}).think_mode, "none"
+        )
+
+    def test_meta_rehearsal_and_model_kwargs(self):
+        dataset = make_dataset(10)
+        # seed 1 shuffle of 10 items: 8 trained, 2 holdout. Everything is known
+        # at baseline so the rehearsal pool is the whole trained split.
+        model = FakeModel(dataset, think=True, known_at_baseline={i.id for i in dataset})
+        config = MetaLearningConfig(
+            name="reh", seeds=[1], checkpoint_interval=4, train_ratio=0.8, rehearsal_k=2
+        )
+        experiment = MetaLearningExperiment(
+            model_factory=lambda: model, db=self.db, model_kwargs={"learning_rate": 3e-5}
+        )
+        result = experiment.run(dataset, config, verbose=False)
+        traj = result.trajectories[1]
+        self.assertEqual(len(model.batch_shapes), 8)
+        self.assertTrue(all(shape[0] == 3 for shape in model.batch_shapes))
+        holdout_questions = {
+            dataset[idx].question for idx in traj_holdout_indices(dataset, seed=1)
+        }
+        for rows in model.trained_batches:
+            for masked, full in rows[1:]:
+                q = full.split("<user>")[1].split("</user>")[0]
+                self.assertNotIn(q, holdout_questions)
+                self.assertRegex(masked, r"^Thinking about q\d\d\.\n</think>\n\nIt is Answer\d+\.<eos>$")
+        cfg = self._config_json_for(traj.experiment_id)
+        self.assertEqual(cfg["rehearsal_k"], 2)
+        self.assertEqual(cfg["model_kwargs"], {"learning_rate": 3e-5})
 
     def test_meta_fewshot_revision_prompt_threads_through(self):
         dataset = make_dataset(10)
@@ -849,6 +1009,245 @@ class MetaLearningTest(_TempDbTest):
         self.assertTrue(any(w.category is DeprecationWarning for w in caught))
         self.assertEqual(traj.final_trained_accuracy, 0.5)
         self.assertIn("final_trained_accuracy", traj.to_dict())
+
+
+def traj_holdout_indices(dataset, seed: int) -> list[int]:
+    """The holdout indices MetaLearningExperiment picks for ``seed`` (train_ratio 0.8)."""
+    import random
+
+    random.seed(seed)
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    return indices[int(len(indices) * 0.8) :]
+
+
+class RehearsalTest(_TempDbTest):
+    """rehearsal_k batches self-distillation rows with each correction."""
+
+    def test_rehearsal_batch_shape_rows_and_padding(self):
+        # 6 items, train_ratio 5/6 -> q00..q04 trained, q05 holdout.
+        # q01, q03 and q05 are known at baseline: the pool is {q01, q03} (q05 is
+        # holdout and must never be rehearsed).
+        dataset = make_dataset(6)
+        model = FakeModel(dataset, think=True, known_at_baseline={"q01", "q03", "q05"})
+        config = EvaluationConfig(name="reh", train_ratio=5 / 6, rehearsal_k=2, seed=7)
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset, config, verbose=False
+        )
+        by_id = {item.item_id: item for item in result.items}
+
+        # One train_on_example call per trained item.
+        self.assertEqual(model.train_calls, 5)
+        self.assertEqual(len(model.batch_shapes), 5)
+        for i, (item, rows, shape) in enumerate(
+            zip(dataset.items[:5], model.trained_batches, model.batch_shapes)
+        ):
+            pool = [pid for pid in ("q01", "q03") if pid != item.id]
+            self.assertEqual(shape[0], 1 + len(pool))  # (1+k, L), k capped at the pool
+            # Row 0 is the correction with the model's own reasoning unmasked.
+            masked, full = rows[0]
+            self.assertEqual(masked, f"{item.correct_answer}{EOS}")
+            self.assertIn(f"{fake_think(item)}\n</think>\n\n", full)
+            # The other rows are correct-baseline items, never the item itself,
+            # trained on their own full baseline output.
+            rehearsed = []
+            for masked, full in rows[1:]:
+                r_item = next(
+                    it for it in dataset.items if f"<user>{it.question}</user>" in full
+                )
+                rehearsed.append(r_item.id)
+                self.assertNotEqual(r_item.id, item.id)
+                self.assertIn(r_item.id, pool)
+                baseline_raw = by_id[r_item.id].initial_response_raw
+                self.assertEqual(masked, f"{baseline_raw}{EOS}")
+                self.assertEqual(
+                    full,
+                    f"<user>{r_item.question}</user><assistant><think>\n{baseline_raw}{EOS}",
+                )
+            self.assertEqual(sorted(rehearsed), sorted(pool))
+            self.assertEqual(sorted(by_id[item.id].rehearsal_item_ids), sorted(pool))
+        # Holdout items are untouched and have no rehearsal ids.
+        self.assertEqual(by_id["q05"].rehearsal_item_ids, [])
+        self.assertNotIn("q05", {rid for r in result.items for rid in r.rehearsal_item_ids})
+        d = result.to_dict()
+        self.assertEqual(d["config"]["rehearsal_k"], 2)
+        self.assertEqual(
+            self._config_json_for(self._latest_experiment_id())["rehearsal_k"], 2
+        )
+        self.assertTrue(
+            any(i["rehearsal_item_ids"] for i in d["items"] if i["was_trained"])
+        )
+
+    def test_rehearsal_padding_has_zero_mask(self):
+        # Rows differ in length, so the collated batch is padded; padded
+        # positions carry mask 0 and the pad id (eos here, since the fake
+        # tokenizer has no pad id).
+        dataset = make_dataset(3)
+        model = FakeModel(dataset, think=True, known_at_baseline={"q01"})
+        tok = model._tokenizer
+        tok.eos_token_id = 99999
+        captured = []
+        original = model.train_on_example
+        model.train_on_example = lambda ex, **kw: (captured.append(ex), original(ex, **kw))
+        EvaluationHarness(model=model, db=self.db).run(
+            dataset, EvaluationConfig(name="pad", train_ratio=1.0, rehearsal_k=1),
+            verbose=False,
+        )
+        self.assertEqual(len(captured), 3)
+        for ex in captured:
+            n_rows, length = ex.mask.shape
+            self.assertEqual(ex.input.shape, (n_rows, length))
+            self.assertEqual(ex.label.shape, (n_rows, length))
+            masks = ex.mask.tolist()
+            labels = ex.label.tolist()
+            inputs = ex.input.tolist()
+            lengths = [
+                max(i for i, t in enumerate(row) if t != 99999) + 1 for row in inputs
+            ]
+            self.assertTrue(any(l < length for l in lengths) or n_rows == 1)
+            for row_mask, row_label, row_len in zip(masks, labels, lengths):
+                if row_len < length:
+                    self.assertEqual(row_mask[row_len:], [0] * (length - row_len))
+                    self.assertEqual(row_label[row_len:], [99999] * (length - row_len))
+                # The last real label of every row is <eos> (masked in).
+                self.assertEqual(row_mask[row_len - 1], 1)
+
+    def test_rehearsal_with_empty_pool_trains_single_row(self):
+        dataset = make_dataset(4)
+        model = FakeModel(dataset, think=True)  # nothing correct at baseline
+        EvaluationHarness(model=model, db=self.db).run(
+            dataset, EvaluationConfig(name="nopool", rehearsal_k=3), verbose=False
+        )
+        self.assertTrue(all(shape[0] == 1 for shape in model.batch_shapes))
+
+    def test_rehearsal_sampling_is_seeded(self):
+        dataset = make_dataset(12)
+        known = {f"q{i:02d}" for i in range(12)}
+        ids = []
+        for _ in range(2):
+            model = FakeModel(dataset, think=True, known_at_baseline=known)
+            result = EvaluationHarness(model=model, db=self.db).run(
+                dataset, EvaluationConfig(name="seeded", rehearsal_k=2, seed=3),
+                verbose=False,
+            )
+            ids.append([i.rehearsal_item_ids for i in result.items if i.was_trained])
+        self.assertEqual(ids[0], ids[1])
+        self.assertTrue(all(len(r) == 2 for r in ids[0]))
+
+
+class CollapseSummaryTest(unittest.TestCase):
+    """EvaluationResult token/empty-think/holdout summaries from scripted results."""
+
+    @staticmethod
+    def _item(i, trained, init_ok, post_ok, init_tok, post_tok, post_raw):
+        return ItemResult(
+            item_id=f"q{i}",
+            question=f"Q{i}",
+            correct_answer="A",
+            key_terms=["a"],
+            initial_response="x",
+            initial_response_raw="x",
+            initial_has_key_terms=init_ok,
+            post_response="y",
+            post_response_raw=post_raw,
+            post_has_key_terms=post_ok,
+            was_trained=trained,
+            initial_token_count=init_tok,
+            post_token_count=post_tok,
+        )
+
+    def test_summary_fields(self):
+        result = EvaluationResult(
+            config=EvaluationConfig(name="s"), dataset_name="d", timestamp="t"
+        )
+        result.items = [
+            self._item(0, True, False, True, 700, 8, "</think>\n\nA"),
+            self._item(1, True, True, True, 800, 12, "  </think>\n\nA"),
+            self._item(2, False, True, False, 600, 10, "reason\n</think>\n\nB"),
+            self._item(3, False, False, True, 500, 10, "</think>\n\nA"),
+            self._item(4, False, True, True, 400, 10, "</think>\n\nA"),
+        ]
+        self.assertAlmostEqual(result.mean_baseline_tokens, 600.0)
+        self.assertAlmostEqual(result.mean_post_tokens, 10.0)
+        self.assertEqual(result.post_empty_think_count, 4)
+        self.assertEqual(result.post_count, 5)
+        self.assertEqual(
+            result.collapse_summary_text(),
+            "Response length: baseline 600 tok → post 10 tok; empty-think responses "
+            "after training: 4/5",
+        )
+        self.assertEqual(result.holdout_total, 3)
+        self.assertEqual(result.holdout_correct, 2)
+        self.assertEqual(result.holdout_baseline_correct, 2)
+        self.assertEqual(
+            result.holdout_summary_text(),
+            "Holdout accuracy: 66.7% (2/3, baseline 2/3)",
+        )
+        metrics = result.to_dict()["metrics"]
+        self.assertEqual(metrics["mean_baseline_tokens"], 600.0)
+        self.assertEqual(metrics["mean_post_tokens"], 10.0)
+        self.assertEqual(metrics["post_empty_think_count"], 4)
+        self.assertEqual(metrics["holdout_baseline_correct"], 2)
+
+    def test_summary_before_post_pass(self):
+        result = EvaluationResult(
+            config=EvaluationConfig(name="s"), dataset_name="d", timestamp="t"
+        )
+        result.items = [
+            ItemResult(
+                item_id="q", question="Q", correct_answer="A", key_terms=["a"],
+                initial_response="x", initial_response_raw="x",
+                initial_has_key_terms=False, initial_token_count=42,
+            )
+        ]
+        self.assertEqual(result.mean_baseline_tokens, 42.0)
+        self.assertEqual(result.mean_post_tokens, 0.0)
+        self.assertEqual(result.post_empty_think_count, 0)
+        self.assertEqual(result.post_count, 0)
+
+    def test_harness_records_token_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = adaptible.Database(pathlib.Path(tmp) / "t.db")
+            dataset = make_dataset(3)
+            model = FakeModel(dataset, think=True, known_at_baseline={"q02"})
+            result = EvaluationHarness(model=model, db=db).run(
+                dataset, EvaluationConfig(name="tok", train_ratio=2 / 3), verbose=False
+            )
+            for item in result.items:
+                self.assertEqual(item.initial_token_count, len(item.initial_response_raw))
+                self.assertEqual(item.post_token_count, len(item.post_response_raw))
+            self.assertEqual(result.post_empty_think_count, 0)
+            self.assertEqual(
+                result.holdout_summary_text(), "Holdout accuracy: 100.0% (1/1, baseline 1/1)"
+            )
+
+
+class CliFlagsTest(unittest.TestCase):
+    """Both CLIs expose the new absl flags."""
+
+    EXPECTED = ("--think_mode", "--rehearsal_k", "--learning_rate", "--[no]close_think")
+
+    def _helpfull(self, *argv) -> str:
+        proc = subprocess.run(
+            [sys.executable, *argv, "--helpfull"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        return proc.stdout + proc.stderr
+
+    def test_eval_cli_flags(self):
+        text = self._helpfull("-m", "adaptible.eval")
+        for flag in self.EXPECTED:
+            self.assertIn(flag, text)
+        self.assertIn("<none|empty|baseline>", text)
+
+    def test_meta_cli_flags(self):
+        text = self._helpfull("scripts/run_meta_experiment.py")
+        for flag in self.EXPECTED:
+            self.assertIn(flag, text)
+        self.assertIn("<none|empty|baseline>", text)
 
 
 class LegacyLoadTest(_TempDbTest):

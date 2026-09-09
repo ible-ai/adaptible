@@ -17,8 +17,13 @@ Options:
                             "self_generated" (train on the model's own revision)
     --revision-prompt P     Revision prompt preset for self_generated:
                             "default" or "fewshot"
-    --[no]close_think       Close the chat template's open <think> block before
-                            the training target (default: on)
+    --think_mode M          "baseline" (default; model's own reasoning in the
+                            unmasked prefix, answer only in the loss), "empty"
+                            ("</think>\n\n{answer}"), or "none" (old target)
+    --[no]close_think       Deprecated alias: --noclose_think == --think_mode none
+    --rehearsal_k K         Batch each correction with K self-distillation
+                            examples from correct trained-split items (default 0)
+    --learning_rate LR      StatefulLLM learning rate (default: the model's)
     --repeats N             Runs per seed with identical shuffle (noise control)
     --holdout-every-checkpoint  Probe the holdout set at every checkpoint
     --subset N              Only use first N items (for quick tests)
@@ -58,6 +63,7 @@ MetaLearningExperiment = adaptible.eval.MetaLearningExperiment
 MetaLearningResult = adaptible.eval.MetaLearningResult
 TRAINING_SOURCES = adaptible.eval.TRAINING_SOURCES
 REVISION_PROMPTS = adaptible.revise.REVISION_PROMPTS
+THINK_MODES = adaptible.revise.THINK_MODES
 generate_default_dataset = adaptible.eval.generate_default_dataset
 load_dataset = adaptible.eval.load_dataset
 
@@ -81,11 +87,28 @@ _REVISION_PROMPT = flags.DEFINE_string(
     f"Revision prompt preset used with --training_source self_generated; one of "
     f"{', '.join(REVISION_PROMPTS)}.",
 )
+_THINK_MODE = flags.DEFINE_enum(
+    "think_mode",
+    "baseline",
+    list(THINK_MODES),
+    "How the training target treats the chat template's open <think> tag: "
+    "'baseline' (model's own reasoning in the unmasked prefix, answer only in "
+    "the loss), 'empty' (train on '</think>\\n\\n{revision}'), or 'none' (old "
+    "malformed target).",
+)
 _CLOSE_THINK = flags.DEFINE_boolean(
     "close_think",
-    True,
-    "If the chat template's generation prompt ends with an open <think> tag, "
-    "train on '</think>\\n\\n{revision}'. --noclose_think keeps the old target.",
+    None,
+    "Deprecated; use --think_mode. --noclose_think is --think_mode none.",
+)
+_REHEARSAL_K = flags.DEFINE_integer(
+    "rehearsal_k",
+    0,
+    "Batch each correction with K rehearsal examples from trained-split items "
+    "the model already answered correctly (self-distillation). 0 disables.",
+)
+_LEARNING_RATE = flags.DEFINE_float(
+    "learning_rate", None, "StatefulLLM learning rate (default: the model's)."
 )
 _REPEATS = flags.DEFINE_integer(
     "repeats", 1, "Runs per seed with an identical shuffle (noise control arm)"
@@ -310,8 +333,12 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                 <div class="value" style="font-size: 16px;">{result.config.revision_prompt}</div>
             </div>
             <div class="config-item">
-                <div class="label">Close Think</div>
-                <div class="value" style="font-size: 16px;">{result.config.close_think}</div>
+                <div class="label">Think Mode</div>
+                <div class="value" style="font-size: 16px;">{result.config.think_mode}</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Rehearsal k</div>
+                <div class="value">{result.config.rehearsal_k}</div>
             </div>
             <div class="config-item">
                 <div class="label">Repeats / Seed</div>
@@ -542,7 +569,9 @@ def main(_):
         train_ratio=_TRAIN_RATIO.value,
         training_source=_TRAINING_SOURCE.value,
         revision_prompt=_REVISION_PROMPT.value,
+        think_mode=_THINK_MODE.value,
         close_think=_CLOSE_THINK.value,
+        rehearsal_k=_REHEARSAL_K.value,
         repeats=_REPEATS.value,
         holdout_every_checkpoint=_HOLDOUT_EVERY_CHECKPOINT.value,
     )
@@ -552,7 +581,12 @@ def main(_):
     print(f"  Name: {config.name}")
     print(f"  Training source: {config.training_source}")
     print(f"  Revision prompt: {config.revision_prompt}")
-    print(f"  Close think: {config.close_think}")
+    print(f"  Think mode: {config.think_mode}")
+    print(f"  Rehearsal k: {config.rehearsal_k}")
+    model_kwargs = {}
+    if _LEARNING_RATE.value is not None:
+        model_kwargs["learning_rate"] = _LEARNING_RATE.value
+        print(f"  Learning rate: {_LEARNING_RATE.value}")
     print(f"  Seeds: {config.seeds}")
     print(f"  Repeats per seed: {config.repeats}")
     print(f"  Holdout every checkpoint: {config.holdout_every_checkpoint}")
@@ -570,7 +604,7 @@ def main(_):
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Run experiment
-    experiment = MetaLearningExperiment()
+    experiment = MetaLearningExperiment(model_kwargs=model_kwargs)
     result = experiment.run(dataset, config, verbose=True)
 
     # Save results

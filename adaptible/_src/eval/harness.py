@@ -23,9 +23,13 @@ from ..db import (
     TrainingEvent,
 )
 from ..revise import (
+    THINK_MODES,
     InvalidRevisionError,
-    make_collated_training_example,
+    collate_training_examples,
     make_revision_prompt,
+    make_revision_training_example,
+    make_training_example,
+    resolve_think_mode,
     revision_prompt_preset,
     strip_think_tags,
     validate_revision_response,
@@ -61,10 +65,20 @@ class EvaluationConfig:
             value so "ground_truth" numbers are never mistaken for self-correction.
         revision_prompt: Which revision prompt preset ``self_generated`` uses;
             see ``revise.revision_prompt_preset``. Ignored for ``ground_truth``.
-        close_think: Passed to ``revise.make_collated_training_example``. When
-            the chat template opens a ``<think>`` block in its generation prompt,
-            close it before the training target (True) or leave the target inside
-            the open block (False, the pre-1.0.0a4 behavior, for comparison).
+        think_mode: How the training target treats the chat template's open
+            ``<think>`` block; one of ``revise.THINK_MODES`` ("none", "empty",
+            "baseline"). "baseline" keeps the model's own reasoning in the
+            unmasked prefix and trains only on the corrected answer.
+        close_think: Deprecated alias for ``think_mode``. ``False`` forces
+            ``think_mode="none"`` (the pre-1.0.0a4 target, for comparison);
+            ``None``/``True`` defer to ``think_mode``. After construction it is
+            always ``think_mode != "none"``.
+        rehearsal_k: When > 0, every training step batches the correction with
+            ``k`` rehearsal examples: other *trained-split* items whose baseline
+            answer was judged correct, with the model's own full baseline output
+            as the target (self-distillation). Sampled with
+            ``seed + item index``; the item being corrected is never in its own
+            rehearsal set. Holdout items are never used.
     """
 
     name: str = "default"
@@ -76,11 +90,22 @@ class EvaluationConfig:
     max_tokens: int | None = None  # Use model default if None
     training_source: str = "ground_truth"
     revision_prompt: str = "default"
-    close_think: bool = True
+    think_mode: str = "baseline"
+    close_think: bool | None = None
+    rehearsal_k: int = 0
 
     def __post_init__(self) -> None:
         validate_training_source(self.training_source)
         revision_prompt_preset(self.revision_prompt)  # raises ValueError if unknown
+        self.think_mode = resolve_think_mode(self.think_mode, self.close_think)
+        self.close_think = self.think_mode != "none"
+        validate_rehearsal_k(self.rehearsal_k)
+
+
+def validate_rehearsal_k(rehearsal_k: int) -> None:
+    """Raise ValueError unless ``rehearsal_k`` is a non-negative int."""
+    if not isinstance(rehearsal_k, int) or rehearsal_k < 0:
+        raise ValueError(f"rehearsal_k must be a non-negative int, got {rehearsal_k!r}")
 
 
 @dataclasses.dataclass
@@ -103,6 +128,11 @@ class ItemResult:
         revision_changed_verdict: ``revision_has_key_terms !=
             initial_has_key_terms``: the revision flipped the judge's verdict in
             either direction.
+        initial_token_count: Tokens in the raw baseline response.
+        post_token_count: Tokens in the raw post-training response; None until
+            the post-training pass runs.
+        rehearsal_item_ids: Ids of the items whose baseline outputs were batched
+            with this item's correction (``EvaluationConfig.rehearsal_k``).
     """
 
     item_id: str
@@ -123,6 +153,14 @@ class ItemResult:
     revision_has_key_terms: bool | None = None
     revision_changed_text: bool | None = None
     revision_changed_verdict: bool | None = None
+    initial_token_count: int = 0
+    post_token_count: int | None = None
+    rehearsal_item_ids: list[str] = dataclasses.field(default_factory=list)
+
+    @property
+    def post_empty_think(self) -> bool:
+        """The post-training response opened with ``</think>``: no reasoning at all."""
+        return (self.post_response_raw or "").lstrip().startswith("</think>")
 
     @property
     def revision_fixed(self) -> bool:
@@ -291,14 +329,84 @@ class EvaluationResult:
         return sum(1 for item in trained if item.post_has_key_terms) / len(trained)
 
     @property
-    def holdout_accuracy(self) -> float:
-        """Fraction of holdout items with key terms (post-training baseline check)."""
-        holdout = [
+    def _judged_holdout_items(self) -> list[ItemResult]:
+        return [
             item for item in self.holdout_items if item.post_has_key_terms is not None
         ]
-        if not holdout:
+
+    @property
+    def holdout_total(self) -> int:
+        return len(self._judged_holdout_items)
+
+    @property
+    def holdout_correct(self) -> int:
+        """Holdout items judged correct after training."""
+        return sum(1 for item in self._judged_holdout_items if item.post_has_key_terms)
+
+    @property
+    def holdout_baseline_correct(self) -> int:
+        """Holdout items judged correct before training."""
+        return sum(
+            1 for item in self._judged_holdout_items if item.initial_has_key_terms
+        )
+
+    @property
+    def holdout_accuracy(self) -> float:
+        """Fraction of holdout items with key terms (post-training baseline check)."""
+        if not self.holdout_total:
             return 0.0
-        return sum(1 for item in holdout if item.post_has_key_terms) / len(holdout)
+        return self.holdout_correct / self.holdout_total
+
+    # Response-length / reasoning-collapse signals. The "empty" think target
+    # taught DeepSeek-R1-Distill to skip reasoning globally (766 -> 6 tokens);
+    # these make that visible in the summary instead of only in the HTML.
+    @property
+    def mean_baseline_tokens(self) -> float:
+        """Mean raw token count of the baseline responses over all items."""
+        if not self.items:
+            return 0.0
+        return sum(item.initial_token_count for item in self.items) / len(self.items)
+
+    @property
+    def mean_post_tokens(self) -> float:
+        """Mean raw token count of the post-training responses over judged items."""
+        counted = [
+            item.post_token_count
+            for item in self.items
+            if item.post_token_count is not None
+        ]
+        if not counted:
+            return 0.0
+        return sum(counted) / len(counted)
+
+    @property
+    def post_empty_think_count(self) -> int:
+        """Post-training responses that start with ``</think>`` (no reasoning)."""
+        return sum(
+            1
+            for item in self.items
+            if item.post_response_raw is not None and item.post_empty_think
+        )
+
+    @property
+    def post_count(self) -> int:
+        """Items with a post-training response."""
+        return sum(1 for item in self.items if item.post_response_raw is not None)
+
+    def collapse_summary_text(self) -> str:
+        """One-line response-length / empty-think summary for logs and reports."""
+        return (
+            f"Response length: baseline {self.mean_baseline_tokens:.0f} tok → post "
+            f"{self.mean_post_tokens:.0f} tok; empty-think responses after training: "
+            f"{self.post_empty_think_count}/{self.post_count}"
+        )
+
+    def holdout_summary_text(self) -> str:
+        return (
+            f"Holdout accuracy: {self.holdout_accuracy:.1%} "
+            f"({self.holdout_correct}/{self.holdout_total}, baseline "
+            f"{self.holdout_baseline_correct}/{self.holdout_total})"
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -311,7 +419,9 @@ class EvaluationResult:
                 "train_ratio": self.config.train_ratio,
                 "training_source": self.config.training_source,
                 "revision_prompt": self.config.revision_prompt,
+                "think_mode": self.config.think_mode,
                 "close_think": self.config.close_think,
+                "rehearsal_k": self.config.rehearsal_k,
             },
             "dataset_name": self.dataset_name,
             "timestamp": self.timestamp,
@@ -322,8 +432,13 @@ class EvaluationResult:
                 "train_retention_rate": self.train_retention_rate,
                 "train_post_accuracy": self.train_post_accuracy,
                 "holdout_accuracy": self.holdout_accuracy,
+                "holdout_correct": self.holdout_correct,
+                "holdout_baseline_correct": self.holdout_baseline_correct,
                 "train_count": len(self.train_items),
                 "holdout_count": len(self.holdout_items),
+                "mean_baseline_tokens": self.mean_baseline_tokens,
+                "mean_post_tokens": self.mean_post_tokens,
+                "post_empty_think_count": self.post_empty_think_count,
                 "revision_invalid_count": self.revision_invalid_count,
                 "revision_summary": self.revision_summary(),
             },
@@ -347,6 +462,9 @@ class EvaluationResult:
                     "revision_has_key_terms": item.revision_has_key_terms,
                     "revision_changed_text": item.revision_changed_text,
                     "revision_changed_verdict": item.revision_changed_verdict,
+                    "initial_token_count": item.initial_token_count,
+                    "post_token_count": item.post_token_count,
+                    "rehearsal_item_ids": item.rehearsal_item_ids,
                 }
                 for item in self.items
             ],
@@ -489,22 +607,24 @@ def _build_training_example(
     baseline_response: str,
     training_source: str,
     revision_prompt: str = "default",
-    close_think: bool = True,
+    think_mode: str = "baseline",
 ) -> tuple[TrainingExample, str | None]:
-    """Build the collated training example for one item.
+    """Build the (unbatched) correction training example for one item.
 
     Args:
         model: Anything with ``generate_response`` and ``_tokenizer``.
         item: The trivia item being trained on.
-        baseline_response: The model's baseline answer to ``item.question``.
+        baseline_response: The model's *raw* baseline answer to ``item.question``
+            (think block included, so ``think_mode="baseline"`` can reuse it).
         training_source: "ground_truth" or "self_generated".
         revision_prompt: Preset name passed to ``revision_prompt_preset``; only
             used for "self_generated".
-        close_think: Passed to ``make_collated_training_example``.
+        think_mode: Passed to ``make_revision_training_example``.
 
     Returns:
         ``(example, revision_text)``. ``revision_text`` is the model's raw
         revision output for "self_generated" and None for "ground_truth".
+        ``example`` is 1-D; batch it with ``collate_training_examples``.
 
     Raises:
         InvalidRevisionError: If a self-generated revision fails validation.
@@ -535,10 +655,37 @@ def _build_training_example(
         revision = model.generate_response(prompt, use_history=False) or ""
         validate_revision_response(revision, num_interactions=len(interactions))
         revision_text = revision
-    example = make_collated_training_example(
-        revision, interactions, tokenizer, close_think=close_think
+    example = make_revision_training_example(
+        revision, interactions, tokenizer, think_mode=think_mode
     )
     return example, revision_text
+
+
+def make_rehearsal_example(
+    item: TriviaItem, baseline_raw: str, tokenizer: Any
+) -> TrainingExample:
+    """Self-distillation example: the model's own full baseline output as target.
+
+    Prefix is the chat template for ``item.question``; the target is
+    ``{baseline_raw}{eos}`` with the whole target in the loss. For a think
+    template ``baseline_raw`` already has the ``{think}</think>\n\n{answer}``
+    shape the model produced, so the sequence matches inference exactly.
+    """
+    eos = tokenizer.special_tokens_map.get("eos_token", "")
+    if isinstance(eos, list):
+        eos = eos[0]
+    messages = [{"role": "user", "content": item.question}]
+    return make_training_example(messages, baseline_raw + eos, tokenizer)
+
+
+def sample_rehearsal_ids(
+    pool_ids: list[str], exclude_id: str, k: int, rng: random.Random
+) -> list[str]:
+    """Pick up to ``k`` ids from ``pool_ids`` (order-stable), never ``exclude_id``."""
+    candidates = [i for i in pool_ids if i != exclude_id]
+    if k <= 0 or not candidates:
+        return []
+    return rng.sample(candidates, min(k, len(candidates)))
 
 
 def _record_training_event(
@@ -574,6 +721,7 @@ class TrainingOutcome:
     # recorded before training so revision quality can be measured on its own.
     revision_answer: str | None = None
     revision_has_key_terms: bool | None = None
+    rehearsal_item_ids: list[str] = dataclasses.field(default_factory=list)
 
 
 def _train_one_item(
@@ -586,21 +734,33 @@ def _train_one_item(
     training_iterations: int,
     training_source: str,
     revision_prompt: str = "default",
-    close_think: bool = True,
+    think_mode: str = "baseline",
+    rehearsal: list[tuple[TriviaItem, str]] | None = None,
 ) -> TrainingOutcome:
     """Build the target, train, and record the event for one item.
+
+    ``baseline_response`` is the raw baseline output (think block included).
+    ``rehearsal`` is a list of ``(item, baseline_raw)`` pairs whose self-
+    distillation examples are batched with the correction (row 0) into a single
+    ``train_on_example`` call.
 
     On ``InvalidRevisionError`` the item is not trained and the outcome carries
     ``revision_invalid=True`` plus the error text.
     """
     try:
-        example, revision_text = _build_training_example(
-            model, item, baseline_response, training_source, revision_prompt, close_think
+        correction, revision_text = _build_training_example(
+            model, item, baseline_response, training_source, revision_prompt, think_mode
         )
     except InvalidRevisionError as e:
         return TrainingOutcome(
             trained=False, revision_invalid=True, revision_error=str(e)
         )
+    tokenizer = model._tokenizer
+    rehearsal = rehearsal or []
+    batch = [correction] + [
+        make_rehearsal_example(r_item, r_raw, tokenizer) for r_item, r_raw in rehearsal
+    ]
+    example = collate_training_examples(batch, tokenizer)
 
     revision_answer: str | None = None
     revision_has_key_terms: bool | None = None
@@ -618,6 +778,7 @@ def _train_one_item(
         training_time_seconds=elapsed,
         revision_answer=revision_answer,
         revision_has_key_terms=revision_has_key_terms,
+        rehearsal_item_ids=[r_item.id for r_item, _ in rehearsal],
     )
 
 
@@ -652,6 +813,7 @@ class EvaluationHarness:
         model: StatefulLLM | None = None,
         db: Database | None = None,
         db_path: Path | str | None = None,
+        model_kwargs: dict[str, Any] | None = None,
     ):
         """Initialize harness with optional pre-loaded model and database.
 
@@ -659,9 +821,13 @@ class EvaluationHarness:
             model: Pre-loaded StatefulLLM. If None, will be loaded on first use.
             db: Pre-initialized Database. If None, will be created using db_path.
             db_path: Path to SQLite database. If None, uses default location.
+            model_kwargs: Keyword arguments for the lazily constructed
+                ``StatefulLLM`` (e.g. ``{"learning_rate": 1e-5}``). Ignored when
+                ``model`` is given; recorded in the experiment's config_json.
         """
         self._model = model
         self._model_loaded = model is not None
+        self._model_kwargs = dict(model_kwargs or {})
         if db is not None:
             self._db = db
         elif db_path is not None:
@@ -674,7 +840,7 @@ class EvaluationHarness:
         """Lazy-load model on first access."""
         if self._model is None:
             print("Loading model...")
-            self._model = StatefulLLM()
+            self._model = StatefulLLM(**self._model_kwargs)
             self._model._model_is_stable = True
             self._model_loaded = True
         return self._model
@@ -722,7 +888,10 @@ class EvaluationHarness:
                     "max_tokens": config.max_tokens,
                     "training_source": config.training_source,
                     "revision_prompt": config.revision_prompt,
+                    "think_mode": config.think_mode,
                     "close_think": config.close_think,
+                    "rehearsal_k": config.rehearsal_k,
+                    "model_kwargs": self._model_kwargs,
                     "dataset_name": dataset.name,
                     "dataset_version": dataset.version,
                 }
@@ -750,7 +919,10 @@ class EvaluationHarness:
             print(f"Training source: {config.training_source}")
             if config.training_source == "self_generated":
                 print(f"Revision prompt: {config.revision_prompt}")
-            print(f"Close think: {config.close_think}")
+            print(f"Think mode: {config.think_mode}")
+            print(f"Rehearsal k: {config.rehearsal_k}")
+            if self._model_kwargs:
+                print(f"Model kwargs: {self._model_kwargs}")
             print(f"Experiment ID: {experiment_id}")
             print()
 
@@ -790,6 +962,7 @@ class EvaluationHarness:
                 initial_response_raw=rec.raw,
                 initial_has_key_terms=rec.correct,
                 was_trained=(idx in train_indices),
+                initial_token_count=rec.token_count,
             )
 
             if verbose:
@@ -804,26 +977,44 @@ class EvaluationHarness:
             print("=" * 60)
 
         train_items = [(dataset[idx], idx) for idx in indices if idx in train_indices]
+        # Rehearsal pool: trained-split items whose baseline was judged correct.
+        # Holdout items never enter it, so holdout stays untouched by training.
+        rehearsal_pool = [
+            item.id for item, _ in train_items if item_results[item.id].initial_has_key_terms
+        ]
+        items_by_id = {item.id: item for item, _ in train_items}
         for i, (item, idx) in enumerate(train_items):
             item_result = item_results[item.id]
             if verbose:
                 print(f"  [{i+1}/{len(train_items)}] Training on {item.id}...")
 
+            rehearsal_ids = sample_rehearsal_ids(
+                rehearsal_pool,
+                item.id,
+                config.rehearsal_k,
+                random.Random(config.seed + i),
+            )
+            rehearsal = [
+                (items_by_id[rid], item_results[rid].initial_response_raw)
+                for rid in rehearsal_ids
+            ]
             outcome = _train_one_item(
                 self.model,
                 self._db,
                 item,
-                item_result.initial_response,
+                item_result.initial_response_raw,
                 example_ids[item.id],
                 experiment_id,
                 config.training_iterations,
                 config.training_source,
                 config.revision_prompt,
-                config.close_think,
+                config.think_mode,
+                rehearsal,
             )
             item_result.revision_text = outcome.revision_text
             item_result.revision_invalid = outcome.revision_invalid
             item_result.training_time_seconds = outcome.training_time_seconds
+            item_result.rehearsal_item_ids = outcome.rehearsal_item_ids
             # An item whose revision was rejected was never trained on; keep it
             # out of the train metrics but flag it so it is counted.
             item_result.was_trained = outcome.trained
@@ -843,7 +1034,12 @@ class EvaluationHarness:
                         f"       Skipped: invalid revision ({outcome.revision_error})"
                     )
                 else:
-                    print(f"       Trained ({outcome.training_time_seconds:.1f}s)")
+                    extra = (
+                        f", rehearsal {outcome.rehearsal_item_ids}"
+                        if outcome.rehearsal_item_ids
+                        else ""
+                    )
+                    print(f"       Trained ({outcome.training_time_seconds:.1f}s{extra})")
                     if outcome.revision_answer is not None:
                         was = "✓" if item_result.initial_has_key_terms else "✗"
                         now = "✓" if outcome.revision_has_key_terms else "✗"
@@ -876,6 +1072,7 @@ class EvaluationHarness:
             item_result.post_response = rec.clean
             item_result.post_response_raw = rec.raw
             item_result.post_has_key_terms = rec.correct
+            item_result.post_token_count = rec.token_count
 
             if verbose:
                 was = "✓" if item_result.initial_has_key_terms else "✗"
@@ -904,11 +1101,13 @@ class EvaluationHarness:
             print(f"Train post-accuracy: {result.train_post_accuracy:.1%} (n={n_train})")
             print(f"Train improvement rate: {result.train_improvement_rate:.1%} (n={n_train})")
             print(f"Train retention rate: {result.train_retention_rate:.1%} (n={n_train})")
-            print(f"Holdout accuracy: {result.holdout_accuracy:.1%}")
+            print(result.holdout_summary_text())
             if config.training_source == "self_generated":
                 print(f"Revision prompt: {config.revision_prompt}")
                 print(f"Invalid revisions (skipped): {result.revision_invalid_count}")
                 print(result.revision_summary_text())
+            print(f"Think mode: {config.think_mode}; rehearsal k: {config.rehearsal_k}")
+            print(result.collapse_summary_text())
             print()
             print(f"Results saved to database (experiment_id={experiment_id})")
 

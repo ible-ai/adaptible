@@ -150,7 +150,9 @@ def generate_html_report(
 
     training_source = getattr(result.config, "training_source", "ground_truth")
     revision_prompt = getattr(result.config, "revision_prompt", "default")
-    close_think = getattr(result.config, "close_think", True)
+    think_mode = getattr(result.config, "think_mode", "empty")
+    rehearsal_k = getattr(result.config, "rehearsal_k", 0)
+    collapse_text = html.escape(result.collapse_summary_text())
     if training_source == "self_generated":
         training_source_text = (
             "the model was trained on its <em>own revision</em> of each baseline "
@@ -385,13 +387,15 @@ def generate_html_report(
         Dataset: {html.escape(result.dataset_name)} ({len(result.items)} items)<br>
         Training source: {html.escape(training_source)} |
         Revision prompt: {html.escape(revision_prompt)} |
-        Close think: <code>{close_think}</code> |
+        Think mode: <code>{html.escape(str(think_mode))}</code> |
+        Rehearsal k: <code>{rehearsal_k}</code> |
         Training iterations: {result.config.training_iterations} |
         Train/Holdout split: {result.config.train_ratio:.0%}/{1-result.config.train_ratio:.0%} |
         Shuffle: {result.config.shuffle} (seed: {result.config.seed})
     </div>
 
     <h2>Overall Metrics</h2>
+    <div class="config-box">{collapse_text}<br>{html.escape(result.holdout_summary_text())}</div>
     <div class="metrics-grid">
         <div class="metric-card">
             <div class="metric-value">{result.baseline_accuracy:.0%}</div>

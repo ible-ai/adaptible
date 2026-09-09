@@ -439,8 +439,14 @@ class StatefulLLM:
         # 3. Prepare training data to train the model on how it should have responded in this
         #    situation. Pass the same list as make_revision_prompt above: the [[X]] index in
         #    the response is a position within interactions_to_review, not interaction_history.
+        #    think_mode="baseline": the interaction's raw llm_response carries the model's
+        #    own reasoning, which stays in the (unmasked) prefix so training does not
+        #    teach the model to skip reasoning.
         example = make_collated_training_example(
-            llm_rewrite_response, interactions_to_review, self._tokenizer
+            llm_rewrite_response,
+            interactions_to_review,
+            self._tokenizer,
+            think_mode="baseline",
         )
         return example
 

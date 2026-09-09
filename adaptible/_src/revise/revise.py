@@ -71,6 +71,41 @@ DialogStyle = Literal["chat", "plain"]
 # model then stops reasoning after a single training example.
 THINK_CLOSE = "</think>\n\n"
 
+# How the training target relates to the chat template's open ``<think>`` block
+# (see ``make_revision_training_example``):
+#   none:     the revision goes straight after the open tag, inside the think
+#             block. The original, malformed target; kept only for comparison.
+#   empty:    ``</think>\n\n`` is inserted before the revision, all of it in the
+#             loss. Teaches "skip reasoning, answer" as a style: after ~80 items
+#             DeepSeek-R1-Distill answered everything with an empty think block
+#             and 6-token responses, and holdout accuracy halved.
+#   baseline: the model's own reasoning from its original response is placed in
+#             the (unmasked) prefix and only the corrected answer is in the loss:
+#             "given this reasoning, the answer is X". Falls back to "empty"
+#             when the original response carried no reasoning.
+THINK_MODES = ("none", "empty", "baseline")
+
+
+def validate_think_mode(think_mode: str) -> None:
+    """Raise ValueError unless ``think_mode`` is one of ``THINK_MODES``."""
+    if think_mode not in THINK_MODES:
+        raise ValueError(f"think_mode must be one of {THINK_MODES}, got {think_mode!r}")
+
+
+def resolve_think_mode(think_mode: str, close_think: bool | None) -> str:
+    """Fold the deprecated ``close_think`` flag into a ``think_mode``.
+
+    ``close_think=False`` means the old unclosed target, i.e. ``"none"``.
+    ``close_think=True`` or ``None`` leaves ``think_mode`` alone, except that
+    ``True`` contradicts ``"none"`` and raises.
+    """
+    validate_think_mode(think_mode)
+    if close_think is False:
+        return "none"
+    if close_think is True and think_mode == "none":
+        raise ValueError('close_think=True contradicts think_mode="none"')
+    return think_mode
+
 
 def revision_prompt_preset(name: str) -> tuple[str, DialogStyle]:
     """Map a preset name to ``(instructions, dialog_style)`` for make_revision_prompt.
@@ -225,6 +260,30 @@ def strip_think_tags(text: str | None) -> str:
     return cleaned.strip()
 
 
+def split_think(text: str | None) -> Tuple[str, str]:
+    """Split a response into its reasoning and its answer.
+
+    Handles ``<think>...</think>answer``, bare ``reasoning</think>answer``
+    (DeepSeek-R1-Distill, whose generation prompt already opened the tag), and
+    text with no tag at all (think is ``""``). Both parts are stripped.
+
+    Args:
+        text: Raw model response.
+
+    Returns:
+        ``(think, answer)``.
+    """
+    if text is None:
+        return "", ""
+    match = re.search(r"</think>", text, flags=re.IGNORECASE)
+    if match is None:
+        return "", text.strip()
+    think = text[: match.start()]
+    answer = text[match.end() :]
+    think = re.sub(r"^\s*<think>", "", think, count=1, flags=re.IGNORECASE)
+    return think.strip(), answer.strip()
+
+
 def strip_examples_tags(text: str | None) -> str:
     """Remove content before </EXAMPLES> closing tag.
 
@@ -322,10 +381,27 @@ def _pad(arr: mx.array, max_len: int, padding_token: int) -> mx.array:
     )
 
 
+def padding_token_for(tokenizer: PreTrainedTokenizer) -> int:
+    """The id used to pad a batch: the tokenizer's pad id, else its eos id, else 0.
+
+    Padded positions are masked out of the loss either way; this only keeps
+    the padded *input* positions on a real token instead of id 0.
+    """
+    for attr in ("pad_token_id", "eos_token_id"):
+        value = getattr(tokenizer, attr, None)
+        if value is not None:
+            return int(value)
+    return 0
+
+
 def _collate_fn(
     batch_data: Sequence[TrainingExample], padding_token: int = 0
 ) -> TrainingExample:
-    # Pad sequences to the maximum length in the batch
+    """Right-pad unbatched examples to a common length and stack them.
+
+    Inputs and labels are padded with ``padding_token``; the mask is always
+    padded with 0 so padded positions never contribute to the loss.
+    """
     max_len = max(max(map(len, (d.input, d.label, d.mask))) for d in batch_data)
     padded_inputs = []
     padded_labels = []
@@ -333,12 +409,22 @@ def _collate_fn(
     for item in batch_data:
         padded_inputs.append(_pad(item.input, max_len, padding_token))
         padded_labels.append(_pad(item.label, max_len, padding_token))
-        padded_masks.append(_pad(item.mask, max_len, padding_token))
+        padded_masks.append(_pad(item.mask, max_len, 0))
     return TrainingExample(
         input=mx.stack(padded_inputs),
         label=mx.stack(padded_labels),
         mask=mx.stack(padded_masks),
     )
+
+
+def collate_training_examples(
+    examples: Sequence[TrainingExample], tokenizer: PreTrainedTokenizer
+) -> TrainingExample:
+    """Batch unbatched examples (from ``make_training_example``) for one training step.
+
+    Row order is preserved. Padding uses ``padding_token_for(tokenizer)``.
+    """
+    return _collate_fn(examples, padding_token_for(tokenizer))
 
 
 def make_revision_prompt(
@@ -371,37 +457,94 @@ def make_revision_prompt(
     return _make_revision_prompt(past_dialog, instructions)
 
 
-def make_collated_training_example(
+def make_training_example(
+    prompt_messages: Sequence[dict[str, str]],
+    target_text: str,
+    tokenizer: PreTrainedTokenizer,
+    prompt_suffix: str = "",
+) -> TrainingExample:
+    """Build one unbatched training example: masked prompt, unmasked target.
+
+    The sequence is ``chat_template(prompt_messages, add_generation_prompt=True)
+    + prompt_suffix + target_text``. The loss mask is 0 over the template and
+    ``prompt_suffix`` and 1 over ``target_text``. ``target_text`` should already
+    end with the eos token if the model is meant to learn to stop.
+
+    The input/label/mask alignment is ``seq[:-1]``, ``seq[1:]``, ``mask[1:]``:
+    position ``i`` of the input predicts ``seq[i + 1]``, so the mask must be
+    aligned with the labels.
+
+    Args:
+        prompt_messages: Chat messages rendered through the tokenizer's chat
+            template with ``add_generation_prompt=True``.
+        target_text: Text the model is trained to produce after the prompt.
+        tokenizer: Model-specific tokenizer.
+        prompt_suffix: Extra text placed between the template and the target
+            that is *not* in the loss (e.g. the model's own reasoning).
+
+    Returns:
+        A 1-D ``TrainingExample``; use ``collate_training_examples`` to batch.
+    """
+    prompt_prefix = tokenizer.apply_chat_template(
+        list(prompt_messages), tokenize=False, add_generation_prompt=True
+    )
+
+    def _tokenize(text: str, dtype: mx.Dtype = mx.int32) -> mx.array:
+        return mx.array(tokenizer.encode(text, add_special_tokens=False), dtype=dtype)
+
+    prompt = _tokenize(prompt_prefix + prompt_suffix)
+    target = _tokenize(target_text)
+    sequence = mx.concat([prompt, target])
+    mask = mx.concat([mx.zeros_like(prompt), mx.ones_like(target)])
+    return TrainingExample(
+        input=sequence[:-1],
+        label=sequence[1:],
+        mask=mask[1:],
+    )
+
+
+def _eos_tag(tokenizer: PreTrainedTokenizer) -> str:
+    eos_tag = tokenizer.special_tokens_map.get("eos_token", "")
+    if isinstance(eos_tag, list):
+        eos_tag = eos_tag[0]
+    return eos_tag
+
+
+def make_revision_training_example(
     response: str,
     interactions: Sequence[InteractionHistory],
     tokenizer: PreTrainedTokenizer,
-    padding_token: int = 0,
-    close_think: bool = True,
+    think_mode: str = "empty",
+    close_think: bool | None = None,
 ) -> TrainingExample:
-    """Convert past interactions and model revision response into a batched training example.
+    """Convert past interactions and a model revision into an unbatched training example.
 
     The prompt prefix is always the tokenizer's real chat template with
     ``add_generation_prompt=True`` so training matches inference, regardless of
     how the *revision prompt* rendered the dialog (see ``make_revision_prompt``'s
     ``dialog_style``).
 
+    When the generation prompt ends with an open ``<think>`` tag (DeepSeek-R1-
+    Distill renders ``...<｜Assistant｜><think>\n``) the target depends on
+    ``think_mode``; see ``THINK_MODES``. For ``"baseline"`` the sequence is
+    ``{prefix}{baseline_think}\n</think>\n\n{revision}{eos}`` where
+    ``baseline_think`` is the reasoning in the revised turn's ``llm_response``
+    (``split_think``), and only ``{revision}{eos}`` is in the loss. Templates
+    without a think tag are unaffected by ``think_mode``.
+
     Args:
-        response: Model-generated revision response.
-        interactions: Past interactions considered when generating the model response.
+        response: Model-generated revision response (``[[X]] ... [[/X]]``).
+        interactions: Past interactions considered when generating the model
+            response; the revised turn's ``llm_response`` should be the raw
+            model output (with its think block) for ``"baseline"`` to work.
         tokenizer: Model-specific tokenizer.
-        padding_token: Token to use for padding.
-        close_think: If the chat template's generation prompt ends with an open
-            ``<think>`` tag, prepend ``THINK_CLOSE`` to the target so it becomes
-            ``<think>\n</think>\n\n{revision}{eos}``: an empty reasoning block and
-            then the answer. ``False`` reproduces the old (malformed) target, kept
-            for comparison. No-op for templates without a think tag.
+        think_mode: One of ``THINK_MODES``.
+        close_think: Deprecated alias; ``False`` forces ``think_mode="none"``.
 
-    Returns: a collated training example, ready for model ingestion.
-
+    Returns: a 1-D training example.
     """
-    eos_tag = tokenizer.special_tokens_map.get("eos_token", "")
-    if isinstance(eos_tag, list):
-        eos_tag = eos_tag[0]
+    think_mode = resolve_think_mode(think_mode, close_think)
+    eos_tag = _eos_tag(tokenizer)
 
     index_to_rewrite = _isolate_turn_to_rewritten_turn_index(response)
     rewritten_response = _parse_rewritten_response(response, index_to_rewrite)
@@ -419,29 +562,46 @@ def make_collated_training_example(
     interaction_to_revise = interactions[index_to_rewrite]
     messages.append({"role": "user", "content": interaction_to_revise.user_input})
 
-    # Use add_generation_prompt=True to match inference format exactly
     prompt_prefix = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
+    open_think = prompt_prefix.rstrip().endswith("<think>")
 
+    prompt_suffix = ""
     target_text = rewritten_response + eos_tag
-    if close_think and prompt_prefix.rstrip().endswith("<think>"):
+    if open_think and think_mode == "baseline":
+        baseline_think, _ = split_think(interaction_to_revise.llm_response)
+        if baseline_think:
+            prompt_suffix = f"{baseline_think}\n{THINK_CLOSE}"
+        else:
+            think_mode = "empty"
+    if open_think and think_mode == "empty":
         target_text = THINK_CLOSE + target_text
+    return make_training_example(messages, target_text, tokenizer, prompt_suffix)
 
-    def _tokenize(text: str, dtype: mx.Dtype = mx.int32) -> mx.array:
-        return mx.array(tokenizer.encode(text, add_special_tokens=False), dtype=dtype)
 
-    dialog_pre_revision = _tokenize(prompt_prefix)
-    # Everything after the prefix (think close, revision, eos) is the label region.
-    revision = _tokenize(target_text)
-    tokenized_rewritten_dialog = mx.concat([dialog_pre_revision, revision])
-    mask = mx.concat([mx.zeros_like(dialog_pre_revision), mx.ones_like(revision)])
-    # Slice mask to align with input/label dimensions:
-    # input has N-1 tokens (sequence[:-1]), label has N-1 tokens (sequence[1:])
-    # mask must also have N-1 tokens, aligned with labels (what we're predicting)
-    training_example = TrainingExample(
-        input=tokenized_rewritten_dialog[:-1],
-        label=tokenized_rewritten_dialog[1:],
-        mask=mask[1:],
+def make_collated_training_example(
+    response: str,
+    interactions: Sequence[InteractionHistory],
+    tokenizer: PreTrainedTokenizer,
+    padding_token: int = 0,
+    close_think: bool | None = None,
+    think_mode: str = "empty",
+) -> TrainingExample:
+    """``make_revision_training_example`` batched to shape ``(1, L)``.
+
+    Args:
+        response: Model-generated revision response.
+        interactions: Past interactions considered when generating the model response.
+        tokenizer: Model-specific tokenizer.
+        padding_token: Token to use for padding (unused for a single example).
+        close_think: Deprecated alias for ``think_mode``: ``False`` reproduces
+            the old target with the revision inside the open think block.
+        think_mode: See ``THINK_MODES`` and ``make_revision_training_example``.
+
+    Returns: a collated training example, ready for model ingestion.
+    """
+    example = make_revision_training_example(
+        response, interactions, tokenizer, think_mode=think_mode, close_think=close_think
     )
-    return _collate_fn([training_example], padding_token)
+    return _collate_fn([example], padding_token)

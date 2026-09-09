@@ -54,11 +54,32 @@ With `self_generated`, the prompt that asks the model for its revision is chosen
 
 `fewshot` exists because the first `self_generated` run with `default` got a valid revision from the 1.5B model for only 1 of 84 items: most responses carried no `[[0]]` marker at all, and several started by echoing the chat-template tokens that `default` puts in the dialog. Whether `fewshot` does better has not been measured yet.
 
-### Training target and `close_think`
+### Training target and `think_mode`
 
-Whatever the revision prompt looked like, the training target is always built by `revise.make_collated_training_example` from the tokenizer's real chat template (`add_generation_prompt=True`), so training matches inference. For DeepSeek-R1-Distill that generation prompt ends with an open `<think>\n`, and the original code put the revision straight after it, training the model on an answer inside an unclosed think block. One such example was enough to collapse responses from ~722 to ~16 tokens.
+Whatever the revision prompt looked like, the training target is always built by `revise.make_revision_training_example` from the tokenizer's real chat template (`add_generation_prompt=True`), so training matches inference. For DeepSeek-R1-Distill that generation prompt ends with an open `<think>\n`, so every response has the form `{reasoning}</think>\n\n{answer}`. `think_mode` (`EvaluationConfig.think_mode`, `MetaLearningConfig.think_mode`, `--think_mode`; one of `revise.THINK_MODES`) says what the target does with that open block:
 
-`close_think` (`EvaluationConfig.close_think`, `MetaLearningConfig.close_think`, `--close_think` / `--noclose_think`; default on) fixes this: when the prefix ends with `<think>`, the target becomes `<think>\n</think>\n\n{revision}{eos}`, an empty reasoning block followed by the answer, with the loss mask covering `</think>\n\n` plus the revision. `--noclose_think` reproduces the old target for comparison. Templates without a think tag are unaffected either way. Both `training_source` values go through this path.
+| `think_mode` | Sequence after the prefix `...<think>\n` | In the loss | Notes |
+|---|---|---|---|
+| `none` | `{revision}{eos}` | all of it | The original target: an answer inside an unclosed think block. One example collapsed responses from ~722 to ~16 tokens. Kept for comparison. |
+| `empty` | `</think>\n\n{revision}{eos}` | all of it | Well-formed, but teaches "skip reasoning, answer in two words" as a global style. After 84 items (`gt_close`): trained 51/84 -> 73/84, holdout 12/21 -> 6/21, mean response 766 -> 6 tokens, every response opening with `</think>`. |
+| `baseline` (default) | `{baseline_think}\n</think>\n\n{revision}{eos}` | `{revision}{eos}` only | `baseline_think` is the model's own reasoning from its baseline response (`revise.split_think`). Teaches "given this reasoning, the answer is X" without touching the reasoning itself. Falls back to `empty` when the baseline had no reasoning. |
+
+Templates without a think tag are unaffected by `think_mode`. Both `training_source` values go through this path. `close_think` survives as a deprecated alias (`--noclose_think` is `--think_mode none`; after construction `config.close_think` is `think_mode != "none"`).
+
+### Rehearsal (`rehearsal_k`)
+
+The `empty` run above also drifted unrelated facts ("The skin" for the largest planet). `rehearsal_k` (`EvaluationConfig.rehearsal_k`, `MetaLearningConfig.rehearsal_k`, `--rehearsal_k`; default 0) batches every correction with `k` self-distillation examples: other *trained-split* items whose baseline answer was judged correct, with the model's own full baseline output (`{think}</think>\n\n{answer}{eos}`, whole target in the loss) as the target. The batch is padded with the tokenizer's pad/eos id (mask 0 on padding) and trained in one `train_on_example` call. Rehearsal items are sampled with `seed + item index`, never include the item being corrected, and never include holdout items. `ItemResult.rehearsal_item_ids` records which items were used.
+
+### Collapse signals
+
+`EvaluationResult.mean_baseline_tokens`, `mean_post_tokens`, and `post_empty_think_count` (post responses that open with `</think>`) are printed at the end of every run as
+
+```
+Response length: baseline 711 tok -> post 10 tok; empty-think responses after training: 105/105
+Holdout accuracy: 28.6% (6/21, baseline 12/21)
+```
+
+so a run that "learned" its training items by giving up reasoning is obvious from the console.
 
 ## Quick Start
 
@@ -98,10 +119,11 @@ config = eval.EvaluationConfig(
     shuffle=True,
     training_source="ground_truth",   # or "self_generated"
     revision_prompt="default",        # or "fewshot"; only used by self_generated
-    close_think=True,                 # False reproduces the pre-fix training target
+    think_mode="baseline",            # or "empty" / "none"; see above
+    rehearsal_k=0,                    # >0 batches self-distillation examples with each correction
 )
 
-harness = eval.EvaluationHarness()    # note: loads <outputs>/autonomous/checkpoint if present
+harness = eval.EvaluationHarness(model_kwargs={"learning_rate": 5e-5})  # note: loads <outputs>/autonomous/checkpoint if present
 result = harness.run(dataset, config, verbose=True)
 
 eval.generate_html_report(result, "/tmp/report.html")
@@ -240,7 +262,10 @@ result = eval.MetaLearningResult.load("outputs/meta/meta.json")
 | `--seed`            | `42`                              | Random seed for shuffling                                |
 | `--training_source` | `ground_truth`                    | `ground_truth` or `self_generated` (see above)           |
 | `--revision_prompt` | `default`                         | `default` or `fewshot`; revision prompt preset for `self_generated` |
-| `--close_think`     | `True`                            | Close an open `<think>` block before the training target; `--noclose_think` for the old target |
+| `--think_mode`      | `baseline`                        | `baseline`, `empty`, or `none` (see above)               |
+| `--close_think`     | `None`                            | Deprecated; `--noclose_think` is `--think_mode none`      |
+| `--rehearsal_k`     | `0`                               | Self-distillation examples batched with each correction  |
+| `--learning_rate`   | `None`                            | `StatefulLLM(learning_rate=...)`; model default if unset |
 | `--subset`          | `None`                            | Use only first N questions                               |
 | `--category`        | `None`                            | Filter to specific category                              |
 | `--output`          | `/tmp/adaptible_eval_report.html` | Report path                                              |

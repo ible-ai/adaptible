@@ -35,9 +35,11 @@ from .harness import (
     _insert_dataset_examples,
     _judge_only,
     _train_one_item,
+    sample_rehearsal_ids,
+    validate_rehearsal_k,
     validate_training_source,
 )
-from ..revise import revision_prompt_preset
+from ..revise import resolve_think_mode, revision_prompt_preset
 
 # Minimum improvable+forgettable items a window needs before its rates feed the
 # meta-learning score. Below this a single item swings a rate by 20+ points.
@@ -396,8 +398,12 @@ class MetaLearningConfig:
             "self_generated" (train on the model's own revision).
         revision_prompt: Revision prompt preset for "self_generated"; see
             ``revise.revision_prompt_preset``.
-        close_think: Close the chat template's open ``<think>`` block before
-            the training target; see ``EvaluationConfig.close_think``.
+        think_mode: How the training target treats the chat template's open
+            ``<think>`` block; see ``EvaluationConfig.think_mode``.
+        close_think: Deprecated alias for ``think_mode``; ``False`` forces
+            ``"none"``. Always ``think_mode != "none"`` after construction.
+        rehearsal_k: Rehearsal examples batched with every correction; see
+            ``EvaluationConfig.rehearsal_k``.
         holdout_every_checkpoint: Also probe the holdout set at every
             checkpoint (costs a holdout-sized inference pass per checkpoint).
         repeats: Run each seed this many times with an identical shuffle. Any
@@ -415,13 +421,18 @@ class MetaLearningConfig:
     max_tokens: int | None = None  # Use model default if None
     training_source: str = "ground_truth"
     revision_prompt: str = "default"
-    close_think: bool = True
+    think_mode: str = "baseline"
+    close_think: bool | None = None
+    rehearsal_k: int = 0
     holdout_every_checkpoint: bool = False
     repeats: int = 1
 
     def __post_init__(self) -> None:
         validate_training_source(self.training_source)
         revision_prompt_preset(self.revision_prompt)  # raises ValueError if unknown
+        self.think_mode = resolve_think_mode(self.think_mode, self.close_think)
+        self.close_think = self.think_mode != "none"
+        validate_rehearsal_k(self.rehearsal_k)
         if self.repeats < 1:
             raise ValueError(f"repeats must be >= 1, got {self.repeats}")
 
@@ -435,7 +446,9 @@ class MetaLearningConfig:
             "max_tokens": self.max_tokens,
             "training_source": self.training_source,
             "revision_prompt": self.revision_prompt,
+            "think_mode": self.think_mode,
             "close_think": self.close_think,
+            "rehearsal_k": self.rehearsal_k,
             "holdout_every_checkpoint": self.holdout_every_checkpoint,
             "repeats": self.repeats,
         }
@@ -451,12 +464,25 @@ class MetaLearningConfig:
             max_tokens=data.get("max_tokens"),
             training_source=data.get("training_source", "ground_truth"),
             revision_prompt=data.get("revision_prompt", "default"),
-            # Files written before close_think existed were trained on the
-            # unclosed-think target, so absence means False, not the new default.
-            close_think=data.get("close_think", False),
+            think_mode=_legacy_think_mode(data),
+            rehearsal_k=data.get("rehearsal_k", 0),
             holdout_every_checkpoint=data.get("holdout_every_checkpoint", False),
             repeats=data.get("repeats", 1),
         )
+
+
+def _legacy_think_mode(data: dict[str, Any]) -> str:
+    """``think_mode`` for a saved config, honouring files that predate it.
+
+    Files written before ``close_think`` existed were trained on the
+    unclosed-think target ("none"); files with only ``close_think`` map
+    ``True`` to "empty" (the target that flag produced) and ``False`` to "none".
+    """
+    if "think_mode" in data:
+        return data["think_mode"]
+    if "close_think" in data:
+        return "empty" if data["close_think"] else "none"
+    return "none"
 
 
 @dataclasses.dataclass
@@ -665,16 +691,23 @@ class MetaLearningExperiment:
         model_factory: Callable[[], StatefulLLM] | None = None,
         db: Database | None = None,
         db_path: Path | str | None = None,
+        model_kwargs: dict[str, Any] | None = None,
     ):
         """Initialize the experiment.
 
         Args:
             model_factory: Factory function to create fresh model instances.
-                If None, uses default StatefulLLM constructor.
+                If None, uses ``StatefulLLM(model_path=None, **model_kwargs)``.
             db: Pre-initialized Database. If None, will be created using db_path.
             db_path: Path to SQLite database. If None, uses default location.
+            model_kwargs: Extra ``StatefulLLM`` keyword arguments for the default
+                factory (e.g. ``{"learning_rate": 1e-5}``); recorded in each
+                experiment's config_json. Ignored when ``model_factory`` is given.
         """
-        self._model_factory = model_factory or (lambda: StatefulLLM(model_path=None))
+        self._model_kwargs = dict(model_kwargs or {})
+        self._model_factory = model_factory or (
+            lambda: StatefulLLM(model_path=None, **self._model_kwargs)
+        )
         if db is not None:
             self._db = db
         elif db_path is not None:
@@ -738,7 +771,8 @@ class MetaLearningExperiment:
         print(f"  Training source: {config.training_source}")
         if config.training_source == "self_generated":
             print(f"  Revision prompt: {config.revision_prompt}")
-        print(f"  Close think: {config.close_think}")
+        print(f"  Think mode: {config.think_mode}")
+        print(f"  Rehearsal k: {config.rehearsal_k}")
         for (seed, repeat), traj in sorted(result.all_trajectories.items()):
             label = f"Seed {seed}" + (f" repeat {repeat}" if config.repeats > 1 else "")
             print(f"  {label}:")
@@ -831,7 +865,10 @@ class MetaLearningExperiment:
                     "max_tokens": config.max_tokens,
                     "training_source": config.training_source,
                     "revision_prompt": config.revision_prompt,
+                    "think_mode": config.think_mode,
                     "close_think": config.close_think,
+                    "rehearsal_k": config.rehearsal_k,
+                    "model_kwargs": self._model_kwargs,
                     "holdout_every_checkpoint": config.holdout_every_checkpoint,
                     "dataset_name": dataset.name,
                     "dataset_version": dataset.version,
@@ -867,6 +904,7 @@ class MetaLearningExperiment:
         baseline_responses: dict[str, tuple[str, bool]] = (
             {}
         )  # item_id -> (response, correct)
+        baseline_raw: dict[str, str] = {}  # item_id -> raw response (think included)
         for idx in indices:
             item = dataset[idx]
             rec = _infer_and_record(
@@ -880,6 +918,7 @@ class MetaLearningExperiment:
                 effective_max_tokens,
             )
             baseline_responses[item.id] = (rec.clean, rec.correct)
+            baseline_raw[item.id] = rec.raw
 
         # Phase 2: Train with checkpoints
         if verbose:
@@ -889,6 +928,13 @@ class MetaLearningExperiment:
 
         post_responses: dict[str, tuple[str, bool]] = {}  # Updated as we train
         trained_items: list[str] = []  # in training order
+        # Rehearsal pool: trained-split items whose baseline was judged correct.
+        rehearsal_pool = [
+            dataset[idx].id
+            for idx in train_indices
+            if baseline_responses[dataset[idx].id][1]
+        ]
+        train_position = 0
 
         for batch_idx in range(0, len(train_indices), config.checkpoint_interval):
             batch = train_indices[batch_idx : batch_idx + config.checkpoint_interval]
@@ -898,18 +944,25 @@ class MetaLearningExperiment:
             # Train on this batch
             for idx in batch:
                 item = dataset[idx]
-                baseline_clean, _ = baseline_responses[item.id]
+                rehearsal_ids = sample_rehearsal_ids(
+                    rehearsal_pool,
+                    item.id,
+                    config.rehearsal_k,
+                    random.Random(seed + train_position),
+                )
+                train_position += 1
                 outcome = _train_one_item(
                     model,
                     self._db,
                     item,
-                    baseline_clean,
+                    baseline_raw[item.id],
                     example_ids[item.id],
                     experiment_id,
                     config.training_iterations,
                     config.training_source,
                     config.revision_prompt,
-                    config.close_think,
+                    config.think_mode,
+                    [(items_by_id[rid], baseline_raw[rid]) for rid in rehearsal_ids],
                 )
                 if outcome.revision_invalid:
                     revision_invalid_ids.append(item.id)

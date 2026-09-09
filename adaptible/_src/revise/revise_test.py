@@ -17,9 +17,15 @@ from .revise import (
     _pad,
     _parse_rewritten_response,
     _serialize_interactions_to_string,
+    collate_training_examples,
     make_collated_training_example,
     make_revision_prompt,
+    make_revision_training_example,
+    make_training_example,
+    padding_token_for,
+    resolve_think_mode,
     revision_prompt_preset,
+    split_think,
     strip_think_tags,
     validate_revision_response,
 )
@@ -698,6 +704,182 @@ class CloseThinkTest(unittest.TestCase):
         tokenizer, example = self._example("<assistant><think>\n</think>\n")
         masked, _ = self._decode(tokenizer, example)
         self.assertEqual(masked, "Right answer.<eos>")
+
+
+class SplitThinkTest(unittest.TestCase):
+    def test_full_tags(self):
+        self.assertEqual(
+            split_think("<think>\nreason\n</think>\n\nanswer"), ("reason", "answer")
+        )
+
+    def test_bare_close_tag(self):
+        self.assertEqual(split_think("reason\n</think>\n\nanswer"), ("reason", "answer"))
+
+    def test_no_tag(self):
+        self.assertEqual(split_think("just an answer"), ("", "just an answer"))
+
+    def test_empty_think(self):
+        self.assertEqual(split_think("</think>\n\nanswer"), ("", "answer"))
+        self.assertEqual(split_think("<think>\n</think>answer"), ("", "answer"))
+
+    def test_none_and_case(self):
+        self.assertEqual(split_think(None), ("", ""))
+        self.assertEqual(split_think("<THINK>r</THINK>a"), ("r", "a"))
+
+    def test_only_first_close_tag_splits(self):
+        self.assertEqual(split_think("r</think>a</think>b"), ("r", "a</think>b"))
+
+    def test_consistent_with_strip_think_tags(self):
+        for text in ("<think>\nr\n</think>\n\na", "r</think>a", "a"):
+            self.assertEqual(split_think(text)[1], strip_think_tags(text))
+
+
+class ThinkModeTest(unittest.TestCase):
+    """think_mode="baseline" keeps the model's reasoning in the unmasked prefix."""
+
+    GEN = "<assistant><think>\n"
+    BASELINE = "Let me think.\nSydney?\n</think>\n\nThe capital is Sydney."
+
+    def _run(self, llm_response, suffix=GEN, **kwargs):
+        tokenizer = _CharTokenizer(suffix)
+        interactions = [InteractionHistory(idx=0, user_input="Q?", llm_response=llm_response)]
+        example = make_collated_training_example(
+            "[[0]] Canberra. [[/0]]", interactions, tokenizer, **kwargs
+        )
+        inputs = example.input.tolist()[0]
+        labels = example.label.tolist()[0]
+        mask = example.mask.tolist()[0]
+        full = tokenizer.decode([inputs[0]] + labels)
+        masked = tokenizer.decode(t for t, m in zip(labels, mask) if m)
+        return full, masked, mask
+
+    def test_baseline_sequence_and_mask_boundary(self):
+        full, masked, mask = self._run(self.BASELINE, think_mode="baseline")
+        prefix = f"<user>Q?</user>{self.GEN}Let me think.\nSydney?\n</think>\n\n"
+        target = "Canberra.<eos>"
+        self.assertEqual(full, prefix + target)
+        self.assertEqual(masked, target)
+        # Mask is 0 through "</think>\n\n" and 1 from the first target char on
+        # (mask[1:] alignment: position i predicts sequence[i + 1]).
+        n = len(prefix)
+        self.assertEqual(mask[: n - 1], [0] * (n - 1))
+        self.assertEqual(mask[n - 1 :], [1] * len(target))
+        self.assertEqual(len(mask), len(prefix) + len(target) - 1)
+
+    def test_baseline_with_full_think_tags(self):
+        full, masked, _ = self._run("<think>\nr\n</think>\n\nSydney.", think_mode="baseline")
+        self.assertEqual(full, f"<user>Q?</user>{self.GEN}r\n</think>\n\nCanberra.<eos>")
+        self.assertEqual(masked, "Canberra.<eos>")
+
+    def test_baseline_without_reasoning_falls_back_to_empty(self):
+        for llm_response in ("Sydney.", "</think>\n\nSydney.", "<think></think>Sydney."):
+            full, masked, _ = self._run(llm_response, think_mode="baseline")
+            self.assertEqual(masked, f"{THINK_CLOSE}Canberra.<eos>")
+            self.assertEqual(full, f"<user>Q?</user>{self.GEN}{THINK_CLOSE}Canberra.<eos>")
+
+    def test_empty_and_none_modes(self):
+        full, masked, _ = self._run(self.BASELINE, think_mode="empty")
+        self.assertEqual(masked, f"{THINK_CLOSE}Canberra.<eos>")
+        self.assertNotIn("Sydney?", full)
+        full, masked, _ = self._run(self.BASELINE, think_mode="none")
+        self.assertEqual(masked, "Canberra.<eos>")
+        self.assertEqual(full, f"<user>Q?</user>{self.GEN}Canberra.<eos>")
+
+    def test_default_mode_is_empty_and_close_think_alias(self):
+        _, masked, _ = self._run(self.BASELINE)
+        self.assertEqual(masked, f"{THINK_CLOSE}Canberra.<eos>")
+        _, masked, _ = self._run(self.BASELINE, close_think=False, think_mode="baseline")
+        self.assertEqual(masked, "Canberra.<eos>")
+        self.assertEqual(resolve_think_mode("baseline", None), "baseline")
+        self.assertEqual(resolve_think_mode("baseline", True), "baseline")
+        self.assertEqual(resolve_think_mode("baseline", False), "none")
+        with self.assertRaises(ValueError):
+            resolve_think_mode("none", True)
+        with self.assertRaises(ValueError):
+            resolve_think_mode("reasoning", None)
+
+    def test_baseline_is_noop_without_think_template(self):
+        full, masked, _ = self._run(self.BASELINE, suffix="<assistant>", think_mode="baseline")
+        self.assertEqual(masked, "Canberra.<eos>")
+        self.assertEqual(full, "<user>Q?</user><assistant>Canberra.<eos>")
+
+    def test_unbatched_revision_example_matches_collated(self):
+        tokenizer = _CharTokenizer(self.GEN)
+        interactions = [InteractionHistory(idx=0, user_input="Q?", llm_response=self.BASELINE)]
+        single = make_revision_training_example(
+            "[[0]] Canberra. [[/0]]", interactions, tokenizer, think_mode="baseline"
+        )
+        batched = make_collated_training_example(
+            "[[0]] Canberra. [[/0]]", interactions, tokenizer, think_mode="baseline"
+        )
+        self.assertEqual(single.input.ndim, 1)
+        self.assertEqual(single.input.tolist(), batched.input.tolist()[0])
+        self.assertEqual(single.label.tolist(), batched.label.tolist()[0])
+        self.assertEqual(single.mask.tolist(), batched.mask.tolist()[0])
+
+
+class MakeTrainingExampleTest(unittest.TestCase):
+    """make_training_example / collate_training_examples / padding_token_for."""
+
+    GEN = "<assistant><think>\n"
+
+    def test_prompt_masked_target_unmasked(self):
+        tokenizer = _CharTokenizer(self.GEN)
+        ex = make_training_example(
+            [{"role": "user", "content": "Q"}], "r</think>\n\nA<eos>", tokenizer
+        )
+        seq = tokenizer.encode(f"<user>Q</user>{self.GEN}r</think>\n\nA<eos>")
+        self.assertEqual(ex.input.tolist(), seq[:-1])
+        self.assertEqual(ex.label.tolist(), seq[1:])
+        n = len(f"<user>Q</user>{self.GEN}")
+        self.assertEqual(ex.mask.tolist(), [0] * (n - 1) + [1] * len("r</think>\n\nA<eos>"))
+
+    def test_prompt_suffix_is_masked(self):
+        tokenizer = _CharTokenizer(self.GEN)
+        ex = make_training_example(
+            [{"role": "user", "content": "Q"}], "A<eos>", tokenizer, prompt_suffix="r</think>\n\n"
+        )
+        masked = tokenizer.decode(t for t, m in zip(ex.label.tolist(), ex.mask.tolist()) if m)
+        self.assertEqual(masked, "A<eos>")
+        self.assertEqual(sum(ex.mask.tolist()), len("A<eos>"))
+
+    def test_collate_pads_inputs_with_pad_id_and_mask_with_zero(self):
+        tokenizer = _CharTokenizer(self.GEN)
+        tokenizer.eos_token_id = 7777
+        short = make_training_example([{"role": "user", "content": "Q"}], "A<eos>", tokenizer)
+        long = make_training_example(
+            [{"role": "user", "content": "Q"}], "A much longer answer<eos>", tokenizer
+        )
+        self.assertEqual(padding_token_for(tokenizer), 7777)
+        batch = collate_training_examples([short, long], tokenizer)
+        n_short = len(short.input)
+        n_long = len(long.input)
+        self.assertEqual(batch.input.shape, (2, n_long))
+        self.assertEqual(batch.mask.shape, (2, n_long))
+        row = batch.input.tolist()[0]
+        self.assertEqual(row[n_short:], [7777] * (n_long - n_short))
+        self.assertEqual(batch.label.tolist()[0][n_short:], [7777] * (n_long - n_short))
+        self.assertEqual(batch.mask.tolist()[0][n_short:], [0] * (n_long - n_short))
+        # Row 1 unchanged.
+        self.assertEqual(batch.input.tolist()[1], long.input.tolist())
+        self.assertEqual(batch.mask.tolist()[1], long.mask.tolist())
+
+    def test_padding_token_for_prefers_pad_over_eos_and_defaults_to_zero(self):
+        tokenizer = _CharTokenizer(self.GEN)
+        self.assertEqual(padding_token_for(tokenizer), 0)
+        tokenizer.eos_token_id = 5
+        self.assertEqual(padding_token_for(tokenizer), 5)
+        tokenizer.pad_token_id = 3
+        self.assertEqual(padding_token_for(tokenizer), 3)
+        tokenizer.pad_token_id = None
+        self.assertEqual(padding_token_for(tokenizer), 5)
+
+    def test_collate_fn_custom_padding_never_pads_mask(self):
+        a = TrainingExample(input=mx.array([1, 2]), label=mx.array([2, 3]), mask=mx.array([1, 1]))
+        b = TrainingExample(input=mx.array([1]), label=mx.array([2]), mask=mx.array([1]))
+        batch = _collate_fn([a, b], padding_token=9)
+        self.assertEqual(batch.input.tolist()[1], [1, 9])
+        self.assertEqual(batch.mask.tolist()[1], [1, 0])
 
 
 class MultiTurnPrefixTest(unittest.TestCase):
