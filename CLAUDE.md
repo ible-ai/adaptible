@@ -9,7 +9,7 @@ critique and rewrite its own past responses during idle time, and LoRA-fine-tune
 rewrites. The evaluation and meta-learning modules are meant to measure whether that loop
 produces net learning across seeds.
 
-Where things stand (2026-09-10): see `docs/HANDOFF-2026-09-10.md` first. The collapse problem (training destroyed reasoning and unrelated knowledge) is solved by the recipe `--think_mode rationale --lora_rank 8 --lora_layers 8 --loss_target 0.6 --rehearsal_k 3`; net learning at 40 items is still ~0 and a screen with `--verify_steps 4` + skipping baseline-correct items is the open experiment. Every published number before 2026-09-09 is ground-truth SFT with a malformed target; do not cite them. Never run an experiment without a passing 1-item probe first (`outputs/runs/probe_*.py`).
+Where things stand (2026-09-10 evening): read `docs/HANDOFF-2026-09-10.md` first (how the user works, what is next), then `docs/FINDINGS-2026-09-10.md` (what was measured and which hypotheses are dead). The collapse problem is solved (recipe in the handoff, commit `31d87b3`). One correction still disturbs most other facts, the rehearsal hinge has never activated, and the yardstick is now `scripts/probes/mve_paraphrase.py` (5 wrong items, original + 3 paraphrases, before/after/after-all). Every published number before 2026-09-09 is ground-truth SFT with a malformed target; do not cite them. Minimum viable experiments only; never run one without a passing small probe first (`scripts/probes/`).
 
 Apple Silicon only — `mlx` is a hard dependency of every code path that touches the model.
 Requires Python 3.13+. Version `1.0.0a3`.
