@@ -6,13 +6,14 @@ import functools
 import math
 import threading
 from pathlib import Path
-from typing import AsyncIterable, Callable, List, Tuple, cast
+from typing import Any, AsyncIterable, Callable, List, Tuple, cast
 
 import immutabledict
 import mlx
 import mlx.core
 import mlx.nn
 import mlx.optimizers
+import mlx.utils
 import mlx_lm.tuner
 import tqdm
 import vizible
@@ -167,6 +168,14 @@ class TrainingStats:
         stopped_early: True if a step's loss fell below the loss target before
             the step cap was reached.
         losses: Every step's loss, in order.
+        rehearsal_final_loss: For ``train_on_examples``, the mean rehearsal
+            loss at the last step; ``None`` when no rehearsal examples were
+            trained (``train_on_example``, or an empty rehearsal list).
+        rehearsal_count: Rehearsal examples in the joint objective (0 for
+            ``train_on_example``).
+
+    All loss figures other than ``rehearsal_final_loss`` are the correction's:
+    the stop rule only ever looks at the correction loss.
     """
 
     steps: int
@@ -174,6 +183,8 @@ class TrainingStats:
     final_loss: float
     stopped_early: bool
     losses: list[float] = dataclasses.field(default_factory=list)
+    rehearsal_final_loss: float | None = None
+    rehearsal_count: int = 0
 
     @property
     def hit_cap(self) -> bool:
@@ -229,6 +240,98 @@ def run_training_steps(
         stopped_early=stopped_early,
         losses=losses,
     )
+
+
+def run_joint_training_steps(
+    step_fn: Callable[[], Tuple[float, float | None]],
+    max_steps: int,
+    loss_target: float | None,
+    rehearsal_count: int,
+    verbose: bool = False,
+) -> TrainingStats:
+    """``run_training_steps`` for a joint correction + rehearsal objective.
+
+    ``step_fn`` performs one optimizer step on the combined gradient and
+    returns ``(correction_loss, mean_rehearsal_loss)``; the rehearsal loss is
+    ``None`` when there are no rehearsal examples. Only the correction loss is
+    compared against ``loss_target``: rehearsal targets are the model's own
+    baseline output, whose loss is already low, so stopping on it would end
+    training before the correction lands.
+
+    Args:
+        step_fn: Performs one gradient step and returns both losses.
+        max_steps: Hard cap on steps.
+        loss_target: Stop as soon as the *correction* loss is below this;
+            ``None`` runs exactly ``max_steps`` steps.
+        rehearsal_count: Rehearsal examples per step, recorded on the stats.
+        verbose: Print each step's losses.
+
+    Returns:
+        ``TrainingStats`` whose loss fields are the correction's and whose
+        ``rehearsal_final_loss`` is the last step's mean rehearsal loss.
+    """
+    last_rehearsal: list[float | None] = [None]
+
+    def correction_only() -> float:
+        loss_c, loss_r = step_fn()
+        last_rehearsal[0] = None if loss_r is None else float(loss_r)
+        if verbose and loss_r is not None:
+            vizible.green(f"\tRehearsal loss: {float(loss_r):.4f}")
+        return float(loss_c)
+
+    stats = run_training_steps(correction_only, max_steps, loss_target, verbose)
+    stats.rehearsal_final_loss = last_rehearsal[0]
+    stats.rehearsal_count = rehearsal_count
+    return stats
+
+
+def combine_grads(grads_c: Any, rehearsal_grads: list[Any], weight: float) -> Any:
+    """``grads_c + weight * mean(rehearsal_grads)`` over nested trees of arrays.
+
+    The trees must share the structure ``mlx.nn.value_and_grad`` produces for
+    the model's trainable parameters. Rehearsal gradients are accumulated one
+    tree at a time (a running sum, then scaled) so no padded batch is ever
+    formed. With no rehearsal gradients or ``weight == 0`` the correction
+    gradient is returned unchanged.
+
+    Args:
+        grads_c: Gradient tree of the correction example.
+        rehearsal_grads: Gradient trees of the rehearsal examples.
+        weight: Multiplier on the mean rehearsal gradient.
+
+    Returns:
+        The combined gradient tree.
+    """
+    if not rehearsal_grads or weight == 0:
+        return grads_c
+    total = rehearsal_grads[0]
+    for grads_r in rehearsal_grads[1:]:
+        total = mlx.utils.tree_map(lambda a, b: a + b, total, grads_r)
+    scale = weight / len(rehearsal_grads)
+    return mlx.utils.tree_map(lambda c, r: c + scale * r, grads_c, total)
+
+
+def _prepare_training_device(verbose: bool) -> None:
+    """Wire the Metal working set and cap the buffer cache before a training loop."""
+    if verbose:
+        vizible.green(f"During training: {mlx.core.metal.device_info() = }")
+    max_recommended_working_set_size = mlx.core.metal.device_info()[
+        "max_recommended_working_set_size"
+    ]
+    assert isinstance(max_recommended_working_set_size, int)
+
+    mlx.core.set_wired_limit(max_recommended_working_set_size)
+    max_buffer_length = mlx.core.metal.device_info()["max_buffer_length"]
+    assert isinstance(max_buffer_length, int)
+
+    # Cap the buffer cache: caching up to max_buffer_length (many GB) lets freed
+    # activations accumulate across hundreds of training steps until Metal OOMs.
+    mlx.core.set_cache_limit(min(max_buffer_length, 1 << 30))
+    world = mlx.core.distributed.init()
+    world_size = world.size()
+    rank = world.rank()
+    if world_size > 1:
+        tqdm.tqdm.write(f"Node {rank} of {world_size}")
 
 
 class StatefulLLM:
@@ -586,26 +689,7 @@ class StatefulLLM:
             self._optimizer.update(self._model, grads)
             return loss
 
-        if verbose:
-            vizible.green(f"During training: {mlx.core.metal.device_info() = }")
-        max_recommended_working_set_size = mlx.core.metal.device_info()[
-            "max_recommended_working_set_size"
-        ]
-        assert isinstance(max_recommended_working_set_size, int)
-
-        mlx.core.set_wired_limit(max_recommended_working_set_size)
-        max_buffer_length = mlx.core.metal.device_info()["max_buffer_length"]
-        assert isinstance(max_buffer_length, int)
-
-        # Cap the buffer cache: caching up to max_buffer_length (many GB) lets freed
-        # activations accumulate across hundreds of training steps until Metal OOMs.
-        mlx.core.set_cache_limit(min(max_buffer_length, 1 << 30))
-        world = mlx.core.distributed.init()
-        world_size = world.size()
-        rank = world.rank()
-        if world_size > 1:
-            tqdm.tqdm.write(f"Node {rank} of {world_size}")
-
+        _prepare_training_device(verbose)
         progress = tqdm.tqdm(desc="Training", total=max_steps)
 
         def one_step() -> float:
@@ -620,13 +704,98 @@ class StatefulLLM:
         finally:
             self._model.train(False)
             progress.close()
-        if verbose:
-            vizible.cyan(
-                f"Trained {stats.steps} steps, loss {stats.initial_loss:.4f} → "
-                f"{stats.final_loss:.4f}"
-                + (" (loss target reached)" if stats.stopped_early else "")
-            )
+        self._report_training(stats, verbose)
         return stats
+
+    def _train_joint_locked(
+        self,
+        correction: TrainingExample,
+        rehearsal: List[TrainingExample],
+        verbose: bool,
+        max_steps: int,
+        loss_target: float | None,
+        rehearsal_weight: float,
+    ) -> TrainingStats:
+        """Joint correction + rehearsal steps; caller must hold ``_lock``.
+
+        Each step computes the correction's gradient and every rehearsal
+        example's gradient as separate single-sequence forward/backward
+        passes (never a padded batch, so peak memory stays that of one
+        sequence), combines them with ``combine_grads``, and applies one
+        optimizer update. Intermediate gradients are evaluated as they are
+        produced so their activations are released before the next pass.
+
+        Args:
+            correction: The corrected answer, whose loss drives the stop rule.
+            rehearsal: Self-distillation examples anchoring the model.
+            verbose: Print per-step losses and device info.
+            max_steps: Step cap.
+            loss_target: Stop once the correction loss is below this.
+            rehearsal_weight: Multiplier on the mean rehearsal gradient.
+
+        Returns:
+            ``TrainingStats`` for this call, rehearsal loss included.
+        """
+        state = [self._model.state, self._optimizer.state, mlx.core.random.state]
+        mlx.core.eval(state)
+        loss_and_grad_fn = mlx.nn.value_and_grad(self._model, _loss_fn)
+
+        _prepare_training_device(verbose)
+        progress = tqdm.tqdm(desc="Training", total=max_steps)
+
+        def one_step() -> Tuple[float, float | None]:
+            loss_c, grads_c = loss_and_grad_fn(
+                self._model, correction.input, correction.label, correction.mask
+            )
+            mlx.core.eval(loss_c, grads_c)
+            rehearsal_losses: list[float] = []
+            rehearsal_grads: list[Any] = []
+            for example in rehearsal:
+                loss_r, grads_r = loss_and_grad_fn(
+                    self._model, example.input, example.label, example.mask
+                )
+                mlx.core.eval(loss_r, grads_r)
+                rehearsal_losses.append(loss_r.item())
+                rehearsal_grads.append(grads_r)
+                del loss_r, grads_r
+            grads = combine_grads(grads_c, rehearsal_grads, rehearsal_weight)
+            del grads_c, rehearsal_grads
+            self._optimizer.update(self._model, grads)
+            mlx.core.eval(state)
+            del grads
+            progress.update(1)
+            loss_r_mean = (
+                sum(rehearsal_losses) / len(rehearsal_losses)
+                if rehearsal_losses
+                else None
+            )
+            return loss_c.item(), loss_r_mean
+
+        self._model.train(True)
+        try:
+            stats = run_joint_training_steps(
+                one_step, max_steps, loss_target, len(rehearsal), verbose
+            )
+        finally:
+            self._model.train(False)
+            progress.close()
+        self._report_training(stats, verbose)
+        return stats
+
+    @staticmethod
+    def _report_training(stats: TrainingStats, verbose: bool) -> None:
+        if not verbose:
+            return
+        rehearsal = (
+            f", rehearsal {stats.rehearsal_final_loss:.4f} (k={stats.rehearsal_count})"
+            if stats.rehearsal_final_loss is not None
+            else ""
+        )
+        vizible.cyan(
+            f"Trained {stats.steps} steps, loss {stats.initial_loss:.4f} → "
+            f"{stats.final_loss:.4f}{rehearsal}"
+            + (" (loss target reached)" if stats.stopped_early else "")
+        )
 
     def train_on_example(
         self,
@@ -673,6 +842,71 @@ class StatefulLLM:
         finally:
             # Release cached activation buffers between items; otherwise a long
             # sequential run accumulates them until Metal reports OOM.
+            mlx.core.clear_cache()
+            self._model_is_stable = True
+        return stats
+
+    def train_on_examples(
+        self,
+        correction: TrainingExample,
+        rehearsal: List[TrainingExample],
+        *,
+        loss_target: float | None,
+        max_steps: int,
+        rehearsal_weight: float = 1.0,
+        verbose: bool = False,
+        save_checkpoint: bool = False,
+    ) -> TrainingStats:
+        """Train on a correction jointly with rehearsal examples.
+
+        Every optimizer step uses ``grad(correction) + rehearsal_weight *
+        mean(grad(rehearsal_i))``, each gradient from its own single-sequence
+        pass, and stops as soon as the *correction* loss is below
+        ``loss_target`` or after ``max_steps`` steps. Training rehearsal
+        examples in their own calls (``train_on_example`` each) does nothing
+        under a loss target, since their loss already sits below it; folding
+        them into the correction's step is what lets them anchor the model
+        while the correction is being driven in.
+
+        Args:
+            correction: Pre-constructed example whose loss drives the stop rule.
+            rehearsal: Self-distillation examples; may be empty, in which case
+                this is ``train_on_example`` with the same target and cap.
+            loss_target: Stop as soon as the correction loss is below this;
+                ``None`` runs exactly ``max_steps`` steps.
+            max_steps: Step cap.
+            rehearsal_weight: Multiplier on the mean rehearsal gradient.
+            verbose: Enable verbose logging.
+            save_checkpoint: Whether to save the model after training.
+
+        Returns:
+            ``TrainingStats`` for the call; ``rehearsal_final_loss`` is the
+            mean rehearsal loss at the last step.
+        """
+        if rehearsal_weight < 0:
+            raise ValueError(f"rehearsal_weight must be >= 0, got {rehearsal_weight}")
+        self._model_is_stable = False
+        try:
+            with self._lock:
+                if rehearsal:
+                    stats = self._train_joint_locked(
+                        correction,
+                        list(rehearsal),
+                        verbose=verbose,
+                        max_steps=max_steps,
+                        loss_target=loss_target,
+                        rehearsal_weight=rehearsal_weight,
+                    )
+                else:
+                    stats = self._train_locked(
+                        correction,
+                        verbose=verbose,
+                        max_steps=max_steps,
+                        loss_target=loss_target,
+                    )
+                if save_checkpoint and self._model_path is not None:
+                    self._save_checkpoint()
+        finally:
             mlx.core.clear_cache()
             self._model_is_stable = True
         return stats

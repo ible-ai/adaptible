@@ -516,6 +516,119 @@ class TrainingStepLoopTest(unittest.TestCase):
         self.assertEqual(stats.losses, [1.5, 0.25])
         self.assertIsInstance(stats.final_loss, float)
 
+    def test_single_example_stats_have_no_rehearsal(self):
+        step, _ = self._scripted([2.0, 0.5])
+        stats = _llm.run_training_steps(step, max_steps=2, loss_target=0.6)
+        self.assertIsNone(stats.rehearsal_final_loss)
+        self.assertEqual(stats.rehearsal_count, 0)
+
+
+class JointTrainingStepTest(unittest.TestCase):
+    """Model-free tests for the joint correction + rehearsal objective."""
+
+    @staticmethod
+    def _scripted(pairs):
+        it = iter(pairs)
+        calls = []
+
+        def step():
+            pair = next(it)
+            calls.append(pair)
+            return pair
+
+        return step, calls
+
+    def test_stops_on_correction_loss_only(self):
+        # Rehearsal is under the target from the first step; the correction
+        # crosses on step 3. Training must run 3 steps, not 1.
+        step, calls = self._scripted(
+            [(6.05, 0.5), (2.1, 0.45), (0.58, 0.41), (0.2, 0.4)]
+        )
+        stats = _llm.run_joint_training_steps(
+            step, max_steps=12, loss_target=0.6, rehearsal_count=4
+        )
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(stats.steps, 3)
+        self.assertEqual(stats.losses, [6.05, 2.1, 0.58])
+        self.assertEqual(stats.initial_loss, 6.05)
+        self.assertEqual(stats.final_loss, 0.58)
+        self.assertEqual(stats.rehearsal_final_loss, 0.41)
+        self.assertEqual(stats.rehearsal_count, 4)
+        self.assertTrue(stats.stopped_early)
+        self.assertFalse(stats.hit_cap)
+
+    def test_low_rehearsal_loss_never_stops_a_capped_correction(self):
+        step, calls = self._scripted([(3.0, 0.01), (2.0, 0.01), (1.0, 0.01)])
+        stats = _llm.run_joint_training_steps(
+            step, max_steps=3, loss_target=0.6, rehearsal_count=1
+        )
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(stats.hit_cap)
+        self.assertEqual(stats.final_loss, 1.0)
+        self.assertEqual(stats.rehearsal_final_loss, 0.01)
+
+    def test_rehearsal_loss_none_without_rehearsal(self):
+        step, _ = self._scripted([(2.0, None), (0.5, None)])
+        stats = _llm.run_joint_training_steps(
+            step, max_steps=5, loss_target=0.6, rehearsal_count=0
+        )
+        self.assertEqual(stats.steps, 2)
+        self.assertIsNone(stats.rehearsal_final_loss)
+        self.assertEqual(stats.rehearsal_count, 0)
+
+    def test_array_losses_are_coerced(self):
+        step, _ = self._scripted([(mx.array(0.25), mx.array(0.75))])
+        stats = _llm.run_joint_training_steps(
+            step, max_steps=5, loss_target=0.6, rehearsal_count=1
+        )
+        self.assertEqual(stats.losses, [0.25])
+        self.assertIsInstance(stats.rehearsal_final_loss, float)
+        self.assertEqual(stats.rehearsal_final_loss, 0.75)
+
+
+class CombineGradsTest(unittest.TestCase):
+    """combine_grads over nested dicts of mx arrays."""
+
+    @staticmethod
+    def _tree(a, b):
+        return {"layers": [{"lora_a": mx.array(a)}], "head": {"lora_b": mx.array(b)}}
+
+    @staticmethod
+    def _flat(tree):
+        return (
+            tree["layers"][0]["lora_a"].tolist(),
+            tree["head"]["lora_b"].tolist(),
+        )
+
+    def test_weighted_mean_is_added_to_correction(self):
+        grads_c = self._tree([1.0, 2.0], [[1.0]])
+        rehearsal = [
+            self._tree([2.0, 4.0], [[10.0]]),
+            self._tree([4.0, 8.0], [[30.0]]),
+        ]
+        combined = _llm.combine_grads(grads_c, rehearsal, weight=0.5)
+        # mean = ([3, 6], [[20]]); weight 0.5 -> ([1.5, 3], [[10]]) added.
+        self.assertEqual(self._flat(combined), ([2.5, 5.0], [[11.0]]))
+        # Inputs are untouched.
+        self.assertEqual(self._flat(grads_c), ([1.0, 2.0], [[1.0]]))
+        self.assertEqual(self._flat(rehearsal[0]), ([2.0, 4.0], [[10.0]]))
+
+    def test_unit_weight_single_rehearsal(self):
+        grads_c = self._tree([1.0], [[0.0]])
+        combined = _llm.combine_grads(
+            grads_c, [self._tree([-1.0], [[2.0]])], weight=1.0
+        )
+        self.assertEqual(self._flat(combined), ([0.0], [[2.0]]))
+
+    def test_empty_rehearsal_returns_correction_unchanged(self):
+        grads_c = self._tree([1.0, 2.0], [[3.0]])
+        self.assertIs(_llm.combine_grads(grads_c, [], weight=1.0), grads_c)
+
+    def test_zero_weight_returns_correction_unchanged(self):
+        grads_c = self._tree([1.0], [[3.0]])
+        rehearsal = [self._tree([100.0], [[100.0]])]
+        self.assertIs(_llm.combine_grads(grads_c, rehearsal, weight=0.0), grads_c)
+
 
 class ValidationTest(unittest.TestCase):
     """Tests for revision validation logic."""

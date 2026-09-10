@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .._classes import InteractionHistory, TrainingExample
+from .. import _llm
 from .._llm import StatefulLLM, TrainingStats
 from ..db import (
     Database,
@@ -55,6 +56,58 @@ def validate_training_source(training_source: str) -> None:
         )
 
 
+# ``StatefulLLM``'s LoRA defaults, exposed so the CLIs and reports share them.
+DEFAULT_LORA_RANK: int = int(_llm._LORA_PARAMETERS["rank"])
+DEFAULT_LORA_LAYERS: int = int(_llm._NUM_LORA_LAYERS)
+DEFAULT_LORA_SCALE: float = float(_llm._LORA_PARAMETERS["scale"])
+
+
+def lora_model_kwargs(
+    rank: int = DEFAULT_LORA_RANK,
+    layers: int = DEFAULT_LORA_LAYERS,
+    scale: float = DEFAULT_LORA_SCALE,
+) -> dict[str, Any]:
+    """``StatefulLLM`` keyword arguments for a LoRA configuration.
+
+    The CLIs thread ``--lora_rank`` / ``--lora_layers`` / ``--lora_scale``
+    through ``model_kwargs`` with this, so the values are recorded in the
+    experiment's config_json alongside everything else the model was built
+    with.
+    """
+    if not isinstance(rank, int) or rank <= 0:
+        raise ValueError(f"lora rank must be a positive int, got {rank!r}")
+    if not isinstance(layers, int) or layers <= 0:
+        raise ValueError(f"lora layers must be a positive int, got {layers!r}")
+    if scale <= 0:
+        raise ValueError(f"lora scale must be positive, got {scale!r}")
+    return {
+        "num_lora_layers": layers,
+        "lora_parameters": {"rank": rank, "dropout": 0.0, "scale": float(scale)},
+    }
+
+
+def lora_settings(model_kwargs: dict[str, Any] | None) -> tuple[int, int, float]:
+    """``(rank, layers, scale)`` a model built with ``model_kwargs`` uses.
+
+    Missing keys fall back to ``StatefulLLM``'s defaults, so runs recorded
+    before the LoRA flags existed report the capacity they actually trained
+    with.
+    """
+    model_kwargs = model_kwargs or {}
+    params = model_kwargs.get("lora_parameters") or {}
+    return (
+        int(params.get("rank", DEFAULT_LORA_RANK)),
+        int(model_kwargs.get("num_lora_layers", DEFAULT_LORA_LAYERS)),
+        float(params.get("scale", DEFAULT_LORA_SCALE)),
+    )
+
+
+def lora_settings_text(model_kwargs: dict[str, Any] | None) -> str:
+    """``LoRA: rank 32, layers 24, scale 10.0`` for logs and reports."""
+    rank, layers, scale = lora_settings(model_kwargs)
+    return f"LoRA: rank {rank}, layers {layers}, scale {scale:g}"
+
+
 @dataclasses.dataclass
 class EvaluationConfig:
     """Configuration for an evaluation run.
@@ -73,29 +126,35 @@ class EvaluationConfig:
             ``think_mode="none"`` (the pre-1.0.0a4 target, for comparison);
             ``None``/``True`` defer to ``think_mode``. After construction it is
             always ``think_mode != "none"``.
-        rehearsal_k: When > 0, every training step batches the correction with
+        rehearsal_k: When > 0, every training step combines the correction with
             ``k`` rehearsal examples: other *trained-split* items whose baseline
             answer was judged correct, with the model's own full baseline output
             as the target (self-distillation). Sampled with
             ``seed + item index``; the item being corrected is never in its own
-            rehearsal set. Holdout items are never used. The correction and each
-            rehearsal example are trained as separate single-row calls (see
-            ``_train_one_item``), so memory is bounded by one sequence.
+            rehearsal set. Holdout items are never used. The item is trained
+            with one ``StatefulLLM.train_on_examples`` call whose every step
+            applies ``grad(correction) + rehearsal_weight * mean(grad(rehearsal))``,
+            each gradient from its own single-sequence pass, so memory is
+            bounded by one sequence (see ``_train_one_item``).
+        rehearsal_weight: Multiplier on the mean rehearsal gradient in that
+            joint step. ``0`` keeps the rehearsal passes (and their loss
+            reporting) but lets only the correction move the weights.
         rehearsal_max_tokens: Items whose raw baseline response is longer than
             this many tokens are excluded from the rehearsal pool. Rehearsal
             targets are the model's own full baseline output, which can run to
             the generation cap; this keeps every training sequence bounded.
-        training_iterations: Cap on optimizer steps per ``train_on_example``
-            call. With a ``loss_target`` this is a ceiling, not a count.
+        training_iterations: Cap on optimizer steps per training call. With a
+            ``loss_target`` this is a ceiling, not a count.
         loss_target: Stop each training call as soon as a step's loss falls
             below this. A per-step probe on the real model showed the greedy
             answer flips to the correction at a mean target loss of ~0.6 with
             the reasoning intact, while driving the loss to ~0 (what a fixed
             5-25 iterations does) collapses the reasoning and bleeds the answer
             into unrelated questions. ``None`` (or any value <= 0) disables the
-            target and trains exactly ``training_iterations`` steps. Rehearsal
-            examples use the same target; their loss is already low, so they
-            normally stop after one step unless the model drifted.
+            target and trains exactly ``training_iterations`` steps. Only the
+            correction loss is compared against the target; the rehearsal loss
+            is reported (``ItemResult.train_rehearsal_final_loss``) but never
+            stops training.
     """
 
     name: str = "default"
@@ -112,6 +171,7 @@ class EvaluationConfig:
     close_think: bool | None = None
     rehearsal_k: int = 0
     rehearsal_max_tokens: int = 768
+    rehearsal_weight: float = 1.0
 
     def __post_init__(self) -> None:
         validate_training_source(self.training_source)
@@ -120,6 +180,7 @@ class EvaluationConfig:
         self.close_think = self.think_mode != "none"
         validate_rehearsal_k(self.rehearsal_k)
         validate_rehearsal_max_tokens(self.rehearsal_max_tokens)
+        self.rehearsal_weight = validate_rehearsal_weight(self.rehearsal_weight)
         self.loss_target = normalize_loss_target(self.loss_target)
 
 
@@ -128,6 +189,15 @@ def normalize_loss_target(loss_target: float | None) -> float | None:
     if loss_target is None or loss_target <= 0:
         return None
     return float(loss_target)
+
+
+def validate_rehearsal_weight(rehearsal_weight: float) -> float:
+    """Return ``rehearsal_weight`` as a float; raise ValueError if negative."""
+    if isinstance(rehearsal_weight, bool) or rehearsal_weight is None:
+        raise ValueError(f"rehearsal_weight must be a number, got {rehearsal_weight!r}")
+    if rehearsal_weight < 0:
+        raise ValueError(f"rehearsal_weight must be >= 0, got {rehearsal_weight!r}")
+    return float(rehearsal_weight)
 
 
 def validate_rehearsal_k(rehearsal_k: int) -> None:
@@ -174,6 +244,8 @@ class ItemResult:
         train_final_loss: Loss at the correction's last step.
         train_hit_cap: The correction ran out of steps without reaching the
             loss target.
+        train_rehearsal_final_loss: Mean rehearsal loss at the correction's last
+            step; None when the item was trained without rehearsal.
     """
 
     item_id: str
@@ -201,6 +273,7 @@ class ItemResult:
     train_initial_loss: float | None = None
     train_final_loss: float | None = None
     train_hit_cap: bool = False
+    train_rehearsal_final_loss: float | None = None
 
     @property
     def post_empty_think(self) -> bool:
@@ -227,6 +300,9 @@ class EvaluationResult:
     timestamp: str
     items: list[ItemResult] = dataclasses.field(default_factory=list)
     total_time_seconds: float = 0.0
+    # ``StatefulLLM`` keyword arguments the harness was given (LoRA capacity,
+    # learning rate); empty when a pre-built model was passed in.
+    model_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     # Computed metrics
     @property
@@ -476,6 +552,18 @@ class EvaluationResult:
         return sum(losses) / len(losses)
 
     @property
+    def mean_train_rehearsal_final_loss(self) -> float | None:
+        """Mean final rehearsal loss over trained items that had rehearsal."""
+        losses = [
+            item.train_rehearsal_final_loss
+            for item in self.train_items
+            if item.train_rehearsal_final_loss is not None
+        ]
+        if not losses:
+            return None
+        return sum(losses) / len(losses)
+
+    @property
     def train_cap_hit_count(self) -> int:
         """Trained items whose correction ran to the step cap."""
         return sum(1 for item in self.train_items if item.train_hit_cap)
@@ -488,7 +576,12 @@ class EvaluationResult:
             self.train_cap_hit_count,
             self.config.training_iterations,
             self.config.loss_target,
+            [item.train_rehearsal_final_loss for item in self.train_items],
         )
+
+    def lora_settings_text(self) -> str:
+        """``LoRA: rank 32, layers 24, scale 10.0`` for the model this run used."""
+        return lora_settings_text(self.model_kwargs)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -506,7 +599,12 @@ class EvaluationResult:
                 "close_think": self.config.close_think,
                 "rehearsal_k": self.config.rehearsal_k,
                 "rehearsal_max_tokens": self.config.rehearsal_max_tokens,
+                "rehearsal_weight": self.config.rehearsal_weight,
             },
+            "model_kwargs": self.model_kwargs,
+            "lora": dict(
+                zip(("rank", "layers", "scale"), lora_settings(self.model_kwargs))
+            ),
             "dataset_name": self.dataset_name,
             "timestamp": self.timestamp,
             "total_time_seconds": self.total_time_seconds,
@@ -527,6 +625,7 @@ class EvaluationResult:
                 "revision_summary": self.revision_summary(),
                 "mean_train_steps": self.mean_train_steps,
                 "mean_train_final_loss": self.mean_train_final_loss,
+                "mean_train_rehearsal_final_loss": self.mean_train_rehearsal_final_loss,
                 "train_cap_hit_count": self.train_cap_hit_count,
             },
             "items": [
@@ -556,6 +655,7 @@ class EvaluationResult:
                     "train_initial_loss": item.train_initial_loss,
                     "train_final_loss": item.train_final_loss,
                     "train_hit_cap": item.train_hit_cap,
+                    "train_rehearsal_final_loss": item.train_rehearsal_final_loss,
                 }
                 for item in self.items
             ],
@@ -568,11 +668,13 @@ def training_summary_text(
     cap_hits: int,
     cap: int,
     loss_target: float | None,
+    rehearsal_final_losses: list[float | None] | None = None,
 ) -> str:
     """Format ``Training: mean 3.2 steps/item (cap 12), mean final loss 0.55; ...``.
 
     Shared by the harness and the meta-learning experiment so both print the
-    same line.
+    same line. When any item reported a rehearsal loss the mean is appended
+    to the correction's: ``mean final loss 0.39 (rehearsal 0.41)``.
     """
     if not steps:
         return "Training: no items trained"
@@ -581,6 +683,9 @@ def training_summary_text(
     loss_text = (
         f"{sum(losses) / len(losses):.2f}" if losses else "n/a"
     )
+    rehearsal = [l for l in (rehearsal_final_losses or []) if l is not None]
+    if rehearsal:
+        loss_text += f" (rehearsal {sum(rehearsal) / len(rehearsal):.2f})"
     target_text = f"{loss_target:.2f}" if loss_target is not None else "off"
     return (
         f"Training: mean {mean_steps:.1f} steps/item (cap {cap}, loss target "
@@ -839,22 +944,28 @@ class TrainingOutcome:
     revision_answer: str | None = None
     revision_has_key_terms: bool | None = None
     rehearsal_item_ids: list[str] = dataclasses.field(default_factory=list)
-    # Stats for the correction call (the first train_on_example call).
+    # Stats for the item's single training call; the losses are the correction's.
     train_steps: int = 0
     train_initial_loss: float | None = None
     train_final_loss: float | None = None
     train_hit_cap: bool = False
-    # Stats for every call, correction first then rehearsal examples in order.
+    # Mean rehearsal loss at the last step (None without rehearsal).
+    train_rehearsal_final_loss: float | None = None
+    # The full stats of the call (one entry; kept as a list for callers that
+    # iterate it).
     training_stats: list[TrainingStats] = dataclasses.field(default_factory=list)
 
     def training_text(self) -> str:
-        """``3 steps, loss 6.05 → 0.58`` for the verbose per-item line."""
+        """``3 steps, loss 6.05 → 0.58 (rehearsal 0.41)`` for the verbose per-item line."""
         if self.train_initial_loss is None or self.train_final_loss is None:
             return f"{self.train_steps} steps"
-        return (
+        text = (
             f"{self.train_steps} steps, loss {self.train_initial_loss:.2f} → "
             f"{self.train_final_loss:.2f}"
         )
+        if self.train_rehearsal_final_loss is not None:
+            text += f" (rehearsal {self.train_rehearsal_final_loss:.2f})"
+        return text
 
 
 def _train_one_item(
@@ -870,23 +981,24 @@ def _train_one_item(
     think_mode: str = "baseline",
     rehearsal: list[tuple[TriviaItem, str]] | None = None,
     loss_target: float | None = None,
+    rehearsal_weight: float = 1.0,
 ) -> TrainingOutcome:
     """Build the target, train, and record the event for one item.
 
     ``baseline_response`` is the raw baseline output (think block included).
-    ``rehearsal`` is a list of ``(item, baseline_raw)`` pairs whose self-
-    distillation examples are trained after the correction. Every example is
-    its own single-row ``train_on_example`` call (correction first, then the
-    rehearsal examples in order) so peak memory is bounded by one sequence;
-    padding a batch of rehearsal targets that can run to the generation cap
-    exhausted a 16 GB machine. One training event is recorded for the item,
-    with ``training_time_seconds`` summed over the calls and
-    ``training_iterations`` set to the steps the correction actually took.
-
-    Every call gets ``loss_target`` and ``max_steps=training_iterations``:
-    training stops as soon as a step's loss is below the target. Rehearsal
-    examples share the target; their loss is already low, so they stop after
-    one step unless the model drifted, which is the intended anchoring.
+    ``rehearsal`` is a list of ``(item, baseline_raw)`` pairs turned into
+    self-distillation examples. With rehearsal the item is one
+    ``model.train_on_examples(correction, rehearsal, ...)`` call: every step
+    combines the correction's gradient with ``rehearsal_weight`` times the
+    mean rehearsal gradient, each from its own single-row pass, so peak
+    memory is bounded by one sequence (padding a batch of rehearsal targets
+    that can run to the generation cap exhausted a 16 GB machine). Without
+    rehearsal it is one ``model.train_on_example(correction, ...)`` call.
+    Either way the call gets ``loss_target`` and ``max_steps =
+    training_iterations`` and stops as soon as the *correction* loss is below
+    the target; the rehearsal loss is only reported. One training event is
+    recorded for the item with ``training_iterations`` set to the steps
+    actually taken.
 
     On ``InvalidRevisionError`` the item is not trained and the outcome carries
     ``revision_invalid=True`` plus the error text.
@@ -901,8 +1013,12 @@ def _train_one_item(
         )
     tokenizer = model._tokenizer
     rehearsal = rehearsal or []
-    examples = [correction] + [
-        make_rehearsal_example(r_item, r_raw, tokenizer) for r_item, r_raw in rehearsal
+    correction_row = collate_training_examples([correction], tokenizer)
+    rehearsal_rows = [
+        collate_training_examples(
+            [make_rehearsal_example(r_item, r_raw, tokenizer)], tokenizer
+        )
+        for r_item, r_raw in rehearsal
     ]
 
     revision_answer: str | None = None
@@ -912,20 +1028,23 @@ def _train_one_item(
         revision_has_key_terms = contains_key_terms(revision_answer, item.key_terms)
 
     train_start = time.time()
-    stats: list[TrainingStats] = []
-    for example in examples:
-        batched = collate_training_examples([example], tokenizer)
-        stats.append(
-            model.train_on_example(
-                batched,
-                iterations=training_iterations,
-                loss_target=loss_target,
-                max_steps=training_iterations,
-            )
+    if rehearsal_rows:
+        stats = model.train_on_examples(
+            correction_row,
+            rehearsal_rows,
+            loss_target=loss_target,
+            max_steps=training_iterations,
+            rehearsal_weight=rehearsal_weight,
+        )
+    else:
+        stats = model.train_on_example(
+            correction_row,
+            iterations=training_iterations,
+            loss_target=loss_target,
+            max_steps=training_iterations,
         )
     elapsed = time.time() - train_start
-    correction = stats[0]
-    _record_training_event(db, example_id, experiment_id, correction.steps, elapsed)
+    _record_training_event(db, example_id, experiment_id, stats.steps, elapsed)
     return TrainingOutcome(
         trained=True,
         revision_text=revision_text,
@@ -933,11 +1052,12 @@ def _train_one_item(
         revision_answer=revision_answer,
         revision_has_key_terms=revision_has_key_terms,
         rehearsal_item_ids=[r_item.id for r_item, _ in rehearsal],
-        train_steps=correction.steps,
-        train_initial_loss=correction.initial_loss,
-        train_final_loss=correction.final_loss,
-        train_hit_cap=correction.hit_cap,
-        training_stats=stats,
+        train_steps=stats.steps,
+        train_initial_loss=stats.initial_loss,
+        train_final_loss=stats.final_loss,
+        train_hit_cap=stats.hit_cap,
+        train_rehearsal_final_loss=stats.rehearsal_final_loss,
+        training_stats=[stats],
     )
 
 
@@ -1029,6 +1149,7 @@ class EvaluationHarness:
             config=config,
             dataset_name=dataset.name,
             timestamp=datetime.now().isoformat(),
+            model_kwargs=dict(self._model_kwargs),
         )
 
         # Create experiment record in database
@@ -1052,7 +1173,11 @@ class EvaluationHarness:
                     "close_think": config.close_think,
                     "rehearsal_k": config.rehearsal_k,
                     "rehearsal_max_tokens": config.rehearsal_max_tokens,
+                    "rehearsal_weight": config.rehearsal_weight,
                     "model_kwargs": self._model_kwargs,
+                    "lora": dict(
+                        zip(("rank", "layers", "scale"), lora_settings(self._model_kwargs))
+                    ),
                     "dataset_name": dataset.name,
                     "dataset_version": dataset.version,
                 }
@@ -1083,12 +1208,14 @@ class EvaluationHarness:
             print(f"Think mode: {config.think_mode}")
             print(
                 f"Rehearsal k: {config.rehearsal_k} "
-                f"(max tokens: {config.rehearsal_max_tokens})"
+                f"(max tokens: {config.rehearsal_max_tokens}, "
+                f"weight: {config.rehearsal_weight:g})"
             )
             print(
                 f"Loss target: {config.loss_target} "
                 f"(step cap: {config.training_iterations})"
             )
+            print(lora_settings_text(self._model_kwargs))
             if self._model_kwargs:
                 print(f"Model kwargs: {self._model_kwargs}")
             print(f"Experiment ID: {experiment_id}")
@@ -1183,6 +1310,7 @@ class EvaluationHarness:
                 config.think_mode,
                 rehearsal,
                 loss_target=config.loss_target,
+                rehearsal_weight=config.rehearsal_weight,
             )
             item_result.revision_text = outcome.revision_text
             item_result.revision_invalid = outcome.revision_invalid
@@ -1192,6 +1320,7 @@ class EvaluationHarness:
             item_result.train_initial_loss = outcome.train_initial_loss
             item_result.train_final_loss = outcome.train_final_loss
             item_result.train_hit_cap = outcome.train_hit_cap
+            item_result.train_rehearsal_final_loss = outcome.train_rehearsal_final_loss
             # An item whose revision was rejected was never trained on; keep it
             # out of the train metrics but flag it so it is counted.
             item_result.was_trained = outcome.trained
@@ -1288,8 +1417,10 @@ class EvaluationHarness:
                 print(result.revision_summary_text())
             print(
                 f"Think mode: {config.think_mode}; rehearsal k: {config.rehearsal_k} "
-                f"(max tokens: {config.rehearsal_max_tokens})"
+                f"(max tokens: {config.rehearsal_max_tokens}, "
+                f"weight: {config.rehearsal_weight:g})"
             )
+            print(result.lora_settings_text())
             print(result.collapse_summary_text())
             print(result.training_summary_text())
             print()

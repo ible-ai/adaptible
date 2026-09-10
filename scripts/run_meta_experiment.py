@@ -23,11 +23,16 @@ Options:
                             unmasked prefix, answer only in the loss), "empty"
                             ("</think>\n\n{answer}"), or "none" (old target)
     --[no]close_think       Deprecated alias: --noclose_think == --think_mode none
-    --rehearsal_k K         Train K self-distillation examples from correct
-                            trained-split items after each correction (default 0)
+    --rehearsal_k K         Fold K self-distillation examples from correct
+                            trained-split items into every correction step
+                            (default 0)
     --rehearsal_max_tokens N  Skip rehearsal items whose baseline is longer than
                             N tokens (default 768)
+    --rehearsal_weight W    Multiplier on the mean rehearsal gradient (default 1.0)
     --learning_rate LR      StatefulLLM learning rate (default: the model's)
+    --lora_rank R           LoRA rank (default 32)
+    --lora_layers N         Trailing layers converted to LoRA (default 24)
+    --lora_scale S          LoRA scale (default 10.0)
     --repeats N             Runs per seed with identical shuffle (noise control)
     --holdout-every-checkpoint  Probe the holdout set at every checkpoint
     --subset N              Only use first N items (for quick tests)
@@ -70,6 +75,11 @@ REVISION_PROMPTS = adaptible.revise.REVISION_PROMPTS
 THINK_MODES = adaptible.revise.THINK_MODES
 generate_default_dataset = adaptible.eval.generate_default_dataset
 load_dataset = adaptible.eval.load_dataset
+_harness = adaptible._src.eval.harness
+DEFAULT_LORA_RANK = _harness.DEFAULT_LORA_RANK
+DEFAULT_LORA_LAYERS = _harness.DEFAULT_LORA_LAYERS
+DEFAULT_LORA_SCALE = _harness.DEFAULT_LORA_SCALE
+lora_model_kwargs = _harness.lora_model_kwargs
 
 _NAME = flags.DEFINE_string("name", "meta_experiment", "Experiment name")
 _SEEDS = flags.DEFINE_string("seeds", "42,123,456", "Comma-separated random seeds")
@@ -119,9 +129,11 @@ _CLOSE_THINK = flags.DEFINE_boolean(
 _REHEARSAL_K = flags.DEFINE_integer(
     "rehearsal_k",
     0,
-    "Train K rehearsal examples after each correction, from trained-split items "
-    "the model already answered correctly (self-distillation), one single-row "
-    "call each. 0 disables.",
+    "Fold K rehearsal examples into every correction step, from trained-split "
+    "items the model already answered correctly (self-distillation): each step "
+    "applies grad(correction) + rehearsal_weight * mean(grad(rehearsal)), one "
+    "single-sequence pass per example, and stops on the correction loss alone. "
+    "0 disables.",
 )
 _REHEARSAL_MAX_TOKENS = flags.DEFINE_integer(
     "rehearsal_max_tokens",
@@ -129,8 +141,24 @@ _REHEARSAL_MAX_TOKENS = flags.DEFINE_integer(
     "Exclude items whose baseline response is longer than this many tokens from "
     "the rehearsal pool.",
 )
+_REHEARSAL_WEIGHT = flags.DEFINE_float(
+    "rehearsal_weight",
+    1.0,
+    "Multiplier on the mean rehearsal gradient in the joint step (>= 0).",
+)
 _LEARNING_RATE = flags.DEFINE_float(
     "learning_rate", None, "StatefulLLM learning rate (default: the model's)."
+)
+_LORA_RANK = flags.DEFINE_integer(
+    "lora_rank", DEFAULT_LORA_RANK, "LoRA rank of every converted linear layer."
+)
+_LORA_LAYERS = flags.DEFINE_integer(
+    "lora_layers",
+    DEFAULT_LORA_LAYERS,
+    "Number of trailing transformer layers whose linears are converted to LoRA.",
+)
+_LORA_SCALE = flags.DEFINE_float(
+    "lora_scale", DEFAULT_LORA_SCALE, "LoRA scale (alpha / rank)."
 )
 _REPEATS = flags.DEFINE_integer(
     "repeats", 1, "Runs per seed with an identical shuffle (noise control arm)"
@@ -366,6 +394,14 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
             <div class="config-item">
                 <div class="label">Rehearsal Max Tokens</div>
                 <div class="value">{result.config.rehearsal_max_tokens}</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Rehearsal Weight</div>
+                <div class="value">{result.config.rehearsal_weight:g}</div>
+            </div>
+            <div class="config-item">
+                <div class="label">LoRA (rank / layers / scale)</div>
+                <div class="value" style="font-size: 16px;">{" / ".join(f"{v:g}" for v in _harness.lora_settings(result.model_kwargs))}</div>
             </div>
             <div class="config-item">
                 <div class="label">Repeats / Seed</div>
@@ -606,6 +642,7 @@ def main(_):
         close_think=_CLOSE_THINK.value,
         rehearsal_k=_REHEARSAL_K.value,
         rehearsal_max_tokens=_REHEARSAL_MAX_TOKENS.value,
+        rehearsal_weight=_REHEARSAL_WEIGHT.value,
         repeats=_REPEATS.value,
         holdout_every_checkpoint=_HOLDOUT_EVERY_CHECKPOINT.value,
     )
@@ -618,7 +655,11 @@ def main(_):
     print(f"  Think mode: {config.think_mode}")
     print(f"  Rehearsal k: {config.rehearsal_k}")
     print(f"  Rehearsal max tokens: {config.rehearsal_max_tokens}")
-    model_kwargs = {}
+    print(f"  Rehearsal weight: {config.rehearsal_weight:g}")
+    model_kwargs = lora_model_kwargs(
+        rank=_LORA_RANK.value, layers=_LORA_LAYERS.value, scale=_LORA_SCALE.value
+    )
+    print(f"  {_harness.lora_settings_text(model_kwargs)}")
     if _LEARNING_RATE.value is not None:
         model_kwargs["learning_rate"] = _LEARNING_RATE.value
         print(f"  Learning rate: {_LEARNING_RATE.value}")

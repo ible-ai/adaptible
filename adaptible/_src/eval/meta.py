@@ -35,10 +35,13 @@ from .harness import (
     _insert_dataset_examples,
     _judge_only,
     _train_one_item,
+    lora_settings,
+    lora_settings_text,
     sample_rehearsal_ids,
     training_summary_text,
     validate_rehearsal_k,
     validate_rehearsal_max_tokens,
+    validate_rehearsal_weight,
     normalize_loss_target,
     validate_training_source,
 )
@@ -242,6 +245,8 @@ class SeedTrajectory:
             correction took under the loss target.
         train_final_losses: Per trained item, the correction's final loss.
         train_cap_hits: Trained items whose correction ran to the step cap.
+        train_rehearsal_final_losses: Per trained item, the mean rehearsal loss
+            at the last step (None for items trained without rehearsal).
     """
 
     seed: int
@@ -255,6 +260,9 @@ class SeedTrajectory:
     train_steps: list[int] = dataclasses.field(default_factory=list)
     train_final_losses: list[float | None] = dataclasses.field(default_factory=list)
     train_cap_hits: int = 0
+    train_rehearsal_final_losses: list[float | None] = dataclasses.field(
+        default_factory=list
+    )
 
     @property
     def mean_train_steps(self) -> float:
@@ -269,6 +277,13 @@ class SeedTrajectory:
             return None
         return sum(losses) / len(losses)
 
+    @property
+    def mean_train_rehearsal_final_loss(self) -> float | None:
+        losses = [l for l in self.train_rehearsal_final_losses if l is not None]
+        if not losses:
+            return None
+        return sum(losses) / len(losses)
+
     def training_summary_text(self, cap: int, loss_target: float | None) -> str:
         """Steps / final-loss / cap summary line; see ``harness.training_summary_text``."""
         return training_summary_text(
@@ -277,6 +292,7 @@ class SeedTrajectory:
             self.train_cap_hits,
             cap,
             loss_target,
+            self.train_rehearsal_final_losses,
         )
 
     @property
@@ -406,8 +422,10 @@ class SeedTrajectory:
             "train_steps": self.train_steps,
             "train_final_losses": self.train_final_losses,
             "train_cap_hits": self.train_cap_hits,
+            "train_rehearsal_final_losses": self.train_rehearsal_final_losses,
             "mean_train_steps": self.mean_train_steps,
             "mean_train_final_loss": self.mean_train_final_loss,
+            "mean_train_rehearsal_final_loss": self.mean_train_rehearsal_final_loss,
             "checkpoints": [c.to_dict() for c in self.checkpoints],
         }
 
@@ -424,6 +442,9 @@ class SeedTrajectory:
             train_steps=traj_data.get("train_steps", []),
             train_final_losses=traj_data.get("train_final_losses", []),
             train_cap_hits=traj_data.get("train_cap_hits", 0),
+            train_rehearsal_final_losses=traj_data.get(
+                "train_rehearsal_final_losses", []
+            ),
         )
         for cp_data in traj_data["checkpoints"]:
             trajectory.checkpoints.append(Checkpoint.from_dict(cp_data))
@@ -447,7 +468,9 @@ class MetaLearningConfig:
             ``EvaluationConfig.rehearsal_k``.
         rehearsal_max_tokens: Baseline token cap for rehearsal-pool items; see
             ``EvaluationConfig.rehearsal_max_tokens``.
-        training_iterations: Step cap per ``train_on_example`` call; see
+        rehearsal_weight: Multiplier on the mean rehearsal gradient in the
+            joint step; see ``EvaluationConfig.rehearsal_weight``.
+        training_iterations: Step cap per training call; see
             ``EvaluationConfig.training_iterations``.
         loss_target: Stop each training call once a step's loss is below this;
             ``None`` (or <= 0) trains exactly ``training_iterations`` steps.
@@ -474,6 +497,7 @@ class MetaLearningConfig:
     close_think: bool | None = None
     rehearsal_k: int = 0
     rehearsal_max_tokens: int = 768
+    rehearsal_weight: float = 1.0
     holdout_every_checkpoint: bool = False
     repeats: int = 1
 
@@ -484,6 +508,7 @@ class MetaLearningConfig:
         self.close_think = self.think_mode != "none"
         validate_rehearsal_k(self.rehearsal_k)
         validate_rehearsal_max_tokens(self.rehearsal_max_tokens)
+        self.rehearsal_weight = validate_rehearsal_weight(self.rehearsal_weight)
         self.loss_target = normalize_loss_target(self.loss_target)
         if self.repeats < 1:
             raise ValueError(f"repeats must be >= 1, got {self.repeats}")
@@ -503,6 +528,7 @@ class MetaLearningConfig:
             "close_think": self.close_think,
             "rehearsal_k": self.rehearsal_k,
             "rehearsal_max_tokens": self.rehearsal_max_tokens,
+            "rehearsal_weight": self.rehearsal_weight,
             "holdout_every_checkpoint": self.holdout_every_checkpoint,
             "repeats": self.repeats,
         }
@@ -523,6 +549,7 @@ class MetaLearningConfig:
             think_mode=_legacy_think_mode(data),
             rehearsal_k=data.get("rehearsal_k", 0),
             rehearsal_max_tokens=data.get("rehearsal_max_tokens", 768),
+            rehearsal_weight=data.get("rehearsal_weight", 1.0),
             holdout_every_checkpoint=data.get("holdout_every_checkpoint", False),
             repeats=data.get("repeats", 1),
         )
@@ -558,6 +585,13 @@ class MetaLearningResult:
         default_factory=dict
     )
     holdout_results: dict[int, float] = dataclasses.field(default_factory=dict)
+    # ``StatefulLLM`` keyword arguments of the default model factory (LoRA
+    # capacity, learning rate); empty for a custom factory or legacy files.
+    model_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def lora_settings_text(self) -> str:
+        """``LoRA: rank 32, layers 24, scale 10.0`` for the models this run used."""
+        return lora_settings_text(self.model_kwargs)
 
     @property
     def trajectories(self) -> dict[int, SeedTrajectory]:
@@ -675,6 +709,10 @@ class MetaLearningResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "config": self.config.to_dict(),
+            "model_kwargs": self.model_kwargs,
+            "lora": dict(
+                zip(("rank", "layers", "scale"), lora_settings(self.model_kwargs))
+            ),
             "dataset_name": self.dataset_name,
             "timestamp": self.timestamp,
             "best_seed": self.best_seed,
@@ -717,6 +755,7 @@ class MetaLearningResult:
             holdout_results={
                 int(k): v for k, v in data.get("holdout_results", {}).items()
             },
+            model_kwargs=data.get("model_kwargs", {}),
         )
 
         if "all_trajectories" in data:
@@ -795,6 +834,7 @@ class MetaLearningExperiment:
             config=config,
             dataset_name=dataset.name,
             timestamp=datetime.now().isoformat(),
+            model_kwargs=dict(self._model_kwargs),
         )
 
         for seed_idx, seed in enumerate(config.seeds):
@@ -831,12 +871,14 @@ class MetaLearningExperiment:
         print(f"  Think mode: {config.think_mode}")
         print(
             f"  Rehearsal k: {config.rehearsal_k} "
-            f"(max tokens: {config.rehearsal_max_tokens})"
+            f"(max tokens: {config.rehearsal_max_tokens}, "
+            f"weight: {config.rehearsal_weight:g})"
         )
         print(
             f"  Loss target: {config.loss_target} "
             f"(step cap: {config.training_iterations})"
         )
+        print(f"  {result.lora_settings_text()}")
         for (seed, repeat), traj in sorted(result.all_trajectories.items()):
             label = f"Seed {seed}" + (f" repeat {repeat}" if config.repeats > 1 else "")
             print(f"  {label}:")
@@ -940,7 +982,11 @@ class MetaLearningExperiment:
                     "close_think": config.close_think,
                     "rehearsal_k": config.rehearsal_k,
                     "rehearsal_max_tokens": config.rehearsal_max_tokens,
+                    "rehearsal_weight": config.rehearsal_weight,
                     "model_kwargs": self._model_kwargs,
+                    "lora": dict(
+                        zip(("rank", "layers", "scale"), lora_settings(self._model_kwargs))
+                    ),
                     "holdout_every_checkpoint": config.holdout_every_checkpoint,
                     "dataset_name": dataset.name,
                     "dataset_version": dataset.version,
@@ -1040,6 +1086,7 @@ class MetaLearningExperiment:
                     config.think_mode,
                     [(items_by_id[rid], baseline_raw[rid]) for rid in rehearsal_ids],
                     loss_target=config.loss_target,
+                    rehearsal_weight=config.rehearsal_weight,
                 )
                 if outcome.revision_invalid:
                     revision_invalid_ids.append(item.id)
@@ -1051,6 +1098,9 @@ class MetaLearningExperiment:
                 window_ids.append(item.id)
                 trajectory.train_steps.append(outcome.train_steps)
                 trajectory.train_final_losses.append(outcome.train_final_loss)
+                trajectory.train_rehearsal_final_losses.append(
+                    outcome.train_rehearsal_final_loss
+                )
                 if outcome.train_hit_cap:
                     trajectory.train_cap_hits += 1
                 if verbose:

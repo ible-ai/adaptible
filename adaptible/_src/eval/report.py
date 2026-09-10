@@ -153,6 +153,8 @@ def generate_html_report(
     think_mode = getattr(result.config, "think_mode", "empty")
     rehearsal_k = getattr(result.config, "rehearsal_k", 0)
     rehearsal_max_tokens = getattr(result.config, "rehearsal_max_tokens", 768)
+    rehearsal_weight = getattr(result.config, "rehearsal_weight", 1.0)
+    lora_text = html.escape(result.lora_settings_text())
     loss_target = getattr(result.config, "loss_target", None)
     loss_target_text = f"{loss_target:.2f}" if loss_target is not None else "off"
     training_text = html.escape(result.training_summary_text())
@@ -392,7 +394,8 @@ def generate_html_report(
         Training source: {html.escape(training_source)} |
         Revision prompt: {html.escape(revision_prompt)} |
         Think mode: <code>{html.escape(str(think_mode))}</code> |
-        Rehearsal k: <code>{rehearsal_k}</code> (max tokens: <code>{rehearsal_max_tokens}</code>) |
+        Rehearsal k: <code>{rehearsal_k}</code> (max tokens: <code>{rehearsal_max_tokens}</code>, weight: <code>{rehearsal_weight:g}</code>) |
+        {lora_text} |
         Training step cap: {result.config.training_iterations} (loss target: <code>{loss_target_text}</code>) |
         Train/Holdout split: {result.config.train_ratio:.0%}/{1-result.config.train_ratio:.0%} |
         Shuffle: {result.config.shuffle} (seed: {result.config.seed})

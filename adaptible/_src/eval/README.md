@@ -72,9 +72,17 @@ Templates without a think tag are unaffected by `think_mode`. Both `training_sou
 
 Every training call (`StatefulLLM.train_on_example`) runs single optimizer steps and stops as soon as a step's loss falls below `loss_target` (`EvaluationConfig.loss_target`, `MetaLearningConfig.loss_target`, `--loss_target`; default `0.6`), or after `training_iterations` steps (`--iterations`; default `12`, now a cap). A per-step probe on the real model with one correction (target "Ottawa"+eos, `think_mode=baseline`) started at loss 6.05; at a mean target loss of about 0.6 the greedy answer flipped to the correction while the reasoning stayed intact and an unrelated item was unaffected, and once the loss was driven below about 0.1 the model emitted the bare answer with no reasoning and answered "Ottawa" to unrelated questions. Every earlier run trained a fixed 5-25 iterations, which drives the loss to ~0; pass `--loss_target 0` (or `loss_target=None`) to reproduce that.
 
-Per item, `ItemResult` records `train_steps`, `train_initial_loss`, `train_final_loss`, and `train_hit_cap`; the `training_events.training_iterations` column stores the steps the correction actually took. The verbose log prints `Trained (3 steps, loss 6.05 → 0.58, 4.1s)` per item and the summary (and report header) carries `Training: mean 3.2 steps/item (cap 12, loss target 0.60), mean final loss 0.55; N items hit the cap`. Rehearsal examples use the same target; their loss is already low, so they normally stop after one step unless the model drifted, which is the intended anchoring. The server's `/trigger_review` path (`self_correct_and_train`) uses `StatefulLLM(loss_target=0.6, max_train_steps=12)`.
+Per item, `ItemResult` records `train_steps`, `train_initial_loss`, `train_final_loss`, `train_hit_cap`, and (with rehearsal) `train_rehearsal_final_loss`; the `training_events.training_iterations` column stores the steps the correction actually took. The verbose log prints `Trained (3 steps, loss 6.05 → 0.58 (rehearsal 0.41), 4.1s)` per item and the summary (and report header) carries `Training: mean 3.2 steps/item (cap 12, loss target 0.60), mean final loss 0.55 (rehearsal 0.41); N items hit the cap`; the `(rehearsal ...)` part appears only when some item trained with rehearsal. Only the correction loss is ever compared against the target. The server's `/trigger_review` path (`self_correct_and_train`) uses `StatefulLLM(loss_target=0.6, max_train_steps=12)`.
 
-The `empty` run above also drifted unrelated facts ("The skin" for the largest planet). `rehearsal_k` (`EvaluationConfig.rehearsal_k`, `MetaLearningConfig.rehearsal_k`, `--rehearsal_k`; default 0) follows every correction with `k` self-distillation examples: other *trained-split* items whose baseline answer was judged correct, with the model's own full baseline output (`{think}</think>\n\n{answer}{eos}`, whole target in the loss) as the target. Each example is its own single-row `train_on_example` call (same `loss_target`, `training_iterations` as the cap), correction first and then the rehearsal examples in order, so peak memory is bounded by one sequence (a padded `(1+k, L)` batch of rehearsal targets that ran to the generation cap exhausted a 16 GB machine). One training event is recorded per item, with the elapsed time summed over the calls. Rehearsal items are sampled with `seed + item index`, never include the item being corrected, and never include holdout items. `rehearsal_max_tokens` (`--rehearsal_max_tokens`; default 768) keeps items whose raw baseline response is longer than that out of the pool; if fewer than `k` items remain, the ones that do are used. `ItemResult.rehearsal_item_ids` records which items were used.
+The `empty` run above also drifted unrelated facts ("The skin" for the largest planet). `rehearsal_k` (`EvaluationConfig.rehearsal_k`, `MetaLearningConfig.rehearsal_k`, `--rehearsal_k`; default 0) folds `k` self-distillation examples into every step of a correction: other *trained-split* items whose baseline answer was judged correct, with the model's own full baseline output (`{think}</think>\n\n{answer}{eos}`, whole target in the loss) as the target. The item is one `StatefulLLM.train_on_examples(correction, rehearsal, loss_target=..., max_steps=training_iterations, rehearsal_weight=...)` call. Each step computes the correction's gradient and every rehearsal example's gradient as separate single-sequence passes (never a padded batch; a `(1+k, L)` batch of rehearsal targets that ran to the generation cap exhausted a 16 GB machine), combines them as `grad(correction) + rehearsal_weight * mean(grad(rehearsal))` (`_llm.combine_grads`), and applies one optimizer update; training stops when the *correction* loss is below `loss_target` or at the step cap. `rehearsal_weight` (`EvaluationConfig.rehearsal_weight`, `MetaLearningConfig.rehearsal_weight`, `--rehearsal_weight`; default 1.0) scales the rehearsal term; `0` keeps the passes and the loss reporting but lets only the correction move the weights. With `rehearsal_k=0`, or an empty pool, the item is a plain `train_on_example` call.
+
+This replaces the earlier scheme that trained each rehearsal example in its own `train_on_example` call after the correction. Under a loss target that did nothing: a rehearsal target's loss is the model's own output and already sits below 0.6, so every rehearsal call stopped after one tiny step. A 32-correction sequential run with k=4 rehearsal that way still collapsed (responses 718 → 21 tokens, 36/40 answers opening with an immediately closed think block, holdout 1/8 → 0/8). Whether the joint objective changes that has not been measured yet.
+
+One training event is recorded per item. Rehearsal items are sampled with `seed + item index`, never include the item being corrected, and never include holdout items. `rehearsal_max_tokens` (`--rehearsal_max_tokens`; default 768) keeps items whose raw baseline response is longer than that out of the pool; if fewer than `k` items remain, the ones that do are used. `ItemResult.rehearsal_item_ids` records which items were used.
+
+### LoRA capacity
+
+`StatefulLLM` converts the last 24 layers to rank-32 LoRA with scale 10.0 by default, which is a lot of capacity for a target a few tokens long. Both CLIs expose `--lora_rank` (default 32), `--lora_layers` (default 24), and `--lora_scale` (default 10.0); `harness.lora_model_kwargs(rank, layers, scale)` turns them into `StatefulLLM(num_lora_layers=..., lora_parameters={"rank": ..., "dropout": 0.0, "scale": ...})` through the existing `model_kwargs` path. The values are recorded in the experiment's `config_json` (`model_kwargs` and a derived `lora` entry), on `EvaluationResult.model_kwargs` / `MetaLearningResult.model_kwargs`, and shown as `LoRA: rank 32, layers 24, scale 10` in the verbose header, the summary, and both reports. Runs recorded before these flags existed report the defaults, which is what they trained with.
 
 ### Collapse signals
 
@@ -130,11 +138,15 @@ config = eval.EvaluationConfig(
     training_source="ground_truth",   # or "self_generated"
     revision_prompt="default",        # or "fewshot"; only used by self_generated
     think_mode="baseline",            # or "empty" / "none"; see above
-    rehearsal_k=0,                    # >0 trains self-distillation examples after each correction
+    rehearsal_k=0,                    # >0 folds self-distillation examples into each correction step
     rehearsal_max_tokens=768,         # rehearsal pool skips baselines longer than this
+    rehearsal_weight=1.0,             # multiplier on the mean rehearsal gradient
 )
 
-harness = eval.EvaluationHarness(model_kwargs={"learning_rate": 5e-5})  # note: loads <outputs>/autonomous/checkpoint if present
+from adaptible._src.eval.harness import lora_model_kwargs  # not re-exported from adaptible.eval yet
+
+model_kwargs = {"learning_rate": 5e-5, **lora_model_kwargs(rank=8, layers=8, scale=10.0)}
+harness = eval.EvaluationHarness(model_kwargs=model_kwargs)  # note: loads <outputs>/autonomous/checkpoint if present
 result = harness.run(dataset, config, verbose=True)
 
 eval.generate_html_report(result, "/tmp/report.html")
@@ -276,9 +288,13 @@ result = eval.MetaLearningResult.load("outputs/meta/meta.json")
 | `--revision_prompt` | `default`                         | `default` or `fewshot`; revision prompt preset for `self_generated` |
 | `--think_mode`      | `baseline`                        | `baseline`, `empty`, or `none` (see above)               |
 | `--close_think`     | `None`                            | Deprecated; `--noclose_think` is `--think_mode none`      |
-| `--rehearsal_k`     | `0`                               | Self-distillation examples trained after each correction |
+| `--rehearsal_k`     | `0`                               | Self-distillation examples folded into each correction step |
 | `--rehearsal_max_tokens` | `768`                        | Baseline token cap for rehearsal-pool items              |
+| `--rehearsal_weight` | `1.0`                            | Multiplier on the mean rehearsal gradient                |
 | `--learning_rate`   | `None`                            | `StatefulLLM(learning_rate=...)`; model default if unset |
+| `--lora_rank`       | `32`                              | LoRA rank                                                |
+| `--lora_layers`     | `24`                              | Trailing layers converted to LoRA                        |
+| `--lora_scale`      | `10.0`                            | LoRA scale                                               |
 | `--subset`          | `None`                            | Use only first N questions                               |
 | `--category`        | `None`                            | Filter to specific category                              |
 | `--output`          | `/tmp/adaptible_eval_report.html` | Report path                                              |

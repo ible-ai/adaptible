@@ -11,7 +11,8 @@ from mlx.utils import tree_flatten, tree_map
 ds = generate_default_dataset()
 wrong = next(i for i in ds if i.id == "geo_002")   # capital of Canada -> model says Montreal
 probe = next(i for i in ds if i.id == "sci_001")   # unrelated, to watch for damage
-m = adaptible.StatefulLLM(model_path=None)
+import os
+m = adaptible.StatefulLLM(model_path=None, num_lora_layers=int(os.environ.get("LORA_LAYERS", 24)), lora_parameters={"rank": int(os.environ.get("LORA_RANK", 32)), "dropout": 0.0, "scale": float(os.environ.get("LORA_SCALE", 10.0))})
 def ask(item): return strip_think_tags(m.generate_response(item.question, use_history=False, max_tokens=1024))
 base_w, base_p = ask(wrong), ask(probe)
 print(f"BASE wrong={contains_key_terms(base_w, wrong.key_terms)} {base_w[:60]!r} | probe={contains_key_terms(base_p, probe.key_terms)} {base_p[:60]!r}", flush=True)

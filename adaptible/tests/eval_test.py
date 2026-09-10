@@ -43,6 +43,9 @@ EOS = "<eos>"
 DONT_KNOW = "I do not know."
 # FakeModel's default per-step loss script: crosses a 0.6 target on step 3.
 FAKE_LOSSES = [6.05, 2.1, 0.58, 0.2, 0.05]
+# Rehearsal loss script: already under the target from step 1, so if it drove
+# the stop rule training would end before the correction landed.
+FAKE_REHEARSAL_LOSSES = [0.5, 0.45, 0.41, 0.4, 0.4]
 LONG_ANSWER_TOKENS = 2000  # a FakeModel(long_at_baseline=...) answer, in fake tokens
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -112,10 +115,13 @@ class FakeModel:
         long_at_baseline: Item ids whose trivia answer is padded out to
             ``LONG_ANSWER_TOKENS`` tokens, the way a small model rambles to the
             generation cap. Used to exercise ``rehearsal_max_tokens``.
-        train_losses: Per-step loss script every ``train_on_example`` call
+        train_losses: Per-step correction loss script every training call
             replays (the last value repeats past the end). The call stops
             through ``_llm.run_training_steps`` exactly as the real model does,
             so the steps it reports depend on ``loss_target``/``max_steps``.
+        rehearsal_losses: Per-step mean rehearsal loss script for
+            ``train_on_examples`` (last value repeats). Never consulted by the
+            stop rule, exactly as in ``_llm.run_joint_training_steps``.
     """
 
     def __init__(
@@ -127,9 +133,11 @@ class FakeModel:
         think: bool = False,
         long_at_baseline: set[str] | None = None,
         train_losses: list[float] | None = None,
+        rehearsal_losses: list[float] | None = None,
     ):
         self._tokenizer = FakeTokenizer(think=think)
         self._train_losses = list(train_losses or FAKE_LOSSES)
+        self._rehearsal_losses = list(rehearsal_losses or FAKE_REHEARSAL_LOSSES)
         self._think = think
         self._long_at_baseline = set(long_at_baseline or set())
         self._max_tokens = 4096
@@ -139,15 +147,22 @@ class FakeModel:
         self._learns_after = learns_after
         self._revision = revision
         self.learned: set[str] = set(known_at_baseline or set())
+        # Training calls of either kind; one per trained item.
         self.train_calls = 0
+        # Masked target of every call's correction, in order.
         self.trained_targets: list[str] = []
-        # Every row of every batch: (decoded masked target, decoded full sequence).
+        # Every example handed to a training call, in order (a joint call
+        # contributes its correction and then each rehearsal example): the
+        # rows of that example as (decoded masked target, decoded full sequence).
         self.trained_batches: list[list[tuple[str, str]]] = []
         self.batch_shapes: list[tuple[int, int]] = []
         self.revision_prompts: list[str] = []
         self.question_prompts: list[str] = []
         # (iterations, loss_target, max_steps) of every train_on_example call.
         self.train_kwargs: list[tuple[int, float | None, int | None]] = []
+        # Keyword arguments of every train_on_examples call, plus the number of
+        # rehearsal examples and their decoded masked targets.
+        self.joint_calls: list[dict] = []
         self.training_stats: list[TrainingStats] = []
 
     def generate_response(
@@ -190,19 +205,65 @@ class FakeModel:
     ) -> TrainingStats:
         del verbose, save_checkpoint
         self.train_kwargs.append((iterations, loss_target, max_steps))
-        script = iter(self._train_losses)
-        last = self._train_losses[-1]
+        step = self._scripted_step(self._train_losses)
+        stats = _llm.run_training_steps(
+            step, iterations if max_steps is None else max_steps, loss_target
+        )
+        return self._finish_call(stats, example)
+
+    def train_on_examples(
+        self,
+        correction,
+        rehearsal,
+        *,
+        loss_target: float | None,
+        max_steps: int,
+        rehearsal_weight: float = 1.0,
+        verbose: bool = False,
+        save_checkpoint: bool = False,
+    ) -> TrainingStats:
+        del verbose, save_checkpoint
+        rehearsal = list(rehearsal)
+        rehearsal_rows = [self._decode_rows(ex) for ex in rehearsal]
+        self.joint_calls.append(
+            {
+                "loss_target": loss_target,
+                "max_steps": max_steps,
+                "rehearsal_weight": rehearsal_weight,
+                "rehearsal_k": len(rehearsal),
+                "rehearsal_targets": [rows[0][0] for rows in rehearsal_rows],
+            }
+        )
+        step_c = self._scripted_step(self._train_losses)
+        step_r = self._scripted_step(self._rehearsal_losses)
+
+        def step() -> tuple[float, float | None]:
+            loss_c = step_c()
+            loss_r = step_r() if rehearsal else None
+            return loss_c, loss_r
+
+        stats = _llm.run_joint_training_steps(
+            step, max_steps, loss_target, len(rehearsal)
+        )
+        stats = self._finish_call(stats, correction)
+        for ex, rows in zip(rehearsal, rehearsal_rows):
+            self.batch_shapes.append(tuple(ex.mask.shape))
+            self.trained_batches.append(rows)
+        return stats
+
+    @staticmethod
+    def _scripted_step(losses: list[float]) -> Callable[[], float]:
+        script = iter(losses)
+        last = losses[-1]
 
         def step() -> float:
             nonlocal last
             last = next(script, last)
             return last
 
-        stats = _llm.run_training_steps(
-            step, iterations if max_steps is None else max_steps, loss_target
-        )
-        self.training_stats.append(stats)
-        self.batch_shapes.append(tuple(example.mask.shape))
+        return step
+
+    def _decode_rows(self, example) -> list[tuple[str, str]]:
         rows = []
         for inputs, labels, mask in zip(
             example.input.tolist(), example.label.tolist(), example.mask.tolist()
@@ -210,6 +271,13 @@ class FakeModel:
             masked = self._tokenizer.decode(t for t, m in zip(labels, mask) if m)
             full = self._tokenizer.decode([inputs[0]] + labels)
             rows.append((masked, full))
+        return rows
+
+    def _finish_call(self, stats: TrainingStats, example) -> TrainingStats:
+        """Record the correction example of a call and "learn" its target."""
+        self.training_stats.append(stats)
+        self.batch_shapes.append(tuple(example.mask.shape))
+        rows = self._decode_rows(example)
         self.trained_batches.append(rows)
         target = rows[0][0]
         self.trained_targets.append(target)
@@ -237,17 +305,18 @@ def make_dataset(n: int) -> TriviaDataset:
 
 
 def training_groups(model: FakeModel, ks: list[int]) -> list[list[tuple[str, str]]]:
-    """Split the model's single-row training calls into per-item groups.
+    """Split the model's single-row training examples into per-item groups.
 
-    With micro-batched rehearsal every item makes ``1 + k`` calls: the
-    correction, then each rehearsal example. Returns, per item, the list of
-    ``(masked target, full sequence)`` rows in call order.
+    With joint rehearsal every item hands the model ``1 + k`` single-row
+    examples in one call: the correction, then each rehearsal example.
+    Returns, per item, the list of ``(masked target, full sequence)`` rows in
+    that order.
     """
     groups, pos = [], 0
     for k in ks:
-        calls = model.trained_batches[pos : pos + 1 + k]
-        assert all(len(rows) == 1 for rows in calls), "every call is one row"
-        groups.append([rows[0] for rows in calls])
+        examples = model.trained_batches[pos : pos + 1 + k]
+        assert all(len(rows) == 1 for rows in examples), "every example is one row"
+        groups.append([rows[0] for rows in examples])
         pos += 1 + k
     assert pos == len(model.trained_batches), (pos, len(model.trained_batches))
     return groups
@@ -874,9 +943,17 @@ class MetaLearningTest(_TempDbTest):
         )
         result = experiment.run(dataset, config, verbose=False)
         traj = result.trajectories[1]
-        # 8 items x (1 correction + 2 rehearsal) single-row calls.
-        self.assertEqual(model.train_calls, 8 * 3)
+        # 8 items, each one joint call over 1 correction + 2 rehearsal rows.
+        self.assertEqual(model.train_calls, 8)
+        self.assertEqual(len(model.joint_calls), 8)
+        self.assertEqual({c["rehearsal_k"] for c in model.joint_calls}, {2})
+        self.assertEqual({c["rehearsal_weight"] for c in model.joint_calls}, {1.0})
+        self.assertEqual(len(model.trained_batches), 8 * 3)
         self.assertTrue(all(shape[0] == 1 for shape in model.batch_shapes))
+        self.assertEqual(traj.train_rehearsal_final_losses, [0.41] * 8)
+        self.assertAlmostEqual(traj.mean_train_rehearsal_final_loss, 0.41)
+        self.assertIn("(rehearsal 0.41)", traj.training_summary_text(12, 0.6))
+        self.assertEqual(result.model_kwargs, {"learning_rate": 3e-5})
         holdout_questions = {
             dataset[idx].question for idx in traj_holdout_indices(dataset, seed=1)
         }
@@ -892,7 +969,17 @@ class MetaLearningTest(_TempDbTest):
         self.assertEqual(
             MetaLearningConfig.from_dict(config.to_dict()).rehearsal_max_tokens, 768
         )
+        self.assertEqual(cfg["rehearsal_weight"], 1.0)
         self.assertEqual(cfg["model_kwargs"], {"learning_rate": 3e-5})
+        # LoRA capacity defaults are recorded even when no flag set them.
+        self.assertEqual(cfg["lora"], {"rank": 32, "layers": 24, "scale": 10.0})
+        # The per-item rehearsal loss survives a save/load round trip.
+        path = self.tmp_path / "reh.json"
+        result.save(path)
+        loaded = MetaLearningResult.load(path)
+        self.assertEqual(loaded.trajectories[1].train_rehearsal_final_losses, [0.41] * 8)
+        self.assertEqual(loaded.config.rehearsal_weight, 1.0)
+        self.assertEqual(loaded.model_kwargs, {"learning_rate": 3e-5})
 
     def test_meta_rehearsal_pool_honors_max_tokens(self):
         dataset = make_dataset(10)
@@ -1116,19 +1203,21 @@ def traj_holdout_indices(dataset, seed: int) -> list[int]:
 
 
 class RehearsalTest(_TempDbTest):
-    """rehearsal_k trains self-distillation rows after each correction.
+    """rehearsal_k folds self-distillation rows into each correction's steps.
 
-    Every example is its own single-row ``train_on_example`` call: correction
-    first, then each rehearsal example in sampled order.
+    Every trained item is one ``train_on_examples`` call: the correction plus
+    its rehearsal examples (in sampled order), each a single row.
     """
 
-    def test_rehearsal_micro_batches_correction_then_rehearsal(self):
+    def test_rehearsal_joins_correction_with_rehearsal_rows(self):
         # 6 items, train_ratio 5/6 -> q00..q04 trained, q05 holdout.
         # q01, q03 and q05 are known at baseline: the pool is {q01, q03} (q05 is
         # holdout and must never be rehearsed).
         dataset = make_dataset(6)
         model = FakeModel(dataset, think=True, known_at_baseline={"q01", "q03", "q05"})
-        config = EvaluationConfig(name="reh", train_ratio=5 / 6, rehearsal_k=2, seed=7)
+        config = EvaluationConfig(
+            name="reh", train_ratio=5 / 6, rehearsal_k=2, seed=7, rehearsal_weight=0.5
+        )
         result = EvaluationHarness(model=model, db=self.db).run(
             dataset, config, verbose=False
         )
@@ -1136,14 +1225,36 @@ class RehearsalTest(_TempDbTest):
         trained = [by_id[item.id] for item in dataset.items[:5]]
         ks = [len(r.rehearsal_item_ids) for r in trained]
 
-        # One single-row call per correction and per rehearsal example.
+        # One joint call per item carrying k single-row rehearsal examples and
+        # the config's target, cap, and weight; never a train_on_example call.
         self.assertEqual(ks, [2, 1, 2, 1, 2])  # k capped at the pool minus self
-        self.assertEqual(model.train_calls, sum(1 + k for k in ks))
+        self.assertEqual(model.train_calls, 5)
+        self.assertEqual(model.train_kwargs, [])
+        self.assertEqual([c["rehearsal_k"] for c in model.joint_calls], ks)
+        for call in model.joint_calls:
+            self.assertEqual(call["loss_target"], 0.6)
+            self.assertEqual(call["max_steps"], 12)
+            self.assertEqual(call["rehearsal_weight"], 0.5)
+        self.assertEqual(len(model.trained_batches), sum(1 + k for k in ks))
         for shape in model.batch_shapes:
             self.assertEqual(shape[0], 1)
         # Single rows are never padded: the last label is <eos>, masked in.
         for rows in model.trained_batches:
             self.assertTrue(rows[0][0].endswith(EOS))
+        # The stop rule saw only the correction loss: 3 steps to cross 0.6 even
+        # though the rehearsal loss was under it from step 1, and the
+        # rehearsal loss at that last step is reported per item.
+        for r in trained:
+            self.assertEqual(r.train_steps, 3)
+            self.assertAlmostEqual(r.train_final_loss, 0.58)
+            self.assertAlmostEqual(r.train_rehearsal_final_loss, 0.41)
+        self.assertIsNone(by_id["q05"].train_rehearsal_final_loss)
+        self.assertAlmostEqual(result.mean_train_rehearsal_final_loss, 0.41)
+        self.assertEqual(
+            result.training_summary_text(),
+            "Training: mean 3.0 steps/item (cap 12, loss target 0.60), "
+            "mean final loss 0.58 (rehearsal 0.41); 0 items hit the cap",
+        )
         groups = training_groups(model, ks)
         for item, r, rows in zip(dataset.items[:5], trained, groups):
             pool = [pid for pid in ("q01", "q03") if pid != item.id]
@@ -1180,12 +1291,23 @@ class RehearsalTest(_TempDbTest):
         d = result.to_dict()
         self.assertEqual(d["config"]["rehearsal_k"], 2)
         self.assertEqual(d["config"]["rehearsal_max_tokens"], 768)
+        self.assertEqual(d["config"]["rehearsal_weight"], 0.5)
+        self.assertAlmostEqual(d["metrics"]["mean_train_rehearsal_final_loss"], 0.41)
         cfg = self._config_json_for(experiment_id)
         self.assertEqual(cfg["rehearsal_k"], 2)
         self.assertEqual(cfg["rehearsal_max_tokens"], 768)
+        self.assertEqual(cfg["rehearsal_weight"], 0.5)
         self.assertTrue(
             any(i["rehearsal_item_ids"] for i in d["items"] if i["was_trained"])
         )
+        self.assertEqual(
+            {i["train_rehearsal_final_loss"] for i in d["items"] if i["was_trained"]},
+            {0.41},
+        )
+        with self.assertRaises(ValueError):
+            EvaluationConfig(rehearsal_weight=-0.1)
+        with self.assertRaises(ValueError):
+            MetaLearningConfig(rehearsal_weight=-1)
 
     def test_rehearsal_pool_honors_max_tokens(self):
         # Everything is correct at baseline, but q02 rambles for
@@ -1218,9 +1340,10 @@ class RehearsalTest(_TempDbTest):
             self.assertNotIn("q02", r.rehearsal_item_ids)
             expected = sorted(known - {"q02", item_id})
             self.assertEqual(sorted(r.rehearsal_item_ids), expected)
+        self.assertEqual(model.train_calls, len(by_id))
         self.assertEqual(
-            model.train_calls,
-            sum(1 + len(r.rehearsal_item_ids) for r in by_id.values()),
+            [c["rehearsal_k"] for c in model.joint_calls],
+            [len(r.rehearsal_item_ids) for r in by_id.values()],
         )
         self.assertTrue(all(shape[0] == 1 for shape in model.batch_shapes))
         cfg = self._config_json_for(self._latest_experiment_id())
@@ -1274,11 +1397,28 @@ class RehearsalTest(_TempDbTest):
     def test_rehearsal_with_empty_pool_trains_single_row(self):
         dataset = make_dataset(4)
         model = FakeModel(dataset, think=True)  # nothing correct at baseline
-        EvaluationHarness(model=model, db=self.db).run(
+        result = EvaluationHarness(model=model, db=self.db).run(
             dataset, EvaluationConfig(name="nopool", rehearsal_k=3), verbose=False
         )
+        # With nothing to rehearse the harness falls back to train_on_example.
         self.assertEqual(model.train_calls, 3)  # one call per trained item
+        self.assertEqual(model.joint_calls, [])
+        self.assertEqual(model.train_kwargs, [(12, 0.6, 12)] * 3)
         self.assertTrue(all(shape[0] == 1 for shape in model.batch_shapes))
+        self.assertTrue(
+            all(i.train_rehearsal_final_loss is None for i in result.items)
+        )
+        self.assertIsNone(result.mean_train_rehearsal_final_loss)
+        self.assertNotIn("rehearsal", result.training_summary_text())
+
+    def test_rehearsal_k_zero_uses_single_example_calls(self):
+        dataset = make_dataset(4)
+        model = FakeModel(dataset, known_at_baseline={i.id for i in dataset})
+        EvaluationHarness(model=model, db=self.db).run(
+            dataset, EvaluationConfig(name="k0", rehearsal_k=0), verbose=False
+        )
+        self.assertEqual(model.joint_calls, [])
+        self.assertEqual(model.train_kwargs, [(12, 0.6, 12)] * 3)
 
     def test_rehearsal_sampling_is_seeded(self):
         dataset = make_dataset(12)
@@ -1474,16 +1614,110 @@ class LossTargetTest(_TempDbTest):
         self.assertEqual([i.train_steps for i in result.train_items], [5, 5])
         self.assertIn("loss target off", result.training_summary_text())
 
-    def test_rehearsal_calls_share_target(self):
+    def test_rehearsal_joint_call_carries_target_cap_and_weight(self):
         dataset = make_dataset(6)
         model = FakeModel(dataset, known_at_baseline={i.id for i in dataset})
         config = EvaluationConfig(
-            name="reh-lt", train_ratio=0.5, rehearsal_k=2, training_iterations=9
+            name="reh-lt",
+            train_ratio=0.5,
+            rehearsal_k=2,
+            training_iterations=9,
+            rehearsal_weight=2.0,
         )
-        EvaluationHarness(model=model, db=self.db).run(dataset, config, verbose=False)
-        # 3 trained items x (1 correction + 2 rehearsal) calls, all with the target.
-        self.assertEqual(len(model.train_kwargs), 9)
-        self.assertEqual(set(model.train_kwargs), {(9, 0.6, 9)})
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset, config, verbose=False
+        )
+        # 3 trained items, one joint call each with 2 rehearsal rows.
+        self.assertEqual(model.train_kwargs, [])
+        self.assertEqual(len(model.joint_calls), 3)
+        for call in model.joint_calls:
+            self.assertEqual(
+                (call["loss_target"], call["max_steps"], call["rehearsal_weight"]),
+                (0.6, 9, 2.0),
+            )
+            self.assertEqual(call["rehearsal_k"], 2)
+        # Rehearsal alone never stops a call: a rehearsal script under the
+        # target from step 1 still runs the correction to its own crossing.
+        for item in result.train_items:
+            self.assertEqual(item.train_steps, 3)
+            self.assertAlmostEqual(item.train_rehearsal_final_loss, 0.41)
+        # A correction that never reaches the target hits the cap regardless
+        # of how low the rehearsal loss is.
+        model = FakeModel(
+            dataset,
+            known_at_baseline={i.id for i in dataset},
+            train_losses=[3.0, 2.0, 1.0],
+            rehearsal_losses=[0.1],
+        )
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset,
+            EvaluationConfig(name="cap", train_ratio=0.5, rehearsal_k=2, training_iterations=4),
+            verbose=False,
+        )
+        for item in result.train_items:
+            self.assertEqual(item.train_steps, 4)
+            self.assertTrue(item.train_hit_cap)
+            self.assertAlmostEqual(item.train_rehearsal_final_loss, 0.1)
+        self.assertIn(
+            "mean final loss 1.00 (rehearsal 0.10); 3 items hit the cap",
+            result.training_summary_text(),
+        )
+
+    def test_verbose_output_shows_rehearsal_loss(self):
+        import contextlib
+        import io
+
+        dataset = make_dataset(4)
+        model = FakeModel(dataset, known_at_baseline={i.id for i in dataset})
+        config = EvaluationConfig(name="v-reh", train_ratio=0.5, rehearsal_k=1)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            EvaluationHarness(model=model, db=self.db).run(dataset, config, verbose=True)
+        out = buf.getvalue()
+        self.assertIn("Rehearsal k: 1 (max tokens: 768, weight: 1)", out)
+        self.assertIn("LoRA: rank 32, layers 24, scale 10", out)
+        self.assertRegex(
+            out, r"Trained \(3 steps, loss 6\.05 → 0\.58 \(rehearsal 0\.41\), \d+\.\ds"
+        )
+        self.assertIn("mean final loss 0.58 (rehearsal 0.41); 0 items hit the cap", out)
+
+    def test_lora_model_kwargs_are_recorded(self):
+        dataset = make_dataset(4)
+        model = FakeModel(dataset)
+        kwargs = harness.lora_model_kwargs(rank=8, layers=4, scale=2.0)
+        self.assertEqual(
+            kwargs,
+            {
+                "num_lora_layers": 4,
+                "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 2.0},
+            },
+        )
+        result = EvaluationHarness(model=model, db=self.db, model_kwargs=kwargs).run(
+            dataset, EvaluationConfig(name="lora", train_ratio=0.5), verbose=False
+        )
+        cfg = self._config_json_for(self._latest_experiment_id())
+        self.assertEqual(cfg["model_kwargs"], kwargs)
+        self.assertEqual(cfg["lora"], {"rank": 8, "layers": 4, "scale": 2.0})
+        self.assertEqual(result.model_kwargs, kwargs)
+        self.assertEqual(result.lora_settings_text(), "LoRA: rank 8, layers 4, scale 2")
+        self.assertEqual(result.to_dict()["lora"], {"rank": 8, "layers": 4, "scale": 2.0})
+        # Defaults match StatefulLLM's when nothing was passed.
+        self.assertEqual(harness.lora_settings({}), (32, 24, 10.0))
+        self.assertEqual(harness.lora_model_kwargs(), harness.lora_model_kwargs(32, 24, 10.0))
+        for bad in ({"rank": 0}, {"layers": -1}, {"scale": 0}):
+            with self.assertRaises(ValueError):
+                harness.lora_model_kwargs(**bad)
+        # The lazy path hands the LoRA kwargs to StatefulLLM as-is.
+        seen = {}
+        original = harness.StatefulLLM
+        harness.StatefulLLM = lambda **kw: seen.update(kw) or model
+        try:
+            EvaluationHarness(db=self.db, model_kwargs=kwargs).model
+        finally:
+            harness.StatefulLLM = original
+        self.assertEqual(seen, kwargs)
+        path = generate_html_report(result, str(self.tmp_path / "lora.html"))
+        self.assertIn("LoRA: rank 8, layers 4, scale 2", pathlib.Path(path).read_text())
 
     def test_verbose_output(self):
         import contextlib
@@ -1555,6 +1789,20 @@ class LossTargetTest(_TempDbTest):
         text = pathlib.Path(path).read_text()
         self.assertIn("loss target: <code>0.60</code>", text)
         self.assertIn("Training: mean 3.0 steps/item (cap 12", text)
+        self.assertIn("weight: <code>1</code>", text)
+        self.assertIn("LoRA: rank 32, layers 24, scale 10", text)
+
+    def test_report_shows_rehearsal_loss(self):
+        dataset = make_dataset(4)
+        model = FakeModel(dataset, known_at_baseline={i.id for i in dataset})
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset,
+            EvaluationConfig(name="rep-reh", train_ratio=0.5, rehearsal_k=1),
+            verbose=False,
+        )
+        path = generate_html_report(result, str(self.tmp_path / "r2.html"))
+        text = pathlib.Path(path).read_text()
+        self.assertIn("mean final loss 0.58 (rehearsal 0.41)", text)
 
 
 class CliFlagsTest(unittest.TestCase):
@@ -1564,8 +1812,12 @@ class CliFlagsTest(unittest.TestCase):
         "--think_mode",
         "--rehearsal_k",
         "--rehearsal_max_tokens",
+        "--rehearsal_weight",
         "--learning_rate",
         "--loss_target",
+        "--lora_rank",
+        "--lora_layers",
+        "--lora_scale",
         "--[no]close_think",
     )
 
@@ -1579,17 +1831,23 @@ class CliFlagsTest(unittest.TestCase):
         )
         return proc.stdout + proc.stderr
 
+    LORA_DEFAULTS = ("(default: '32')", "(default: '24')", "(default: '10.0')")
+
     def test_eval_cli_flags(self):
         text = self._helpfull("-m", "adaptible.eval")
         for flag in self.EXPECTED:
             self.assertIn(flag, text)
         self.assertIn("<none|empty|baseline>", text)
+        for default in self.LORA_DEFAULTS:
+            self.assertIn(default, text)
 
     def test_meta_cli_flags(self):
         text = self._helpfull("scripts/run_meta_experiment.py")
         for flag in self.EXPECTED:
             self.assertIn(flag, text)
         self.assertIn("<none|empty|baseline>", text)
+        for default in self.LORA_DEFAULTS:
+            self.assertIn(default, text)
 
 
 class LegacyLoadTest(_TempDbTest):
