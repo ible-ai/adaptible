@@ -37,6 +37,12 @@ Options:
                             loss at the call's first step (default 0.05)
     --rationale_max_tokens N  Cap the rationale in the target at N tokens, cut at
                             a sentence boundary (default 512)
+    --[no]train_correct_items  Train train-split items whose baseline is already
+                            correct (default False: skipped, re-inferred at the
+                            end, regressions reported as interference)
+    --verify_steps N        After a correction reaches the loss target or cap,
+                            generate and judge; while wrong and under the cap,
+                            train N more steps and check again (default 0 = off)
     --learning_rate LR      StatefulLLM learning rate (default: the model's)
     --lora_rank R           LoRA rank (default 32)
     --lora_layers N         Trailing layers converted to LoRA (default 24)
@@ -172,6 +178,22 @@ _RATIONALE_MAX_TOKENS = flags.DEFINE_integer(
     "with no </think> is taken whole as the rationale (the model reasons "
     "inside the open think block); an item with no rationale at all is skipped.",
 )
+_TRAIN_CORRECT_ITEMS = flags.DEFINE_boolean(
+    "train_correct_items",
+    False,
+    "Train train-split items whose baseline answer is already judged correct. "
+    "Off by default: such items are skipped (not trained, not in any window, "
+    "not holdout), re-inferred at the end, and the ones that regressed are "
+    "reported as interference. For self_generated this skip is an oracle.",
+)
+_VERIFY_STEPS = flags.DEFINE_integer(
+    "verify_steps",
+    0,
+    "Verify-after-target: once a correction's training call returns (loss "
+    "target reached or cap), generate the item's answer and judge it; while it "
+    "is wrong and the step cap has not been reached, train this many more "
+    "steps (no loss target) and check again. 0 disables.",
+)
 _LEARNING_RATE = flags.DEFINE_float(
     "learning_rate", None, "StatefulLLM learning rate (default: the model's)."
 )
@@ -240,6 +262,8 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                 <td>{traj.window_sizes}</td>
                 <td>{len(traj.checkpoints)}</td>
                 <td>{traj.mean_train_steps:.1f} / {traj.train_cap_hits} cap</td>
+                <td>{traj.skipped_correct_count} / {traj.skipped_correct_regressed}</td>
+                <td>{f"{traj.verified_count}/{len(traj.verified)}" if result.config.verify_steps else "off"}</td>
                 <td>{traj.total_time_seconds:.1f}s</td>
             </tr>
             """)
@@ -434,6 +458,14 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                 <div class="value">{result.config.rationale_max_tokens}</div>
             </div>
             <div class="config-item">
+                <div class="label">Train Correct Items</div>
+                <div class="value" style="font-size: 16px;">{result.config.train_correct_items}</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Verify Steps</div>
+                <div class="value">{result.config.verify_steps}</div>
+            </div>
+            <div class="config-item">
                 <div class="label">LoRA (rank / layers / scale)</div>
                 <div class="value" style="font-size: 16px;">{" / ".join(f"{v:g}" for v in _harness.lora_settings(result.model_kwargs))}</div>
             </div>
@@ -510,6 +542,8 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                 <th>Window Sizes</th>
                 <th>Checkpoints</th>
                 <th>Mean Steps / Cap Hits</th>
+                <th>Skipped Correct / Regressed</th>
+                <th>Verified</th>
                 <th>Time</th>
             </tr>
         </thead>
@@ -681,6 +715,8 @@ def main(_):
         rationale_max_tokens=_RATIONALE_MAX_TOKENS.value,
         repeats=_REPEATS.value,
         holdout_every_checkpoint=_HOLDOUT_EVERY_CHECKPOINT.value,
+        train_correct_items=_TRAIN_CORRECT_ITEMS.value,
+        verify_steps=_VERIFY_STEPS.value,
     )
 
     print()
@@ -694,6 +730,8 @@ def main(_):
     print(f"  Rehearsal weight: {config.rehearsal_weight:g}")
     print(f"  Rehearsal margin: {config.rehearsal_margin:g}")
     print(f"  Rationale max tokens: {config.rationale_max_tokens}")
+    print(f"  Train correct items: {config.train_correct_items}")
+    print(f"  Verify steps: {config.verify_steps}")
     model_kwargs = lora_model_kwargs(
         rank=_LORA_RANK.value, layers=_LORA_LAYERS.value, scale=_LORA_SCALE.value
     )

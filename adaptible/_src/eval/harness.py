@@ -188,6 +188,35 @@ class EvaluationConfig:
             (``ItemResult.train_final_train_loss``) and the rehearsal loss
             (``ItemResult.train_rehearsal_final_loss``) are reported but never
             stop training.
+        train_correct_items: Whether train-split items whose baseline answer
+            is already judged correct are trained. ``False`` (the default)
+            skips them: they get ``ItemResult.skipped_correct=True``, stay
+            ``was_trained=False``, are excluded from both the train metrics
+            and the holdout set, and are still re-inferred after training so
+            the ones that regressed count as *interference* from the other
+            items' training (``EvaluationResult.skipped_correct_regressed_count``).
+            A 40-item screen spent 60% of its gradient steps on 20 items with
+            nothing to correct, and every regression was one of them. With
+            ``training_source="self_generated"`` this skip is an oracle (a live
+            system cannot know which of its answers are wrong); it exists to
+            measure the ceiling. ``True`` restores training every train-split
+            item.
+        verify_steps: When > 0, after a correction's training call returns
+            (target reached or cap) the harness *generates* the item's answer
+            and judges it with ``contains_key_terms``. If it is still wrong
+            and the step cap has not been reached, it trains ``verify_steps``
+            more steps on the same examples with no loss target, then checks
+            again, until the answer is right or the cap is reached. Per item
+            ``ItemResult.verify_attempts`` counts the checks and
+            ``ItemResult.verified`` says whether the last one passed (``None``
+            when off); ``train_steps`` is the total. Motivation: some items
+            reach an answer loss of 0.05 after one step yet the free-running
+            model still gives its old answer, because the teacher-forced
+            answer is easy given the rationale while the model's own reasoning
+            never reaches it. For those the loss target is the wrong stop
+            signal; generating and checking is the only reliable one. The
+            verification generations are intermediate and are not recorded in
+            the database.
     """
 
     name: str = "default"
@@ -207,6 +236,8 @@ class EvaluationConfig:
     rehearsal_weight: float = 1.0
     rehearsal_margin: float = 0.05
     rationale_max_tokens: int = DEFAULT_RATIONALE_MAX_TOKENS
+    train_correct_items: bool = False
+    verify_steps: int = 0
 
     def __post_init__(self) -> None:
         validate_training_source(self.training_source)
@@ -219,6 +250,8 @@ class EvaluationConfig:
         self.rehearsal_margin = validate_rehearsal_margin(self.rehearsal_margin)
         validate_rationale_max_tokens(self.rationale_max_tokens)
         self.loss_target = normalize_loss_target(self.loss_target)
+        self.train_correct_items = bool(self.train_correct_items)
+        validate_verify_steps(self.verify_steps)
 
 
 def normalize_loss_target(loss_target: float | None) -> float | None:
@@ -226,6 +259,18 @@ def normalize_loss_target(loss_target: float | None) -> float | None:
     if loss_target is None or loss_target <= 0:
         return None
     return float(loss_target)
+
+
+def validate_verify_steps(verify_steps: int) -> None:
+    """Raise ValueError unless ``verify_steps`` is a non-negative int."""
+    if (
+        isinstance(verify_steps, bool)
+        or not isinstance(verify_steps, int)
+        or verify_steps < 0
+    ):
+        raise ValueError(
+            f"verify_steps must be a non-negative int, got {verify_steps!r}"
+        )
 
 
 def validate_rehearsal_weight(rehearsal_weight: float) -> float:
@@ -314,6 +359,17 @@ class ItemResult:
         train_rehearsal_active_steps: ``(step, rehearsal example)`` pairs
             whose gradient the hinge let through, out of
             ``train_steps * len(rehearsal_item_ids)``.
+        skipped_correct: The item was in the train split but its baseline
+            was already judged correct and ``EvaluationConfig.train_correct_items``
+            is False, so it was **not trained**. Neither a train item nor a
+            holdout item; it is still re-inferred after training, and a
+            regression here is interference from the other items' training.
+        verify_attempts: With ``EvaluationConfig.verify_steps`` > 0, the
+            number of generate-and-judge checks made for this item after its
+            training (0 when off or not trained).
+        verified: Whether the last verification check found the answer
+            correct; ``None`` when verification is off or the item was not
+            trained. ``False`` means the item is still wrong at the step cap.
     """
 
     item_id: str
@@ -328,6 +384,9 @@ class ItemResult:
     post_has_key_terms: bool | None = None
     was_trained: bool = False
     training_time_seconds: float = 0.0
+    skipped_correct: bool = False
+    verify_attempts: int = 0
+    verified: bool | None = None
     revision_text: str | None = None
     revision_invalid: bool = False
     revision_answer: str | None = None
@@ -370,6 +429,11 @@ class ItemResult:
         """Baseline was right and the revision is wrong."""
         return self.revision_has_key_terms is False and self.initial_has_key_terms
 
+    @property
+    def regressed(self) -> bool:
+        """Baseline was right and the post-training answer is wrong."""
+        return self.initial_has_key_terms and self.post_has_key_terms is False
+
 
 @dataclasses.dataclass
 class EvaluationResult:
@@ -393,8 +457,9 @@ class EvaluationResult:
     def holdout_items(self) -> list[ItemResult]:
         """Items never scheduled for training (skipped items excluded).
 
-        An item scheduled for training but skipped (invalid revision, or no
-        rationale) is neither trained nor holdout.
+        An item scheduled for training but skipped (invalid revision, no
+        rationale, or baseline already correct under
+        ``train_correct_items=False``) is neither trained nor holdout.
         """
         return [
             item
@@ -402,7 +467,58 @@ class EvaluationResult:
             if not item.was_trained
             and not item.revision_invalid
             and not item.rationale_missing
+            and not item.skipped_correct
         ]
+
+    # Items in the train split that were not trained because their baseline
+    # was already correct. Their post-training verdict is the interference
+    # measure: nothing was done to them, so a regression came from training
+    # other items.
+    @property
+    def skipped_correct_items(self) -> list[ItemResult]:
+        return [item for item in self.items if item.skipped_correct]
+
+    @property
+    def skipped_correct_count(self) -> int:
+        return len(self.skipped_correct_items)
+
+    @property
+    def skipped_correct_regressed_count(self) -> int:
+        """Skipped-correct items judged wrong after the other items' training."""
+        return sum(1 for item in self.skipped_correct_items if item.regressed)
+
+    def interference_summary_text(self) -> str:
+        """``Skipped (baseline correct): N; of which M regressed ...`` for logs and reports."""
+        return interference_summary_text(
+            self.skipped_correct_count, self.skipped_correct_regressed_count
+        )
+
+    # Verify-after-target (``EvaluationConfig.verify_steps``).
+    @property
+    def verified_count(self) -> int:
+        """Trained items whose last verification check found the answer right."""
+        return sum(1 for item in self.train_items if item.verified is True)
+
+    @property
+    def verify_still_wrong_count(self) -> int:
+        """Trained items still wrong at the step cap after verification."""
+        return sum(1 for item in self.train_items if item.verified is False)
+
+    @property
+    def mean_verify_attempts(self) -> float:
+        """Mean verification checks per trained item (0 when off)."""
+        if not self.train_items:
+            return 0.0
+        return sum(item.verify_attempts for item in self.train_items) / len(
+            self.train_items
+        )
+
+    def verification_summary_text(self) -> str:
+        """``Verification: K/N items verified ...`` for logs and reports."""
+        return verification_summary_text(
+            [item.verified for item in self.train_items],
+            [item.verify_attempts for item in self.train_items],
+        )
 
     @property
     def revision_invalid_items(self) -> list[ItemResult]:
@@ -728,6 +844,8 @@ class EvaluationResult:
                 "rehearsal_weight": self.config.rehearsal_weight,
                 "rehearsal_margin": self.config.rehearsal_margin,
                 "rationale_max_tokens": self.config.rationale_max_tokens,
+                "train_correct_items": self.config.train_correct_items,
+                "verify_steps": self.config.verify_steps,
             },
             "model_kwargs": self.model_kwargs,
             "lora": dict(
@@ -760,6 +878,11 @@ class EvaluationResult:
                 "rationale_truncated_count": self.rationale_truncated_count,
                 "train_rehearsal_active_steps": self.train_rehearsal_active_steps,
                 "train_rehearsal_pairs": self.train_rehearsal_pairs,
+                "skipped_correct_count": self.skipped_correct_count,
+                "skipped_correct_regressed_count": self.skipped_correct_regressed_count,
+                "verified_count": self.verified_count,
+                "verify_still_wrong_count": self.verify_still_wrong_count,
+                "mean_verify_attempts": self.mean_verify_attempts,
             },
             "items": [
                 {
@@ -796,10 +919,45 @@ class EvaluationResult:
                     "train_rehearsal_final_loss": item.train_rehearsal_final_loss,
                     "train_rehearsal_initial_loss": item.train_rehearsal_initial_loss,
                     "train_rehearsal_active_steps": item.train_rehearsal_active_steps,
+                    "skipped_correct": item.skipped_correct,
+                    "verify_attempts": item.verify_attempts,
+                    "verified": item.verified,
                 }
                 for item in self.items
             ],
         }
+
+
+def interference_summary_text(skipped: int, regressed: int) -> str:
+    """Format the one-line interference summary.
+
+    ``Skipped (baseline correct): 20; of which 4 regressed after other items'
+    training``. Shared by the harness and the meta-learning experiment.
+    """
+    return (
+        f"Skipped (baseline correct): {skipped}; of which {regressed} regressed "
+        "after other items' training"
+    )
+
+
+def verification_summary_text(
+    verified: list[bool | None], attempts: list[int]
+) -> str:
+    """Format the one-line verify-after-target summary.
+
+    ``Verification: 9/12 items verified correct after training (mean 1.8
+    checks/item); 3 still wrong at the cap``. ``verified`` and ``attempts``
+    are per trained item; items with ``None`` (verification off) are not
+    counted as verified or still wrong.
+    """
+    n = len(verified)
+    ok = sum(1 for v in verified if v is True)
+    wrong = sum(1 for v in verified if v is False)
+    mean = sum(attempts) / n if n else 0.0
+    return (
+        f"Verification: {ok}/{n} items verified correct after training "
+        f"(mean {mean:.1f} checks/item); {wrong} still wrong at the cap"
+    )
 
 
 def training_summary_text(
@@ -1214,19 +1372,35 @@ class TrainingOutcome:
     train_rehearsal_final_loss: float | None = None
     train_rehearsal_initial_loss: float | None = None
     train_rehearsal_active_steps: int = 0
-    # The full stats of the call (one entry; kept as a list for callers that
-    # iterate it).
+    # The full stats of every training call made for the item: the first
+    # (loss-targeted) call, then one per verify-after-target round.
     training_stats: list[TrainingStats] = dataclasses.field(default_factory=list)
+    # Verify-after-target: generate-and-judge checks made, and whether the
+    # last one passed (None when verification is off).
+    verify_attempts: int = 0
+    verified: bool | None = None
 
     @property
     def train_rehearsal_pairs(self) -> int:
         """``steps * k``: what ``train_rehearsal_active_steps`` is out of."""
         return self.train_steps * len(self.rehearsal_item_ids)
 
+    def verification_text(self) -> str:
+        """``verified ✓ (2 checks)`` / ``not verified at cap (3 checks)``; empty when off."""
+        if self.verified is None:
+            return ""
+        checks = f"{self.verify_attempts} check{'s' if self.verify_attempts != 1 else ''}"
+        if self.verified:
+            return f"verified ✓ ({checks})"
+        return f"not verified at cap ({checks})"
+
     def training_text(self) -> str:
         """``3 steps, loss 6.05 → 0.58 (train 0.80, rehearsal 0.38→0.36 (active 3/9))`` for the verbose per-item line."""
         if self.train_initial_loss is None or self.train_final_loss is None:
-            return f"{self.train_steps} steps"
+            text = f"{self.train_steps} steps"
+            if self.verified is not None:
+                text += f", {self.verification_text()}"
+            return text
         text = (
             f"{self.train_steps} steps, loss {self.train_initial_loss:.2f} → "
             f"{self.train_final_loss:.2f}"
@@ -1250,7 +1424,46 @@ class TrainingOutcome:
             )
         if extras:
             text += f" ({', '.join(extras)})"
+        if self.verified is not None:
+            text += f", {self.verification_text()}"
         return text
+
+
+def _merge_training_stats(calls: list[TrainingStats]) -> TrainingStats:
+    """Fold the stats of consecutive training calls on one example into one.
+
+    Steps, per-step losses, and rehearsal active pairs are summed or
+    concatenated; the initial losses come from the first call and the final
+    ones from the last. ``stopped_early`` is the last call's, so
+    ``hit_cap`` is only meaningful for a single call: with verification the
+    caller decides the cap verdict from the verification outcome.
+    """
+    if len(calls) == 1:
+        return calls[0]
+    first, last = calls[0], calls[-1]
+    return TrainingStats(
+        steps=sum(c.steps for c in calls),
+        initial_loss=first.initial_loss,
+        final_loss=last.final_loss,
+        stopped_early=last.stopped_early,
+        losses=[l for c in calls for l in c.losses],
+        rehearsal_final_loss=last.rehearsal_final_loss,
+        rehearsal_count=first.rehearsal_count,
+        final_train_loss=getattr(last, "final_train_loss", float("nan")),
+        train_losses=[l for c in calls for l in getattr(c, "train_losses", [])],
+        rehearsal_initial_loss=getattr(first, "rehearsal_initial_loss", None),
+        rehearsal_active_steps=sum(
+            getattr(c, "rehearsal_active_steps", 0) for c in calls
+        ),
+    )
+
+
+def _verify_answer(model: Any, item: TriviaItem, max_tokens: int | None) -> bool:
+    """Generate the item's answer and judge it; nothing is persisted."""
+    raw = model.generate_response(
+        item.question, use_history=False, max_tokens=max_tokens
+    )
+    return contains_key_terms(strip_think_tags(raw or ""), item.key_terms)
 
 
 def _train_one_item(
@@ -1269,6 +1482,8 @@ def _train_one_item(
     rehearsal_weight: float = 1.0,
     rehearsal_margin: float = 0.05,
     rationale_max_tokens: int = DEFAULT_RATIONALE_MAX_TOKENS,
+    verify_steps: int = 0,
+    max_tokens: int | None = None,
 ) -> TrainingOutcome:
     """Build the target, train, and record the event for one item.
 
@@ -1289,6 +1504,16 @@ def _train_one_item(
 
     ``rehearsal_margin`` is the rehearsal hinge (``_llm.active_rehearsal``)
     and ``rationale_max_tokens`` the cap on the rationale in the target.
+
+    With ``verify_steps > 0`` the loss-targeted call is followed by a
+    verify-after-target loop: generate the item's answer (``max_tokens`` as
+    at inference) and judge it; while it is wrong and the total steps are
+    under ``training_iterations``, train ``verify_steps`` more steps (clipped
+    to the remaining budget) on the same examples with ``loss_target=None``
+    and check again. The loop stops at the first passing check. The outcome's
+    ``train_steps`` is the total over every call, ``verify_attempts`` the
+    number of checks, ``verified`` the last verdict, and ``train_hit_cap`` is
+    then "still wrong at the cap". The checks are not persisted anywhere.
 
     On ``InvalidRevisionError`` the item is not trained and the outcome carries
     ``revision_invalid=True`` plus the error text; on ``RationaleMissingError``
@@ -1328,24 +1553,43 @@ def _train_one_item(
         revision_answer = extract_revision(revision_text)
         revision_has_key_terms = contains_key_terms(revision_answer, item.key_terms)
 
+    def train_call(target: float | None, steps: int) -> TrainingStats:
+        if rehearsal_rows:
+            return model.train_on_examples(
+                correction_row,
+                rehearsal_rows,
+                loss_target=target,
+                max_steps=steps,
+                rehearsal_weight=rehearsal_weight,
+                rehearsal_margin=rehearsal_margin,
+            )
+        return model.train_on_example(
+            correction_row,
+            iterations=steps,
+            loss_target=target,
+            max_steps=steps,
+        )
+
     train_start = time.time()
-    if rehearsal_rows:
-        stats = model.train_on_examples(
-            correction_row,
-            rehearsal_rows,
-            loss_target=loss_target,
-            max_steps=training_iterations,
-            rehearsal_weight=rehearsal_weight,
-            rehearsal_margin=rehearsal_margin,
-        )
-    else:
-        stats = model.train_on_example(
-            correction_row,
-            iterations=training_iterations,
-            loss_target=loss_target,
-            max_steps=training_iterations,
-        )
+    calls = [train_call(loss_target, training_iterations)]
+    total_steps = calls[0].steps
+    verify_attempts = 0
+    verified: bool | None = None
+    if verify_steps > 0:
+        # Verify-after-target: the loss target says the teacher-forced answer
+        # is cheap, not that the free-running model produces it. Generate and
+        # check; while wrong and under the cap, train a few more steps.
+        while True:
+            verify_attempts += 1
+            verified = _verify_answer(model, item, max_tokens)
+            if verified or total_steps >= training_iterations:
+                break
+            extra = min(verify_steps, training_iterations - total_steps)
+            calls.append(train_call(None, extra))
+            total_steps += calls[-1].steps
     elapsed = time.time() - train_start
+    stats = _merge_training_stats(calls)
+    hit_cap = stats.hit_cap if verified is None else not verified
     _record_training_event(db, example_id, experiment_id, stats.steps, elapsed)
     return TrainingOutcome(
         trained=True,
@@ -1360,12 +1604,14 @@ def _train_one_item(
         train_steps=stats.steps,
         train_initial_loss=stats.initial_loss,
         train_final_loss=stats.final_loss,
-        train_hit_cap=stats.hit_cap,
+        train_hit_cap=hit_cap,
         train_final_train_loss=_final_train_loss(stats),
         train_rehearsal_final_loss=stats.rehearsal_final_loss,
         train_rehearsal_initial_loss=getattr(stats, "rehearsal_initial_loss", None),
         train_rehearsal_active_steps=getattr(stats, "rehearsal_active_steps", 0),
-        training_stats=[stats],
+        training_stats=calls,
+        verify_attempts=verify_attempts,
+        verified=verified,
     )
 
 
@@ -1492,6 +1738,8 @@ class EvaluationHarness:
                     "rehearsal_weight": config.rehearsal_weight,
                     "rehearsal_margin": config.rehearsal_margin,
                     "rationale_max_tokens": config.rationale_max_tokens,
+                    "train_correct_items": config.train_correct_items,
+                    "verify_steps": config.verify_steps,
                     "model_kwargs": self._model_kwargs,
                     "lora": dict(
                         zip(("rank", "layers", "scale"), lora_settings(self._model_kwargs))
@@ -1536,6 +1784,10 @@ class EvaluationHarness:
             print(
                 f"Loss target: {config.loss_target} "
                 f"(step cap: {config.training_iterations})"
+            )
+            print(
+                f"Train correct items: {config.train_correct_items}; "
+                f"verify steps: {config.verify_steps}"
             )
             print(lora_settings_text(self._model_kwargs))
             if self._model_kwargs:
@@ -1609,6 +1861,15 @@ class EvaluationHarness:
             if verbose:
                 print(f"  [{i+1}/{len(train_items)}] Training on {item.id}...")
 
+            if not config.train_correct_items and item_result.initial_has_key_terms:
+                # Nothing to correct: skip it, and let its post-training
+                # verdict measure interference from the other items.
+                item_result.skipped_correct = True
+                item_result.was_trained = False
+                if verbose:
+                    print("       Skipped: baseline correct (not trained)")
+                continue
+
             rehearsal_ids = sample_rehearsal_ids(
                 rehearsal_pool,
                 item.id,
@@ -1635,10 +1896,14 @@ class EvaluationHarness:
                 rehearsal_weight=config.rehearsal_weight,
                 rehearsal_margin=config.rehearsal_margin,
                 rationale_max_tokens=config.rationale_max_tokens,
+                verify_steps=config.verify_steps,
+                max_tokens=config.max_tokens,
             )
             item_result.revision_text = outcome.revision_text
             item_result.revision_invalid = outcome.revision_invalid
             item_result.training_time_seconds = outcome.training_time_seconds
+            item_result.verify_attempts = outcome.verify_attempts
+            item_result.verified = outcome.verified
             item_result.rehearsal_item_ids = outcome.rehearsal_item_ids
             item_result.rationale_text = outcome.rationale_text
             item_result.rationale_missing = outcome.rationale_missing
@@ -1729,7 +1994,12 @@ class EvaluationHarness:
             if verbose:
                 was = "✓" if item_result.initial_has_key_terms else "✗"
                 now = "✓" if rec.correct else "✗"
-                trained = "(trained)" if item_result.was_trained else "(holdout)"
+                if item_result.was_trained:
+                    trained = "(trained)"
+                elif item_result.skipped_correct:
+                    trained = "(skipped: baseline correct)"
+                else:
+                    trained = "(holdout)"
                 print(f"       {was} → {now} {trained}")
 
         # Compile results
@@ -1754,6 +2024,9 @@ class EvaluationHarness:
             print(f"Train improvement rate: {result.train_improvement_rate:.1%} (n={n_train})")
             print(f"Train retention rate: {result.train_retention_rate:.1%} (n={n_train})")
             print(result.holdout_summary_text())
+            print(result.interference_summary_text())
+            if config.verify_steps > 0:
+                print(result.verification_summary_text())
             if config.training_source == "self_generated":
                 print(f"Revision prompt: {config.revision_prompt}")
                 print(f"Invalid revisions (skipped): {result.revision_invalid_count}")

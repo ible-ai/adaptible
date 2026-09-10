@@ -40,6 +40,14 @@ Options:
     --rationale_max_tokens N
                           Cap the rationale in the training target at N
                           tokens, cut at a sentence boundary (default: 512)
+    --[no]train_correct_items
+                          Train train-split items whose baseline answer is
+                          already correct (default: False; they are skipped,
+                          re-inferred, and reported as interference)
+    --verify_steps N      After a correction reaches the loss target or cap,
+                          generate and judge the answer; while wrong and
+                          under the cap, train N more steps and check again
+                          (default: 0 = off)
     --learning_rate LR    Optimizer learning rate for StatefulLLM (default: model's)
     --lora_rank R         LoRA rank (default: 32)
     --lora_layers N       Number of trailing layers converted to LoRA (default: 24)
@@ -159,6 +167,23 @@ _RATIONALE_MAX_TOKENS = flags.DEFINE_integer(
     "with no </think> is taken whole as the rationale (the model reasons "
     "inside the open think block); an item with no rationale at all is skipped.",
 )
+_TRAIN_CORRECT_ITEMS = flags.DEFINE_boolean(
+    "train_correct_items",
+    False,
+    "Train train-split items whose baseline answer is already judged correct. "
+    "Off by default: such items are skipped (not trained, not holdout), still "
+    "re-inferred after training, and the ones that regressed are reported as "
+    "interference from the other items' training. For self_generated this "
+    "skip is an oracle; it measures the ceiling.",
+)
+_VERIFY_STEPS = flags.DEFINE_integer(
+    "verify_steps",
+    0,
+    "Verify-after-target: once a correction's training call returns (loss "
+    "target reached or cap), generate the item's answer and judge it; while it "
+    "is wrong and the step cap has not been reached, train this many more "
+    "steps (no loss target) and check again. 0 disables.",
+)
 _LEARNING_RATE = flags.DEFINE_float(
     "learning_rate", None, "StatefulLLM learning rate (default: the model's)."
 )
@@ -230,6 +255,8 @@ def main(_):
         rehearsal_weight=_REHEARSAL_WEIGHT.value,
         rehearsal_margin=_REHEARSAL_MARGIN.value,
         rationale_max_tokens=_RATIONALE_MAX_TOKENS.value,
+        train_correct_items=_TRAIN_CORRECT_ITEMS.value,
+        verify_steps=_VERIFY_STEPS.value,
     )
     model_kwargs = lora_model_kwargs(
         rank=_LORA_RANK.value, layers=_LORA_LAYERS.value, scale=_LORA_SCALE.value

@@ -35,6 +35,7 @@ from .harness import (
     _insert_dataset_examples,
     _judge_only,
     _train_one_item,
+    interference_summary_text,
     lora_settings,
     lora_settings_text,
     sample_rehearsal_ids,
@@ -43,6 +44,8 @@ from .harness import (
     validate_rehearsal_margin,
     validate_rehearsal_max_tokens,
     validate_rehearsal_weight,
+    validate_verify_steps,
+    verification_summary_text,
     normalize_loss_target,
     validate_training_source,
 )
@@ -110,6 +113,10 @@ class Checkpoint:
 
     # Items in this window whose self-generated revision was rejected (untrained)
     revision_invalid_ids: list[str] = dataclasses.field(default_factory=list)
+    # Items in this window skipped because their baseline was already correct
+    # (``MetaLearningConfig.train_correct_items=False``); untrained, not in
+    # the window counts.
+    skipped_correct_ids: list[str] = dataclasses.field(default_factory=list)
 
     # Optional per-checkpoint holdout probe
     holdout_correct: int | None = None
@@ -193,6 +200,7 @@ class Checkpoint:
             "window_ids": self.window_ids,
             "window_size": self.window_size,
             "revision_invalid_ids": self.revision_invalid_ids,
+            "skipped_correct_ids": self.skipped_correct_ids,
             "holdout_correct": self.holdout_correct,
             "holdout_total": self.holdout_total,
             "holdout_accuracy": self.holdout_accuracy,
@@ -231,6 +239,7 @@ class Checkpoint:
             window_stuck=cp_data.get("window_stuck", 0),
             window_ids=cp_data.get("window_ids", []),
             revision_invalid_ids=cp_data.get("revision_invalid_ids", []),
+            skipped_correct_ids=cp_data.get("skipped_correct_ids", []),
             holdout_correct=cp_data.get("holdout_correct"),
             holdout_total=cp_data.get("holdout_total"),
         )
@@ -265,6 +274,16 @@ class SeedTrajectory:
             through.
         train_rehearsal_pairs: Per trained item, ``steps * k``: what the
             active count is out of.
+        skipped_correct_ids: Train-split items not trained because their
+            baseline was already correct (``train_correct_items=False``).
+            Neither trained nor holdout.
+        skipped_correct_regressed: How many of those were judged wrong in the
+            final post-training pass: interference from the other items'
+            training.
+        verify_attempts: Per trained item, verify-after-target checks made
+            (``verify_steps``); 0 when off.
+        verified: Per trained item, whether the last check passed; ``None``
+            when verification is off.
     """
 
     seed: int
@@ -288,6 +307,40 @@ class SeedTrajectory:
     rationale_truncated_count: int = 0
     train_rehearsal_active_steps: list[int] = dataclasses.field(default_factory=list)
     train_rehearsal_pairs: list[int] = dataclasses.field(default_factory=list)
+    skipped_correct_ids: list[str] = dataclasses.field(default_factory=list)
+    skipped_correct_regressed: int = 0
+    verify_attempts: list[int] = dataclasses.field(default_factory=list)
+    verified: list[bool | None] = dataclasses.field(default_factory=list)
+
+    @property
+    def skipped_correct_count(self) -> int:
+        return len(self.skipped_correct_ids)
+
+    @property
+    def verified_count(self) -> int:
+        """Trained items whose last verification check passed."""
+        return sum(1 for v in self.verified if v is True)
+
+    @property
+    def verify_still_wrong_count(self) -> int:
+        """Trained items still wrong at the step cap after verification."""
+        return sum(1 for v in self.verified if v is False)
+
+    @property
+    def mean_verify_attempts(self) -> float:
+        if not self.verify_attempts:
+            return 0.0
+        return sum(self.verify_attempts) / len(self.verify_attempts)
+
+    def interference_summary_text(self) -> str:
+        """``Skipped (baseline correct): N; of which M regressed ...``."""
+        return interference_summary_text(
+            self.skipped_correct_count, self.skipped_correct_regressed
+        )
+
+    def verification_summary_text(self) -> str:
+        """``Verification: K/N items verified correct ...``."""
+        return verification_summary_text(self.verified, self.verify_attempts)
 
     @property
     def mean_train_steps(self) -> float:
@@ -464,6 +517,14 @@ class SeedTrajectory:
             "train_rehearsal_final_losses": self.train_rehearsal_final_losses,
             "train_rehearsal_active_steps": self.train_rehearsal_active_steps,
             "train_rehearsal_pairs": self.train_rehearsal_pairs,
+            "skipped_correct_ids": self.skipped_correct_ids,
+            "skipped_correct_count": self.skipped_correct_count,
+            "skipped_correct_regressed": self.skipped_correct_regressed,
+            "verify_attempts": self.verify_attempts,
+            "verified": self.verified,
+            "verified_count": self.verified_count,
+            "verify_still_wrong_count": self.verify_still_wrong_count,
+            "mean_verify_attempts": self.mean_verify_attempts,
             "mean_train_steps": self.mean_train_steps,
             "mean_train_final_loss": self.mean_train_final_loss,
             "mean_train_final_train_loss": self.mean_train_final_train_loss,
@@ -494,6 +555,10 @@ class SeedTrajectory:
                 "train_rehearsal_active_steps", []
             ),
             train_rehearsal_pairs=traj_data.get("train_rehearsal_pairs", []),
+            skipped_correct_ids=traj_data.get("skipped_correct_ids", []),
+            skipped_correct_regressed=traj_data.get("skipped_correct_regressed", 0),
+            verify_attempts=traj_data.get("verify_attempts", []),
+            verified=traj_data.get("verified", []),
         )
         for cp_data in traj_data["checkpoints"]:
             trajectory.checkpoints.append(Checkpoint.from_dict(cp_data))
@@ -534,6 +599,12 @@ class MetaLearningConfig:
         repeats: Run each seed this many times with an identical shuffle. Any
             divergence between repeats is generation/training noise, which is
             the control the across-seed comparison needs.
+        train_correct_items: Train train-split items whose baseline is already
+            correct. ``False`` (default) skips them; they are treated like
+            invalid-revision items for the window/checkpoint logic and are
+            re-inferred at the end to measure interference. See
+            ``EvaluationConfig.train_correct_items``.
+        verify_steps: Verify-after-target; see ``EvaluationConfig.verify_steps``.
     """
 
     name: str = "meta_experiment"
@@ -556,6 +627,8 @@ class MetaLearningConfig:
     rationale_max_tokens: int = DEFAULT_RATIONALE_MAX_TOKENS
     holdout_every_checkpoint: bool = False
     repeats: int = 1
+    train_correct_items: bool = False
+    verify_steps: int = 0
 
     def __post_init__(self) -> None:
         validate_training_source(self.training_source)
@@ -568,6 +641,8 @@ class MetaLearningConfig:
         self.rehearsal_margin = validate_rehearsal_margin(self.rehearsal_margin)
         validate_rationale_max_tokens(self.rationale_max_tokens)
         self.loss_target = normalize_loss_target(self.loss_target)
+        self.train_correct_items = bool(self.train_correct_items)
+        validate_verify_steps(self.verify_steps)
         if self.repeats < 1:
             raise ValueError(f"repeats must be >= 1, got {self.repeats}")
 
@@ -591,6 +666,8 @@ class MetaLearningConfig:
             "rationale_max_tokens": self.rationale_max_tokens,
             "holdout_every_checkpoint": self.holdout_every_checkpoint,
             "repeats": self.repeats,
+            "train_correct_items": self.train_correct_items,
+            "verify_steps": self.verify_steps,
         }
 
     @classmethod
@@ -616,6 +693,9 @@ class MetaLearningConfig:
             ),
             holdout_every_checkpoint=data.get("holdout_every_checkpoint", False),
             repeats=data.get("repeats", 1),
+            # Files written before the skip existed trained every item.
+            train_correct_items=data.get("train_correct_items", True),
+            verify_steps=data.get("verify_steps", 0),
         )
 
 
@@ -946,6 +1026,10 @@ class MetaLearningExperiment:
             f"  Loss target: {config.loss_target} "
             f"(step cap: {config.training_iterations})"
         )
+        print(
+            f"  Train correct items: {config.train_correct_items}; "
+            f"verify steps: {config.verify_steps}"
+        )
         print(f"  {result.lora_settings_text()}")
         for (seed, repeat), traj in sorted(result.all_trajectories.items()):
             label = f"Seed {seed}" + (f" repeat {repeat}" if config.repeats > 1 else "")
@@ -970,6 +1054,9 @@ class MetaLearningExperiment:
                     config.training_iterations, config.loss_target
                 )
             )
+            print("    " + traj.interference_summary_text())
+            if config.verify_steps > 0:
+                print("    " + traj.verification_summary_text())
             if config.training_source == "self_generated":
                 print(f"    Invalid revisions: {traj.revision_invalid_count}")
         print()
@@ -1053,6 +1140,8 @@ class MetaLearningExperiment:
                     "rehearsal_weight": config.rehearsal_weight,
                     "rehearsal_margin": config.rehearsal_margin,
                     "rationale_max_tokens": config.rationale_max_tokens,
+                    "train_correct_items": config.train_correct_items,
+                    "verify_steps": config.verify_steps,
                     "model_kwargs": self._model_kwargs,
                     "lora": dict(
                         zip(("rank", "layers", "scale"), lora_settings(self._model_kwargs))
@@ -1132,10 +1221,22 @@ class MetaLearningExperiment:
             batch = train_indices[batch_idx : batch_idx + config.checkpoint_interval]
             window_ids: list[str] = []
             revision_invalid_ids: list[str] = []
+            skipped_correct_ids: list[str] = []
 
             # Train on this batch
             for idx in batch:
                 item = dataset[idx]
+                if (
+                    not config.train_correct_items
+                    and baseline_responses[item.id][1]
+                ):
+                    # Nothing to correct: not trained, not in the window.
+                    # Re-inferred in phase 3 to measure interference.
+                    skipped_correct_ids.append(item.id)
+                    trajectory.skipped_correct_ids.append(item.id)
+                    if verbose:
+                        print(f"    Skipped {item.id}: baseline correct")
+                    continue
                 rehearsal_ids = sample_rehearsal_ids(
                     rehearsal_pool,
                     item.id,
@@ -1159,6 +1260,8 @@ class MetaLearningExperiment:
                     rehearsal_weight=config.rehearsal_weight,
                     rehearsal_margin=config.rehearsal_margin,
                     rationale_max_tokens=config.rationale_max_tokens,
+                    verify_steps=config.verify_steps,
+                    max_tokens=config.max_tokens,
                 )
                 if outcome.revision_invalid:
                     revision_invalid_ids.append(item.id)
@@ -1187,6 +1290,8 @@ class MetaLearningExperiment:
                     outcome.train_rehearsal_active_steps
                 )
                 trajectory.train_rehearsal_pairs.append(outcome.train_rehearsal_pairs)
+                trajectory.verify_attempts.append(outcome.verify_attempts)
+                trajectory.verified.append(outcome.verified)
                 if outcome.train_hit_cap:
                     trajectory.train_cap_hits += 1
                 if outcome.rationale_truncated:
@@ -1220,6 +1325,7 @@ class MetaLearningExperiment:
                 window_ids=window_ids,
                 revision_invalid_ids=revision_invalid_ids,
                 holdout_probe=holdout_probe,
+                skipped_correct_ids=skipped_correct_ids,
             )
             trajectory.checkpoints.append(checkpoint)
 
@@ -1255,6 +1361,23 @@ class MetaLearningExperiment:
 
         trajectory.holdout_correct = holdout_correct
         trajectory.holdout_total = len(holdout_indices)
+
+        # Skipped-correct items: re-infer them too (not holdout, not trained)
+        # so a regression shows up as interference.
+        for item_id in trajectory.skipped_correct_ids:
+            rec = _infer_and_record(
+                model,
+                self._db,
+                items_by_id[item_id],
+                example_ids[item_id],
+                experiment_id,
+                Phase.POST_TRAINING,
+                config.max_tokens,
+                effective_max_tokens,
+            )
+            if not rec.correct:
+                trajectory.skipped_correct_regressed += 1
+
         if verbose:
             acc = trajectory.holdout_accuracy
             print(
@@ -1268,6 +1391,9 @@ class MetaLearningExperiment:
                     config.training_iterations, config.loss_target
                 )
             )
+            print("    " + trajectory.interference_summary_text())
+            if config.verify_steps > 0:
+                print("    " + trajectory.verification_summary_text())
 
         # Mark experiment complete
         self._db.complete_experiment(experiment_id)
@@ -1285,6 +1411,7 @@ class MetaLearningExperiment:
         window_ids: list[str] | None = None,
         revision_invalid_ids: list[str] | None = None,
         holdout_probe: tuple[int, int] | None = None,
+        skipped_correct_ids: list[str] | None = None,
     ) -> Checkpoint:
         """Compute metrics for a checkpoint.
 
@@ -1296,6 +1423,8 @@ class MetaLearningExperiment:
             window_ids: Items trained since the previous checkpoint (window counts).
             revision_invalid_ids: Items in this window skipped for invalid revisions.
             holdout_probe: ``(correct, total)`` for the holdout set, if probed.
+            skipped_correct_ids: Items in this window skipped because their
+                baseline was already correct.
         """
         window = set(window_ids or [])
         counts = {"improved": 0, "retained": 0, "regressed": 0, "stuck": 0}
@@ -1345,6 +1474,7 @@ class MetaLearningExperiment:
             window_stuck=window_counts["stuck"],
             window_ids=list(window_ids or []),
             revision_invalid_ids=list(revision_invalid_ids or []),
+            skipped_correct_ids=list(skipped_correct_ids or []),
             holdout_correct=holdout_probe[0] if holdout_probe else None,
             holdout_total=holdout_probe[1] if holdout_probe else None,
         )

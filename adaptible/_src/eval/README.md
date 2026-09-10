@@ -85,6 +85,32 @@ This replaces the earlier scheme that trained each rehearsal example in its own 
 
 One training event is recorded per item. Rehearsal items are sampled with `seed + item index`, never include the item being corrected, and never include holdout items. `rehearsal_max_tokens` (`--rehearsal_max_tokens`; default 768) keeps items whose raw baseline response is longer than that out of the pool; if fewer than `k` items remain, the ones that do are used. `ItemResult.rehearsal_item_ids` records which items were used.
 
+### Skipping items with a correct baseline (`train_correct_items`)
+
+By default the harness trained every train-split item, including the ones whose baseline answer was already judged correct. On a 40-item screen (`think_mode=rationale`, rank 8, lr 1e-5, answer-loss target 0.6, cap 20) that was 20 of 32 trained items and 60% of all gradient steps spent on items with nothing to correct; net learning was zero (4 of 12 wrong items fixed, 4 of 20 right items regressed) and every regression was one of those already-correct items.
+
+`train_correct_items` (`EvaluationConfig.train_correct_items`, `MetaLearningConfig.train_correct_items`, `--[no]train_correct_items`; default `False`) controls this. When `False`, a train-split item whose baseline is judged correct is **not trained**: it gets `ItemResult.skipped_correct=True`, stays `was_trained=False`, is excluded from `train_items` and from the holdout set (it is neither), and is still re-inferred after training. The harness prints
+
+```text
+Skipped (baseline correct): 20; of which 4 regressed after other items' training
+```
+
+(`EvaluationResult.skipped_correct_count` / `skipped_correct_regressed_count`, `interference_summary_text()`). Nothing was done to these items, so a regression among them is interference from the other items' training, measured separately from the train improvement and retention rates, which now cover the trained (baseline-wrong) items only. The meta-learning experiment treats skipped items like invalid revisions for the window and checkpoint logic (`Checkpoint.skipped_correct_ids`, `SeedTrajectory.skipped_correct_ids` / `skipped_correct_regressed`) and re-infers them in the final pass. Skipped items remain eligible for the rehearsal pool.
+
+For `training_source="self_generated"` this skip is an **oracle**: a live system cannot know which of its answers are wrong, so it cannot choose to skip the right ones. The setting exists to measure the ceiling, i.e. what the loop could achieve if its judgement were perfect. Pass `--train_correct_items` to restore the old behaviour of training every train-split item. Result files written before the flag existed load with `train_correct_items=True`, which is what they did.
+
+### Verify-after-target (`verify_steps`)
+
+The loss target is a proxy: it says the teacher-forced answer is cheap given the rationale, not that the free-running model produces it. Per-item data from the same screen showed stuck items in two classes: (i) answer loss still 2-5 at the step cap (needs more steps), and (ii) answer loss at the target, some at 0.05 after a single step, yet the model still gives the old wrong answer because its own reasoning never reaches the corrected one. For (ii) the only reliable stop signal is generating and checking.
+
+`verify_steps` (`EvaluationConfig.verify_steps`, `MetaLearningConfig.verify_steps`, `--verify_steps`; default `0` = off) adds that loop to `_train_one_item`. After the loss-targeted call returns (target reached or cap), the harness generates the item's answer (`generate_response(question, use_history=False, max_tokens=config.max_tokens)`) and judges it with `contains_key_terms`. If it is wrong and the total steps are still under `training_iterations`, it trains `verify_steps` more steps on the same examples (correction plus any rehearsal rows) with `loss_target=None`, clipped to the remaining budget, then checks again; this repeats until a check passes or the cap is reached. It stops at the first passing check (a probe on `geo_013` flipped right at 4 steps, wrong again at 8, and right at 12 and 16, so a later pass is not guaranteed by an earlier one; the harness does not re-check). Per item, `ItemResult.verify_attempts` is the number of checks, `verified` whether the last one passed (`None` when off), `train_steps` the total over every call, and `train_hit_cap` then means "still wrong at the cap". The summary line and report header carry
+
+```text
+Verification: 9/12 items verified correct after training (mean 1.8 checks/item); 3 still wrong at the cap
+```
+
+(`EvaluationResult.verified_count` / `verify_still_wrong_count` / `mean_verify_attempts`, `verification_summary_text()`; `SeedTrajectory.verified` / `verify_attempts` per trained item). The verification generations are intermediate and are **not** recorded in the database; only the baseline and final post-training responses are. `verify_steps` is stored in the experiment's `config_json` and in both result files.
+
 ### LoRA capacity
 
 `StatefulLLM` converts the last 24 layers to rank-32 LoRA with scale 10.0 by default, which is a lot of capacity for a target a few tokens long. Both CLIs expose `--lora_rank` (default 32), `--lora_layers` (default 24), and `--lora_scale` (default 10.0); `harness.lora_model_kwargs(rank, layers, scale)` turns them into `StatefulLLM(num_lora_layers=..., lora_parameters={"rank": ..., "dropout": 0.0, "scale": ...})` through the existing `model_kwargs` path. The values are recorded in the experiment's `config_json` (`model_kwargs` and a derived `lora` entry), on `EvaluationResult.model_kwargs` / `MetaLearningResult.model_kwargs`, and shown as `LoRA: rank 32, layers 24, scale 10` in the verbose header, the summary, and both reports. Runs recorded before these flags existed report the defaults, which is what they trained with.
@@ -123,6 +149,12 @@ python -m adaptible.eval --category geography --iterations 20 \
 
 # Fixed-count training (the pre-loss-target behaviour): 25 steps per item
 python -m adaptible.eval --loss_target 0 --iterations 25
+
+# Verify each correction by generating, training 4 more steps while it is still wrong
+python -m adaptible.eval --verify_steps 4 --iterations 20 --shuffle
+
+# Train every train-split item, including the ones already right (old behaviour)
+python -m adaptible.eval --train_correct_items
 ```
 
 Flags are `absl.flags`: use underscores (`--train_ratio`, `--no_browser`), not dashes.
@@ -148,6 +180,8 @@ config = eval.EvaluationConfig(
     rehearsal_weight=1.0,             # multiplier on the mean rehearsal gradient
     rehearsal_margin=0.05,            # rehearsal hinge: gradient only once the loss drifts this far
     rationale_max_tokens=512,         # cap on the rationale in the target
+    train_correct_items=False,        # skip train-split items already correct at baseline
+    verify_steps=0,                   # >0: generate-and-check after the target, train N more if wrong
 )
 
 from adaptible._src.eval.harness import lora_model_kwargs  # not re-exported from adaptible.eval yet
@@ -210,6 +244,8 @@ dataset = load_dataset("my_dataset.json")
 | **Train Improvement Rate** | % of trained items that were wrong at baseline and are right after |
 | **Train Retention Rate**   | % of trained items that were right at baseline and stayed right |
 | **Holdout Accuracy**       | % of untrained items correct after training                   |
+| **Skipped (baseline correct)** | Train-split items not trained because their baseline was right (`train_correct_items=False`); the number that regressed is the interference measure |
+| **Verification**           | `verify_steps > 0` only: trained items whose generated answer was judged right after training, mean checks per item, and how many are still wrong at the cap |
 | **Revision Invalid Count** | `self_generated` only: items skipped because the revision failed validation |
 | **Revision summary**       | `self_generated` only: attempted / valid / correct / fixed / broke counts of the revisions themselves, judged before training (see above) |
 
@@ -300,6 +336,8 @@ result = eval.MetaLearningResult.load("outputs/meta/meta.json")
 | `--rehearsal_weight` | `1.0`                            | Multiplier on the mean rehearsal gradient                |
 | `--rehearsal_margin` | `0.05`                           | Rehearsal hinge: drift above the initial loss that activates an example's gradient |
 | `--rationale_max_tokens` | `512`                        | Token cap on the rationale in the target (cut at a sentence boundary) |
+| `--train_correct_items` | `False`                       | Train train-split items already correct at baseline; off skips them and reports interference (see above) |
+| `--verify_steps`    | `0`                               | Verify-after-target: generate and judge after the target; while wrong and under the cap, train N more steps (see above) |
 | `--learning_rate`   | `None`                            | `StatefulLLM(learning_rate=...)`; model default if unset |
 | `--lora_rank`       | `32`                              | LoRA rank                                                |
 | `--lora_layers`     | `24`                              | Trailing layers converted to LoRA                        |

@@ -19,6 +19,7 @@ def generate_html_report(
     # Build item cards
     train_items_html = []
     holdout_items_html = []
+    skipped_items_html = []
 
     for item in result.items:
         initial_class = "has-answer" if item.initial_has_key_terms else "missing-answer"
@@ -71,6 +72,25 @@ def generate_html_report(
             revision_html += (
                 '<div class="key-terms"><strong>Rationale:</strong> '
                 "MISSING (item skipped, not trained)</div>"
+            )
+        if getattr(item, "skipped_correct", False):
+            revision_html += (
+                '<div class="key-terms"><strong>Skipped:</strong> baseline '
+                "already correct (not trained; a regression here is "
+                "interference)</div>"
+            )
+        verified = getattr(item, "verified", None)
+        if verified is not None:
+            attempts = getattr(item, "verify_attempts", 0)
+            checks = f"{attempts} check{'s' if attempts != 1 else ''}"
+            verdict = (
+                f"✓ correct after {checks}"
+                if verified
+                else f"✗ still wrong at the step cap after {checks}"
+            )
+            revision_html += (
+                f'<div class="key-terms"><strong>Verification:</strong> '
+                f"{verdict} ({item.train_steps} steps total)</div>"
             )
 
         # Self-generated runs: show the parsed revision (what was trained on)
@@ -134,12 +154,16 @@ def generate_html_report(
 
         if item.was_trained:
             train_items_html.append(card_html)
+        elif getattr(item, "skipped_correct", False):
+            skipped_items_html.append(card_html)
         else:
             holdout_items_html.append(card_html)
 
     # Count statistics for summary
     train_items = result.train_items
     holdout_items = result.holdout_items
+    skipped_items = getattr(result, "skipped_correct_items", [])
+    skipped_regressed = getattr(result, "skipped_correct_regressed_count", 0)
 
     train_improved = sum(
         1 for i in train_items if not i.initial_has_key_terms and i.post_has_key_terms
@@ -181,6 +205,14 @@ def generate_html_report(
     loss_target_text = f"{loss_target:.2f}" if loss_target is not None else "off"
     training_text = html.escape(result.training_summary_text())
     collapse_text = html.escape(result.collapse_summary_text())
+    train_correct_items = getattr(result.config, "train_correct_items", True)
+    verify_steps = getattr(result.config, "verify_steps", 0)
+    interference_text = html.escape(result.interference_summary_text())
+    verification_html = (
+        f"<br>{html.escape(result.verification_summary_text())}"
+        if verify_steps
+        else ""
+    )
     if training_source == "self_generated":
         training_source_text = (
             "the model was trained on its <em>own revision</em> of each baseline "
@@ -419,12 +451,14 @@ def generate_html_report(
         Rehearsal k: <code>{rehearsal_k}</code> (max tokens: <code>{rehearsal_max_tokens}</code>, weight: <code>{rehearsal_weight:g}</code>, margin: <code>{rehearsal_margin:g}</code>) |
         {lora_text} |
         Training step cap: {result.config.training_iterations} (loss target: <code>{loss_target_text}</code>) |
+        Train correct items: <code>{train_correct_items}</code> |
+        Verify steps: <code>{verify_steps}</code> |
         Train/Holdout split: {result.config.train_ratio:.0%}/{1-result.config.train_ratio:.0%} |
         Shuffle: {result.config.shuffle} (seed: {result.config.seed})
     </div>
 
     <h2>Overall Metrics</h2>
-    <div class="config-box">{collapse_text}<br>{html.escape(result.holdout_summary_text())}<br>{training_text}</div>
+    <div class="config-box">{collapse_text}<br>{html.escape(result.holdout_summary_text())}<br>{interference_text}<br>{training_text}{verification_html}</div>
     <div class="metrics-grid">
         <div class="metric-card">
             <div class="metric-value">{result.baseline_accuracy:.0%}</div>
@@ -499,6 +533,13 @@ def generate_html_report(
         <span class="section-count">{len(holdout_items)} items</span>
     </h2>
     {''.join(holdout_items_html)}
+
+    <h2 class="section-header">
+        <span>Skipped Items (baseline correct, not trained)</span>
+        <span class="section-count">{len(skipped_items)} items, {skipped_regressed} regressed</span>
+    </h2>
+    <p>Train-split items whose baseline answer was already correct. Nothing was done to them, so a regression here is interference from the other items' training.</p>
+    {''.join(skipped_items_html)}
 
     <h2>Raw Data</h2>
     <details>
