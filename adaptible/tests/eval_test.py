@@ -2652,7 +2652,9 @@ class VerifyTest(_TempDbTest):
             )
         q00 = next(r for r in result.items if r.item_id == "q00")
         self.assertEqual(model.train_calls, 3)
-        self.assertEqual(model.train_kwargs, [(12, 0.6, 12), (2, None, 2), (2, None, 2)])
+        # Extra rounds halve the target (call 1 ended at 0.58 -> 0.29, then
+        # 0.6/4 = 0.15 = VERIFY_LOSS_FLOOR) instead of training with none.
+        self.assertEqual(model.train_kwargs, [(12, 0.6, 12), (2, 0.29, 2), (2, 0.15, 2)])
         self.assertEqual([s.steps for s in model.training_stats], [3, 2, 2])
         self.assertEqual(q00.train_steps, 7)
         self.assertEqual(q00.verify_attempts, 3)
@@ -2724,7 +2726,7 @@ class VerifyTest(_TempDbTest):
             verbose=False,
         )
         q00 = next(r for r in result.items if r.item_id == "q00")
-        self.assertEqual(model.train_kwargs, [(6, 0.6, 6), (2, None, 2), (1, None, 1)])
+        self.assertEqual(model.train_kwargs, [(6, 0.6, 6), (2, 0.29, 2), (1, 0.15, 1)])
         self.assertEqual(q00.train_steps, 6)
         self.assertEqual(q00.verify_attempts, 3)
         self.assertIs(q00.verified, False)
@@ -2820,7 +2822,7 @@ class VerifyTest(_TempDbTest):
         self.assertEqual(model.train_kwargs, [])
         self.assertEqual(
             [(c["loss_target"], c["max_steps"], c["rehearsal_k"]) for c in model.joint_calls],
-            [(0.6, 12, 2), (None, 2, 2)],
+            [(0.6, 12, 2), (0.29, 2, 2)],
         )
         # The same rehearsal rows went into both calls.
         self.assertEqual(

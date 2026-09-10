@@ -49,6 +49,10 @@ from .dataset import TriviaDataset, TriviaItem
 #                   the same make_revision_prompt -> validate -> train pipeline the
 #                   server uses. This is the self-correction loop the README describes.
 TRAINING_SOURCES = ("ground_truth", "self_generated")
+# Lowest answer-loss target the verify-after-target rounds train toward.
+# probe_lr (2026-09-09): answer loss < 0.1 leaves the model emitting bare
+# answers everywhere; 0.6 flips the answer with reasoning intact.
+VERIFY_LOSS_FLOOR = 0.15
 
 
 def validate_training_source(training_source: str) -> None:
@@ -1509,8 +1513,11 @@ def _train_one_item(
     verify-after-target loop: generate the item's answer (``max_tokens`` as
     at inference) and judge it; while it is wrong and the total steps are
     under ``training_iterations``, train ``verify_steps`` more steps (clipped
-    to the remaining budget) on the same examples with ``loss_target=None``
-    and check again. The loop stops at the first passing check. The outcome's
+    to the remaining budget) on the same examples and check again. Each
+    extra round's loss target is half the previous one (capped at half the
+    loss the previous call ended at), never below ``VERIFY_LOSS_FLOOR``; a
+    still-wrong item whose loss is already at the floor is left unverified.
+    The loop stops at the first passing check. The outcome's
     ``train_steps`` is the total over every call, ``verify_attempts`` the
     number of checks, ``verified`` the last verdict, and ``train_hit_cap`` is
     then "still wrong at the cap". The checks are not persisted anywhere.
@@ -1579,13 +1586,26 @@ def _train_one_item(
         # Verify-after-target: the loss target says the teacher-forced answer
         # is cheap, not that the free-running model produces it. Generate and
         # check; while wrong and under the cap, train a few more steps.
+        # Each extra round keeps a loss target, halved from the previous one
+        # (and never above half the loss the last call ended at, so the
+        # round always trains), down to VERIFY_LOSS_FLOOR: training with no
+        # target drove answer losses to 0.00 and that is exactly the
+        # collapse regime (screen_verify, 2026-09-10: 3 skipped items and
+        # the holdout regressed). An item still wrong once its loss is at
+        # the floor stays unverified rather than being ground further.
+        target = loss_target
         while True:
             verify_attempts += 1
             verified = _verify_answer(model, item, max_tokens)
             if verified or total_steps >= training_iterations:
                 break
+            last_loss = calls[-1].final_loss
+            if target is not None:
+                if target <= VERIFY_LOSS_FLOOR and last_loss <= VERIFY_LOSS_FLOOR:
+                    break
+                target = max(VERIFY_LOSS_FLOOR, min(target / 2, last_loss / 2))
             extra = min(verify_steps, training_iterations - total_steps)
-            calls.append(train_call(None, extra))
+            calls.append(train_call(target, extra))
             total_steps += calls[-1].steps
     elapsed = time.time() - train_start
     stats = _merge_training_stats(calls)
