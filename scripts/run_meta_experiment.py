@@ -19,8 +19,11 @@ Options:
                             "self_generated" (train on the model's own revision)
     --revision-prompt P     Revision prompt preset for self_generated:
                             "default" or "fewshot"
-    --think_mode M          "baseline" (default; model's own reasoning in the
-                            unmasked prefix, answer only in the loss), "empty"
+    --think_mode M          "rationale" (default; "{rationale}\n</think>\n\n
+                            {answer}" with a rationale that concludes the
+                            answer, stop on the answer loss), "baseline"
+                            (model's own reasoning in the unmasked prefix,
+                            answer only in the loss), "empty"
                             ("</think>\n\n{answer}"), or "none" (old target)
     --[no]close_think       Deprecated alias: --noclose_think == --think_mode none
     --rehearsal_k K         Fold K self-distillation examples from correct
@@ -114,9 +117,11 @@ _REVISION_PROMPT = flags.DEFINE_string(
 )
 _THINK_MODE = flags.DEFINE_enum(
     "think_mode",
-    "baseline",
+    "rationale",
     list(THINK_MODES),
     "How the training target treats the chat template's open <think> tag: "
+    "'rationale' (train on '{rationale}\\n</think>\\n\\n{revision}' with a "
+    "rationale that concludes the revision; loss target on the answer tokens), "
     "'baseline' (model's own reasoning in the unmasked prefix, answer only in "
     "the loss), 'empty' (train on '</think>\\n\\n{revision}'), or 'none' (old "
     "malformed target).",

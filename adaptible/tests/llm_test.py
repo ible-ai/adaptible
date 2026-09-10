@@ -522,6 +522,49 @@ class TrainingStepLoopTest(unittest.TestCase):
         self.assertIsNone(stats.rehearsal_final_loss)
         self.assertEqual(stats.rehearsal_count, 0)
 
+    def test_scalar_losses_report_equal_train_and_stop_loss(self):
+        step, _ = self._scripted([2.0, 0.5])
+        stats = _llm.run_training_steps(step, max_steps=5, loss_target=0.6)
+        self.assertEqual(stats.final_train_loss, 0.5)
+        self.assertEqual(stats.train_losses, [2.0, 0.5])
+        self.assertEqual(stats.losses, [2.0, 0.5])
+
+    def test_pairs_stop_on_stop_loss_not_train_loss(self):
+        # (train_loss, stop_loss): the whole-target loss stays above the
+        # target while the answer loss crosses it on step 3.
+        step, calls = self._scripted([(3.0, 6.05), (2.5, 2.1), (2.2, 0.58), (2.0, 0.2)])
+        stats = _llm.run_training_steps(step, max_steps=12, loss_target=0.6)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(stats.steps, 3)
+        self.assertTrue(stats.stopped_early)
+        self.assertEqual(stats.losses, [6.05, 2.1, 0.58])
+        self.assertEqual(stats.initial_loss, 6.05)
+        self.assertEqual(stats.final_loss, 0.58)
+        self.assertEqual(stats.train_losses, [3.0, 2.5, 2.2])
+        self.assertEqual(stats.final_train_loss, 2.2)
+
+    def test_low_train_loss_never_stops_on_its_own(self):
+        # The reverse: train loss under the target, answer loss above it.
+        step, calls = self._scripted([(0.1, 3.0), (0.05, 2.0), (0.01, 1.0)])
+        stats = _llm.run_training_steps(step, max_steps=3, loss_target=0.6)
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(stats.hit_cap)
+        self.assertEqual(stats.final_loss, 1.0)
+        self.assertEqual(stats.final_train_loss, 0.01)
+
+    def test_pair_losses_accept_array_like(self):
+        step, _ = self._scripted([(mx.array(1.5), mx.array(0.25))])
+        stats = _llm.run_training_steps(step, max_steps=5, loss_target=0.6)
+        self.assertEqual(stats.losses, [0.25])
+        self.assertEqual(stats.train_losses, [1.5])
+        self.assertIsInstance(stats.final_train_loss, float)
+
+    def test_zero_steps_have_nan_train_loss(self):
+        step, _ = self._scripted([])
+        stats = _llm.run_training_steps(step, max_steps=0, loss_target=0.6)
+        self.assertTrue(stats.final_train_loss != stats.final_train_loss)  # NaN
+        self.assertEqual(stats.train_losses, [])
+
 
 class JointTrainingStepTest(unittest.TestCase):
     """Model-free tests for the joint correction + rehearsal objective."""
@@ -584,6 +627,23 @@ class JointTrainingStepTest(unittest.TestCase):
         self.assertEqual(stats.losses, [0.25])
         self.assertIsInstance(stats.rehearsal_final_loss, float)
         self.assertEqual(stats.rehearsal_final_loss, 0.75)
+
+    def test_correction_pair_stops_on_stop_loss(self):
+        # ((train_loss, stop_loss), rehearsal_loss): only the correction's
+        # stop loss drives the stop rule; both other losses are reported.
+        step, calls = self._scripted(
+            [((3.0, 6.05), 0.5), ((2.5, 2.1), 0.45), ((2.2, 0.58), 0.41), ((2.0, 0.2), 0.4)]
+        )
+        stats = _llm.run_joint_training_steps(
+            step, max_steps=12, loss_target=0.6, rehearsal_count=2
+        )
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(stats.losses, [6.05, 2.1, 0.58])
+        self.assertEqual(stats.final_loss, 0.58)
+        self.assertEqual(stats.train_losses, [3.0, 2.5, 2.2])
+        self.assertEqual(stats.final_train_loss, 2.2)
+        self.assertEqual(stats.rehearsal_final_loss, 0.41)
+        self.assertTrue(stats.stopped_early)
 
 
 class CombineGradsTest(unittest.TestCase):

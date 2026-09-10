@@ -28,6 +28,7 @@ from ._paths import default_checkpoint_path
 from .revise import (
     make_collated_training_example,
     make_revision_prompt,
+    split_think,
     validate_revision_response,
 )
 
@@ -52,7 +53,9 @@ _EPOCHS = 5
 # unaffected. Driving the loss below ~0.1 (what a fixed 5-25 iterations does)
 # makes the model emit the bare answer with no reasoning and answer "Ottawa"
 # to unrelated questions. So training stops on a loss target with a step cap,
-# not on a fixed count.
+# not on a fixed count. The target applies to the *answer* tokens
+# (``TrainingExample.stop_mask``): with think_mode="rationale" the training
+# loss also covers the reasoning, which is not what the stop rule is about.
 _LOSS_TARGET: float | None = 0.6
 _MAX_TRAIN_STEPS = 12
 # LoRA configuration: Higher rank (32) and more layers (24) provide
@@ -144,7 +147,21 @@ def _loss_fn(
     inputs: mlx.core.array,
     targets: mlx.core.array,
     mask: mlx.core.array,
-) -> mlx.core.array:
+    stop_mask: mlx.core.array | None = None,
+) -> Tuple[mlx.core.array, mlx.core.array]:
+    """Masked-mean cross entropy: ``(train_loss, stop_loss)``.
+
+    ``train_loss`` is the mean over ``mask`` and is what gradients are taken
+    of. ``stop_loss`` is the mean over ``stop_mask`` (the answer tokens; see
+    ``TrainingExample.stop_mask``) and is what the loss target is compared
+    against; with ``stop_mask=None`` it is ``train_loss``. Both come from the
+    same forward pass.
+
+    ``mlx.core.value_and_grad`` (and so ``mlx.nn.value_and_grad``) accepts a
+    function returning a tuple whose first element is the scalar to
+    differentiate; the remaining elements are returned as auxiliary values
+    untouched, so no second forward pass is needed for ``stop_loss``.
+    """
     # The second positional argument of mlx_lm models is the KV cache, not an
     # attention mask; passing an array there crashes on current mlx_lm. With no
     # cache the model builds its own causal mask.
@@ -152,9 +169,24 @@ def _loss_fn(
     # Use reduction="none" to get per-token losses, then apply mask correctly.
     # Using reduction="mean" would return a scalar that broadcasts incorrectly
     # when multiplied by mask (every masked position gets the same mean value).
-    loss = mlx.nn.losses.cross_entropy(logits, targets, reduction="none") * mask
-    normalized_loss = loss.sum() / mask.sum()
-    return normalized_loss
+    per_token = mlx.nn.losses.cross_entropy(logits, targets, reduction="none")
+    train_loss = (per_token * mask).sum() / mask.sum()
+    if stop_mask is None:
+        return train_loss, train_loss
+    stop_loss = (per_token * stop_mask).sum() / stop_mask.sum()
+    return train_loss, stop_loss
+
+
+StepLoss = float | Tuple[float, float]
+"""What a step function returns: one loss, or ``(train_loss, stop_loss)``."""
+
+
+def _split_step_loss(loss: Any) -> Tuple[float, float]:
+    """``(train_loss, stop_loss)`` from a scalar or a pair (scalar: both equal)."""
+    if isinstance(loss, (tuple, list)):
+        train_loss, stop_loss = loss
+        return float(train_loss), float(stop_loss)
+    return float(loss), float(loss)
 
 
 @dataclasses.dataclass
@@ -163,11 +195,18 @@ class TrainingStats:
 
     Attributes:
         steps: Optimizer steps taken.
-        initial_loss: Loss reported by the first step (NaN if no step ran).
-        final_loss: Loss reported by the last step (NaN if no step ran).
-        stopped_early: True if a step's loss fell below the loss target before
-            the step cap was reached.
-        losses: Every step's loss, in order.
+        initial_loss: Answer (stop) loss reported by the first step (NaN if no
+            step ran).
+        final_loss: Answer (stop) loss reported by the last step (NaN if no
+            step ran). This is the loss the stop rule compares against the
+            target: the masked mean over ``TrainingExample.stop_mask`` (the
+            answer tokens), or the training loss when there is no stop mask.
+        stopped_early: True if a step's answer loss fell below the loss target
+            before the step cap was reached.
+        losses: Every step's answer loss, in order.
+        final_train_loss: Training loss (masked mean over the whole target)
+            at the last step; equals ``final_loss`` without a stop mask.
+        train_losses: Every step's training loss, in order.
         rehearsal_final_loss: For ``train_on_examples``, the mean rehearsal
             loss at the last step; ``None`` when no rehearsal examples were
             trained (``train_on_example``, or an empty rehearsal list).
@@ -175,7 +214,7 @@ class TrainingStats:
             ``train_on_example``).
 
     All loss figures other than ``rehearsal_final_loss`` are the correction's:
-    the stop rule only ever looks at the correction loss.
+    the stop rule only ever looks at the correction's answer loss.
     """
 
     steps: int
@@ -185,6 +224,8 @@ class TrainingStats:
     losses: list[float] = dataclasses.field(default_factory=list)
     rehearsal_final_loss: float | None = None
     rehearsal_count: int = 0
+    final_train_loss: float = math.nan
+    train_losses: list[float] = dataclasses.field(default_factory=list)
 
     @property
     def hit_cap(self) -> bool:
@@ -202,35 +243,40 @@ def should_stop(loss: float, loss_target: float | None) -> bool:
 
 
 def run_training_steps(
-    step_fn: Callable[[], float],
+    step_fn: Callable[[], StepLoss],
     max_steps: int,
     loss_target: float | None,
     verbose: bool = False,
 ) -> TrainingStats:
-    """Call ``step_fn`` until its loss drops below ``loss_target`` or ``max_steps``.
+    """Call ``step_fn`` until its answer loss drops below ``loss_target`` or ``max_steps``.
 
-    ``step_fn`` performs one optimizer step and returns that step's loss. The
-    target is checked after each step, so the step that crosses it is the last
-    one and its loss is ``final_loss``.
+    ``step_fn`` performs one optimizer step and returns that step's loss,
+    either a scalar or ``(train_loss, stop_loss)``. Only ``stop_loss`` (the
+    answer-token loss; the scalar itself when only one is returned) is
+    compared against the target. The target is checked after each step, so
+    the step that crosses it is the last one and its loss is ``final_loss``.
 
     Args:
-        step_fn: Performs one gradient step and returns its loss.
+        step_fn: Performs one gradient step and returns its loss(es).
         max_steps: Hard cap on steps.
-        loss_target: Stop as soon as a step's loss is below this; ``None``
-            runs exactly ``max_steps`` steps.
+        loss_target: Stop as soon as a step's answer loss is below this;
+            ``None`` runs exactly ``max_steps`` steps.
         verbose: Print each step's loss.
 
     Returns:
         Per-call ``TrainingStats``.
     """
     losses: list[float] = []
+    train_losses: list[float] = []
     stopped_early = False
     for step in range(max(max_steps, 0)):
-        loss = float(step_fn())
-        losses.append(loss)
+        train_loss, stop_loss = _split_step_loss(step_fn())
+        losses.append(stop_loss)
+        train_losses.append(train_loss)
         if verbose:
-            vizible.green(f"Step: {step}\tLoss: {loss:.4f}")
-        if should_stop(loss, loss_target):
+            extra = f"\tTrain loss: {train_loss:.4f}" if train_loss != stop_loss else ""
+            vizible.green(f"Step: {step}\tLoss: {stop_loss:.4f}{extra}")
+        if should_stop(stop_loss, loss_target):
             stopped_early = True
             break
     return TrainingStats(
@@ -239,11 +285,13 @@ def run_training_steps(
         final_loss=losses[-1] if losses else math.nan,
         stopped_early=stopped_early,
         losses=losses,
+        final_train_loss=train_losses[-1] if train_losses else math.nan,
+        train_losses=train_losses,
     )
 
 
 def run_joint_training_steps(
-    step_fn: Callable[[], Tuple[float, float | None]],
+    step_fn: Callable[[], Tuple[StepLoss, float | None]],
     max_steps: int,
     loss_target: float | None,
     rehearsal_count: int,
@@ -252,17 +300,18 @@ def run_joint_training_steps(
     """``run_training_steps`` for a joint correction + rehearsal objective.
 
     ``step_fn`` performs one optimizer step on the combined gradient and
-    returns ``(correction_loss, mean_rehearsal_loss)``; the rehearsal loss is
-    ``None`` when there are no rehearsal examples. Only the correction loss is
-    compared against ``loss_target``: rehearsal targets are the model's own
-    baseline output, whose loss is already low, so stopping on it would end
-    training before the correction lands.
+    returns ``(correction_loss, mean_rehearsal_loss)``, where the correction
+    loss is a scalar or a ``(train_loss, stop_loss)`` pair and the rehearsal
+    loss is ``None`` when there are no rehearsal examples. Only the
+    correction's answer loss is compared against ``loss_target``: rehearsal
+    targets are the model's own baseline output, whose loss is already low,
+    so stopping on it would end training before the correction lands.
 
     Args:
         step_fn: Performs one gradient step and returns both losses.
         max_steps: Hard cap on steps.
-        loss_target: Stop as soon as the *correction* loss is below this;
-            ``None`` runs exactly ``max_steps`` steps.
+        loss_target: Stop as soon as the *correction's answer* loss is below
+            this; ``None`` runs exactly ``max_steps`` steps.
         rehearsal_count: Rehearsal examples per step, recorded on the stats.
         verbose: Print each step's losses.
 
@@ -272,12 +321,12 @@ def run_joint_training_steps(
     """
     last_rehearsal: list[float | None] = [None]
 
-    def correction_only() -> float:
+    def correction_only() -> StepLoss:
         loss_c, loss_r = step_fn()
         last_rehearsal[0] = None if loss_r is None else float(loss_r)
         if verbose and loss_r is not None:
             vizible.green(f"\tRehearsal loss: {float(loss_r):.4f}")
-        return float(loss_c)
+        return _split_step_loss(loss_c)
 
     stats = run_training_steps(correction_only, max_steps, loss_target, verbose)
     stats.rehearsal_final_loss = last_rehearsal[0]
@@ -639,14 +688,17 @@ class StatefulLLM:
         # 3. Prepare training data to train the model on how it should have responded in this
         #    situation. Pass the same list as make_revision_prompt above: the [[X]] index in
         #    the response is a position within interactions_to_review, not interaction_history.
-        #    think_mode="baseline": the interaction's raw llm_response carries the model's
-        #    own reasoning, which stays in the (unmasked) prefix so training does not
-        #    teach the model to skip reasoning.
+        #    think_mode="rationale": the revision generation's own think block becomes the
+        #    reasoning in the target, so the model is trained on reasoning that actually
+        #    concludes the revision rather than on "given the old reasoning, say X".
+        #    Without a think block this falls back to "empty".
+        rationale, _ = split_think(llm_rewrite_response)
         example = make_collated_training_example(
             llm_rewrite_response,
             interactions_to_review,
             self._tokenizer,
-            think_mode="baseline",
+            think_mode="rationale",
+            rationale=rationale,
         )
         return example
 
@@ -681,22 +733,29 @@ class StatefulLLM:
             max_steps = self._epochs
         state = [self._model.state, self._optimizer.state, mlx.core.random.state]
         mlx.core.eval(state)
+        # ``_loss_fn`` returns ``(train_loss, stop_loss)``; value_and_grad
+        # differentiates the first element and passes the tuple through.
         loss_and_grad_fn = mlx.nn.value_and_grad(self._model, _loss_fn)
+        stop_mask = example.mask if example.stop_mask is None else example.stop_mask
 
         @functools.partial(mlx.core.compile, inputs=state, outputs=state)
-        def _step(inputs, labels, mask):
-            loss, grads = loss_and_grad_fn(self._model, inputs, labels, mask)
+        def _step(inputs, labels, mask, stop_mask):
+            (train_loss, stop_loss), grads = loss_and_grad_fn(
+                self._model, inputs, labels, mask, stop_mask
+            )
             self._optimizer.update(self._model, grads)
-            return loss
+            return train_loss, stop_loss
 
         _prepare_training_device(verbose)
         progress = tqdm.tqdm(desc="Training", total=max_steps)
 
-        def one_step() -> float:
-            loss = _step(example.input, example.label, example.mask)
-            mlx.core.eval(state, loss)
+        def one_step() -> Tuple[float, float]:
+            train_loss, stop_loss = _step(
+                example.input, example.label, example.mask, stop_mask
+            )
+            mlx.core.eval(state, train_loss, stop_loss)
             progress.update(1)
-            return loss.item()
+            return train_loss.item(), stop_loss.item()
 
         self._model.train(True)
         try:
@@ -726,11 +785,12 @@ class StatefulLLM:
         produced so their activations are released before the next pass.
 
         Args:
-            correction: The corrected answer, whose loss drives the stop rule.
+            correction: The corrected answer, whose answer loss drives the
+                stop rule.
             rehearsal: Self-distillation examples anchoring the model.
             verbose: Print per-step losses and device info.
             max_steps: Step cap.
-            loss_target: Stop once the correction loss is below this.
+            loss_target: Stop once the correction's answer loss is below this.
             rehearsal_weight: Multiplier on the mean rehearsal gradient.
 
         Returns:
@@ -739,19 +799,26 @@ class StatefulLLM:
         state = [self._model.state, self._optimizer.state, mlx.core.random.state]
         mlx.core.eval(state)
         loss_and_grad_fn = mlx.nn.value_and_grad(self._model, _loss_fn)
+        stop_mask_c = (
+            correction.mask if correction.stop_mask is None else correction.stop_mask
+        )
 
         _prepare_training_device(verbose)
         progress = tqdm.tqdm(desc="Training", total=max_steps)
 
-        def one_step() -> Tuple[float, float | None]:
-            loss_c, grads_c = loss_and_grad_fn(
-                self._model, correction.input, correction.label, correction.mask
+        def one_step() -> Tuple[Tuple[float, float], float | None]:
+            (train_c, stop_c), grads_c = loss_and_grad_fn(
+                self._model,
+                correction.input,
+                correction.label,
+                correction.mask,
+                stop_mask_c,
             )
-            mlx.core.eval(loss_c, grads_c)
+            mlx.core.eval(train_c, stop_c, grads_c)
             rehearsal_losses: list[float] = []
             rehearsal_grads: list[Any] = []
             for example in rehearsal:
-                loss_r, grads_r = loss_and_grad_fn(
+                (loss_r, _), grads_r = loss_and_grad_fn(
                     self._model, example.input, example.label, example.mask
                 )
                 mlx.core.eval(loss_r, grads_r)
@@ -769,7 +836,7 @@ class StatefulLLM:
                 if rehearsal_losses
                 else None
             )
-            return loss_c.item(), loss_r_mean
+            return (train_c.item(), stop_c.item()), loss_r_mean
 
         self._model.train(True)
         try:
@@ -791,9 +858,14 @@ class StatefulLLM:
             if stats.rehearsal_final_loss is not None
             else ""
         )
+        train = (
+            f", train loss {stats.final_train_loss:.4f}"
+            if stats.final_train_loss != stats.final_loss
+            else ""
+        )
         vizible.cyan(
-            f"Trained {stats.steps} steps, loss {stats.initial_loss:.4f} → "
-            f"{stats.final_loss:.4f}{rehearsal}"
+            f"Trained {stats.steps} steps, answer loss {stats.initial_loss:.4f} → "
+            f"{stats.final_loss:.4f}{train}{rehearsal}"
             + (" (loss target reached)" if stats.stopped_early else "")
         )
 
@@ -808,10 +880,11 @@ class StatefulLLM:
     ) -> TrainingStats:
         """Train on a pre-constructed training example.
 
-        Runs single optimizer steps until a step's loss is below
-        ``loss_target`` or the step cap is reached. With ``loss_target=None``
-        (the default) exactly ``iterations`` steps run, which keeps existing
-        callers' behaviour.
+        Runs single optimizer steps until a step's answer loss (the masked
+        mean over ``example.stop_mask``, or the whole target without one) is
+        below ``loss_target`` or the step cap is reached. With
+        ``loss_target=None`` (the default) exactly ``iterations`` steps run,
+        which keeps existing callers' behaviour.
 
         Args:
             example: Pre-constructed TrainingExample with input, label, and mask.

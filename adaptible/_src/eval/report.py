@@ -55,6 +55,19 @@ def generate_html_report(
         else:
             revision_html = ""
 
+        rationale_text = getattr(item, "rationale_text", None)
+        if rationale_text:
+            revision_html += (
+                '<div class="key-terms"><strong>Rationale (in target):</strong> '
+                f"{html.escape(rationale_text[:500])}"
+                f"{'...' if len(rationale_text) > 500 else ''}</div>"
+            )
+        elif getattr(item, "rationale_missing", False):
+            revision_html += (
+                '<div class="key-terms"><strong>Rationale:</strong> '
+                "MISSING (trained on the empty-think target)</div>"
+            )
+
         # Self-generated runs: show the parsed revision (what was trained on)
         # between the baseline and post-training answers, judged on its own.
         if item.revision_answer is not None:
@@ -151,6 +164,7 @@ def generate_html_report(
     training_source = getattr(result.config, "training_source", "ground_truth")
     revision_prompt = getattr(result.config, "revision_prompt", "default")
     think_mode = getattr(result.config, "think_mode", "empty")
+    rationale_missing_count = getattr(result, "rationale_missing_count", 0)
     rehearsal_k = getattr(result.config, "rehearsal_k", 0)
     rehearsal_max_tokens = getattr(result.config, "rehearsal_max_tokens", 768)
     rehearsal_weight = getattr(result.config, "rehearsal_weight", 1.0)
@@ -393,7 +407,7 @@ def generate_html_report(
         Dataset: {html.escape(result.dataset_name)} ({len(result.items)} items)<br>
         Training source: {html.escape(training_source)} |
         Revision prompt: {html.escape(revision_prompt)} |
-        Think mode: <code>{html.escape(str(think_mode))}</code> |
+        Think mode: <code>{html.escape(str(think_mode))}</code> (rationales missing: <code>{rationale_missing_count}</code>) |
         Rehearsal k: <code>{rehearsal_k}</code> (max tokens: <code>{rehearsal_max_tokens}</code>, weight: <code>{rehearsal_weight:g}</code>) |
         {lora_text} |
         Training step cap: {result.config.training_iterations} (loss target: <code>{loss_target_text}</code>) |

@@ -32,7 +32,9 @@ from ..revise import (
     make_training_example,
     resolve_think_mode,
     revision_prompt_preset,
+    split_think,
     strip_think_tags,
+    template_opens_think,
     validate_revision_response,
 )
 from .dataset import TriviaDataset, TriviaItem
@@ -120,8 +122,17 @@ class EvaluationConfig:
             see ``revise.revision_prompt_preset``. Ignored for ``ground_truth``.
         think_mode: How the training target treats the chat template's open
             ``<think>`` block; one of ``revise.THINK_MODES`` ("none", "empty",
-            "baseline"). "baseline" keeps the model's own reasoning in the
-            unmasked prefix and trains only on the corrected answer.
+            "baseline", "rationale"). "rationale" (the default) trains on
+            ``{rationale}\n</think>\n\n{answer}{eos}`` where the rationale is
+            reasoning that concludes the answer: the revision generation's
+            own think block for ``self_generated``, or, for ``ground_truth``,
+            one generated with ``make_rationale_prompt`` from the label.
+            Items with no rationale fall back to "empty" and are counted in
+            ``EvaluationResult.rationale_missing_count``. "baseline" keeps the
+            model's own baseline reasoning in the unmasked prefix and trains
+            only on the corrected answer; on DeepSeek-R1-Distill the correction
+            then does not take at inference (the model re-derives its old
+            answer).
         close_think: Deprecated alias for ``think_mode``. ``False`` forces
             ``think_mode="none"`` (the pre-1.0.0a4 target, for comparison);
             ``None``/``True`` defer to ``think_mode``. After construction it is
@@ -145,16 +156,20 @@ class EvaluationConfig:
             the generation cap; this keeps every training sequence bounded.
         training_iterations: Cap on optimizer steps per training call. With a
             ``loss_target`` this is a ceiling, not a count.
-        loss_target: Stop each training call as soon as a step's loss falls
-            below this. A per-step probe on the real model showed the greedy
+        loss_target: Stop each training call as soon as a step's *answer*
+            loss falls below this: the loss over the answer tokens plus eos
+            (``TrainingExample.stop_mask``), whatever else the training loss
+            covers. A per-step probe on the real model showed the greedy
             answer flips to the correction at a mean target loss of ~0.6 with
             the reasoning intact, while driving the loss to ~0 (what a fixed
             5-25 iterations does) collapses the reasoning and bleeds the answer
             into unrelated questions. ``None`` (or any value <= 0) disables the
             target and trains exactly ``training_iterations`` steps. Only the
-            correction loss is compared against the target; the rehearsal loss
-            is reported (``ItemResult.train_rehearsal_final_loss``) but never
-            stops training.
+            correction's answer loss is compared against the target; the
+            training loss over the whole target
+            (``ItemResult.train_final_train_loss``) and the rehearsal loss
+            (``ItemResult.train_rehearsal_final_loss``) are reported but never
+            stop training.
     """
 
     name: str = "default"
@@ -167,7 +182,7 @@ class EvaluationConfig:
     max_tokens: int | None = None  # Use model default if None
     training_source: str = "ground_truth"
     revision_prompt: str = "default"
-    think_mode: str = "baseline"
+    think_mode: str = "rationale"
     close_think: bool | None = None
     rehearsal_k: int = 0
     rehearsal_max_tokens: int = 768
@@ -239,9 +254,20 @@ class ItemResult:
             the post-training pass runs.
         rehearsal_item_ids: Ids of the items whose baseline outputs were batched
             with this item's correction (``EvaluationConfig.rehearsal_k``).
+        rationale_text: With ``think_mode="rationale"``, the reasoning that
+            was placed before ``</think>`` in the training target (the
+            revision's own think block, or the generated one for
+            ``ground_truth``); None otherwise or when none was available.
+        rationale_missing: The item was trained with ``think_mode="rationale"``
+            on a think template but no rationale was available, so it fell
+            back to the "empty" target.
         train_steps: Optimizer steps the correction took (0 if not trained).
-        train_initial_loss: Loss at the correction's first step.
-        train_final_loss: Loss at the correction's last step.
+        train_initial_loss: Answer loss at the correction's first step.
+        train_final_loss: Answer loss at the correction's last step (the loss
+            the stop rule watched; over the answer tokens plus eos).
+        train_final_train_loss: Training loss over the whole target at the
+            correction's last step; equals ``train_final_loss`` unless the
+            target carries more than the answer (``think_mode="rationale"``).
         train_hit_cap: The correction ran out of steps without reaching the
             loss target.
         train_rehearsal_final_loss: Mean rehearsal loss at the correction's last
@@ -269,9 +295,12 @@ class ItemResult:
     initial_token_count: int = 0
     post_token_count: int | None = None
     rehearsal_item_ids: list[str] = dataclasses.field(default_factory=list)
+    rationale_text: str | None = None
+    rationale_missing: bool = False
     train_steps: int = 0
     train_initial_loss: float | None = None
     train_final_loss: float | None = None
+    train_final_train_loss: float | None = None
     train_hit_cap: bool = False
     train_rehearsal_final_loss: float | None = None
 
@@ -541,7 +570,7 @@ class EvaluationResult:
 
     @property
     def mean_train_final_loss(self) -> float | None:
-        """Mean final loss over trained items that reported one."""
+        """Mean final answer loss over trained items that reported one."""
         losses = [
             item.train_final_loss
             for item in self.train_items
@@ -550,6 +579,23 @@ class EvaluationResult:
         if not losses:
             return None
         return sum(losses) / len(losses)
+
+    @property
+    def mean_train_final_train_loss(self) -> float | None:
+        """Mean final training (whole-target) loss over trained items."""
+        losses = [
+            item.train_final_train_loss
+            for item in self.train_items
+            if item.train_final_train_loss is not None
+        ]
+        if not losses:
+            return None
+        return sum(losses) / len(losses)
+
+    @property
+    def rationale_missing_count(self) -> int:
+        """Items that fell back to the "empty" target for want of a rationale."""
+        return sum(1 for item in self.items if item.rationale_missing)
 
     @property
     def mean_train_rehearsal_final_loss(self) -> float | None:
@@ -577,6 +623,8 @@ class EvaluationResult:
             self.config.training_iterations,
             self.config.loss_target,
             [item.train_rehearsal_final_loss for item in self.train_items],
+            [item.train_final_train_loss for item in self.train_items],
+            self.rationale_missing_count,
         )
 
     def lora_settings_text(self) -> str:
@@ -625,8 +673,10 @@ class EvaluationResult:
                 "revision_summary": self.revision_summary(),
                 "mean_train_steps": self.mean_train_steps,
                 "mean_train_final_loss": self.mean_train_final_loss,
+                "mean_train_final_train_loss": self.mean_train_final_train_loss,
                 "mean_train_rehearsal_final_loss": self.mean_train_rehearsal_final_loss,
                 "train_cap_hit_count": self.train_cap_hit_count,
+                "rationale_missing_count": self.rationale_missing_count,
             },
             "items": [
                 {
@@ -651,9 +701,12 @@ class EvaluationResult:
                     "initial_token_count": item.initial_token_count,
                     "post_token_count": item.post_token_count,
                     "rehearsal_item_ids": item.rehearsal_item_ids,
+                    "rationale_text": item.rationale_text,
+                    "rationale_missing": item.rationale_missing,
                     "train_steps": item.train_steps,
                     "train_initial_loss": item.train_initial_loss,
                     "train_final_loss": item.train_final_loss,
+                    "train_final_train_loss": item.train_final_train_loss,
                     "train_hit_cap": item.train_hit_cap,
                     "train_rehearsal_final_loss": item.train_rehearsal_final_loss,
                 }
@@ -669,27 +722,37 @@ def training_summary_text(
     cap: int,
     loss_target: float | None,
     rehearsal_final_losses: list[float | None] | None = None,
+    train_final_losses: list[float | None] | None = None,
+    rationale_missing: int = 0,
 ) -> str:
-    """Format ``Training: mean 3.2 steps/item (cap 12), mean final loss 0.55; ...``.
+    """Format the one-line training summary.
 
-    Shared by the harness and the meta-learning experiment so both print the
-    same line. When any item reported a rehearsal loss the mean is appended
-    to the correction's: ``mean final loss 0.39 (rehearsal 0.41)``.
+    ``Training: mean 3.2 steps/item (cap 12, answer-loss target 0.60), mean
+    final answer loss 0.55 (train loss 0.80, rehearsal 0.41); 0 items hit the
+    cap; 0 rationales missing``. Shared by the harness and the meta-learning
+    experiment so both print the same line. The parenthesised train loss
+    (whole-target) and rehearsal loss each appear only when some item
+    reported one.
     """
     if not steps:
         return "Training: no items trained"
     mean_steps = sum(steps) / len(steps)
     losses = [l for l in final_losses if l is not None]
-    loss_text = (
-        f"{sum(losses) / len(losses):.2f}" if losses else "n/a"
-    )
+    loss_text = f"{sum(losses) / len(losses):.2f}" if losses else "n/a"
+    extras = []
+    train = [l for l in (train_final_losses or []) if l is not None]
+    if train:
+        extras.append(f"train loss {sum(train) / len(train):.2f}")
     rehearsal = [l for l in (rehearsal_final_losses or []) if l is not None]
     if rehearsal:
-        loss_text += f" (rehearsal {sum(rehearsal) / len(rehearsal):.2f})"
+        extras.append(f"rehearsal {sum(rehearsal) / len(rehearsal):.2f}")
+    if extras:
+        loss_text += f" ({', '.join(extras)})"
     target_text = f"{loss_target:.2f}" if loss_target is not None else "off"
     return (
-        f"Training: mean {mean_steps:.1f} steps/item (cap {cap}, loss target "
-        f"{target_text}), mean final loss {loss_text}; {cap_hits} items hit the cap"
+        f"Training: mean {mean_steps:.1f} steps/item (cap {cap}, answer-loss "
+        f"target {target_text}), mean final answer loss {loss_text}; "
+        f"{cap_hits} items hit the cap; {rationale_missing} rationales missing"
     )
 
 
@@ -823,15 +886,62 @@ def _judge_only(
     return clean, contains_key_terms(clean, item.key_terms)
 
 
+RATIONALE_PROMPT = (
+    "{question}\n\nThe correct answer is: {correct_answer}\n"
+    "Reason it through step by step, then state the answer."
+)
+"""Prompt that asks the model to reason its way to a known answer.
+
+Used by ``think_mode="rationale"`` with ``training_source="ground_truth"``:
+the think block of the response becomes the reasoning in the training
+target, so the model is trained on reasoning that concludes the label rather
+than on its own reasoning that concluded something else.
+"""
+
+
+def make_rationale_prompt(question: str, correct_answer: str) -> str:
+    """``RATIONALE_PROMPT`` filled in for one item."""
+    return RATIONALE_PROMPT.format(question=question, correct_answer=correct_answer)
+
+
+@dataclasses.dataclass
+class BuiltExample:
+    """What ``_build_training_example`` produced for one item.
+
+    Attributes:
+        example: The 1-D correction example; batch it with
+            ``collate_training_examples``.
+        revision_text: The model's raw revision output for "self_generated"
+            (think block and markers included); None for "ground_truth".
+        rationale_text: The reasoning placed in the target under
+            ``think_mode="rationale"``; None otherwise or when unavailable.
+        rationale_missing: ``think_mode="rationale"`` on a think template but
+            no rationale could be had, so the target fell back to "empty".
+    """
+
+    example: TrainingExample
+    revision_text: str | None = None
+    rationale_text: str | None = None
+    rationale_missing: bool = False
+
+
 def _build_training_example(
     model: Any,
     item: TriviaItem,
     baseline_response: str,
     training_source: str,
     revision_prompt: str = "default",
-    think_mode: str = "baseline",
-) -> tuple[TrainingExample, str | None]:
+    think_mode: str = "rationale",
+) -> BuiltExample:
     """Build the (unbatched) correction training example for one item.
+
+    With ``think_mode="rationale"`` the reasoning in the target comes from
+    the revision generation's own think block (``self_generated``; the raw
+    revision text is kept for that) or, for ``ground_truth``, from one extra
+    generation with ``make_rationale_prompt``. Either way ``split_think``
+    picks the think block out; if it is empty the item falls back to the
+    "empty" target and ``rationale_missing`` is set. Templates without an
+    open think tag skip all of this (no extra generation).
 
     Args:
         model: Anything with ``generate_response`` and ``_tokenizer``.
@@ -844,9 +954,7 @@ def _build_training_example(
         think_mode: Passed to ``make_revision_training_example``.
 
     Returns:
-        ``(example, revision_text)``. ``revision_text`` is the model's raw
-        revision output for "self_generated" and None for "ground_truth".
-        ``example`` is 1-D; batch it with ``collate_training_examples``.
+        A ``BuiltExample``.
 
     Raises:
         InvalidRevisionError: If a self-generated revision fails validation.
@@ -877,10 +985,31 @@ def _build_training_example(
         revision = model.generate_response(prompt, use_history=False) or ""
         validate_revision_response(revision, num_interactions=len(interactions))
         revision_text = revision
+
+    rationale: str | None = None
+    rationale_missing = False
+    messages = [{"role": "user", "content": item.question}]
+    if think_mode == "rationale" and template_opens_think(tokenizer, messages):
+        if training_source == "self_generated":
+            rationale, _ = split_think(revision)
+        else:
+            output = model.generate_response(
+                make_rationale_prompt(item.question, item.correct_answer),
+                use_history=False,
+            )
+            rationale, _ = split_think(output or "")
+        if not rationale:
+            rationale = None
+            rationale_missing = True
     example = make_revision_training_example(
-        revision, interactions, tokenizer, think_mode=think_mode
+        revision, interactions, tokenizer, think_mode=think_mode, rationale=rationale
     )
-    return example, revision_text
+    return BuiltExample(
+        example=example,
+        revision_text=revision_text,
+        rationale_text=rationale,
+        rationale_missing=rationale_missing,
+    )
 
 
 def make_rehearsal_example(
@@ -944,11 +1073,18 @@ class TrainingOutcome:
     revision_answer: str | None = None
     revision_has_key_terms: bool | None = None
     rehearsal_item_ids: list[str] = dataclasses.field(default_factory=list)
-    # Stats for the item's single training call; the losses are the correction's.
+    # Reasoning placed in the target under think_mode="rationale", and whether
+    # the item fell back to "empty" for want of one.
+    rationale_text: str | None = None
+    rationale_missing: bool = False
+    # Stats for the item's single training call; the losses are the
+    # correction's answer loss (what the stop rule watched).
     train_steps: int = 0
     train_initial_loss: float | None = None
     train_final_loss: float | None = None
     train_hit_cap: bool = False
+    # Whole-target training loss at the last step.
+    train_final_train_loss: float | None = None
     # Mean rehearsal loss at the last step (None without rehearsal).
     train_rehearsal_final_loss: float | None = None
     # The full stats of the call (one entry; kept as a list for callers that
@@ -956,15 +1092,23 @@ class TrainingOutcome:
     training_stats: list[TrainingStats] = dataclasses.field(default_factory=list)
 
     def training_text(self) -> str:
-        """``3 steps, loss 6.05 → 0.58 (rehearsal 0.41)`` for the verbose per-item line."""
+        """``3 steps, loss 6.05 → 0.58 (train 0.80, rehearsal 0.41)`` for the verbose per-item line."""
         if self.train_initial_loss is None or self.train_final_loss is None:
             return f"{self.train_steps} steps"
         text = (
             f"{self.train_steps} steps, loss {self.train_initial_loss:.2f} → "
             f"{self.train_final_loss:.2f}"
         )
+        extras = []
+        if (
+            self.train_final_train_loss is not None
+            and self.train_final_train_loss != self.train_final_loss
+        ):
+            extras.append(f"train {self.train_final_train_loss:.2f}")
         if self.train_rehearsal_final_loss is not None:
-            text += f" (rehearsal {self.train_rehearsal_final_loss:.2f})"
+            extras.append(f"rehearsal {self.train_rehearsal_final_loss:.2f}")
+        if extras:
+            text += f" ({', '.join(extras)})"
         return text
 
 
@@ -978,7 +1122,7 @@ def _train_one_item(
     training_iterations: int,
     training_source: str,
     revision_prompt: str = "default",
-    think_mode: str = "baseline",
+    think_mode: str = "rationale",
     rehearsal: list[tuple[TriviaItem, str]] | None = None,
     loss_target: float | None = None,
     rehearsal_weight: float = 1.0,
@@ -995,22 +1139,24 @@ def _train_one_item(
     that can run to the generation cap exhausted a 16 GB machine). Without
     rehearsal it is one ``model.train_on_example(correction, ...)`` call.
     Either way the call gets ``loss_target`` and ``max_steps =
-    training_iterations`` and stops as soon as the *correction* loss is below
-    the target; the rehearsal loss is only reported. One training event is
-    recorded for the item with ``training_iterations`` set to the steps
-    actually taken.
+    training_iterations`` and stops as soon as the correction's *answer*
+    loss is below the target; the whole-target training loss and the
+    rehearsal loss are only reported. One training event is recorded for the
+    item with ``training_iterations`` set to the steps actually taken.
 
     On ``InvalidRevisionError`` the item is not trained and the outcome carries
     ``revision_invalid=True`` plus the error text.
     """
     try:
-        correction, revision_text = _build_training_example(
+        built = _build_training_example(
             model, item, baseline_response, training_source, revision_prompt, think_mode
         )
     except InvalidRevisionError as e:
         return TrainingOutcome(
             trained=False, revision_invalid=True, revision_error=str(e)
         )
+    correction = built.example
+    revision_text = built.revision_text
     tokenizer = model._tokenizer
     rehearsal = rehearsal or []
     correction_row = collate_training_examples([correction], tokenizer)
@@ -1052,13 +1198,24 @@ def _train_one_item(
         revision_answer=revision_answer,
         revision_has_key_terms=revision_has_key_terms,
         rehearsal_item_ids=[r_item.id for r_item, _ in rehearsal],
+        rationale_text=built.rationale_text,
+        rationale_missing=built.rationale_missing,
         train_steps=stats.steps,
         train_initial_loss=stats.initial_loss,
         train_final_loss=stats.final_loss,
         train_hit_cap=stats.hit_cap,
+        train_final_train_loss=_final_train_loss(stats),
         train_rehearsal_final_loss=stats.rehearsal_final_loss,
         training_stats=[stats],
     )
+
+
+def _final_train_loss(stats: TrainingStats) -> float | None:
+    """``stats.final_train_loss`` as ``None`` when NaN or absent (stub stats)."""
+    value = getattr(stats, "final_train_loss", None)
+    if value is None or value != value:
+        return None
+    return float(value)
 
 
 def _insert_dataset_examples(db: Database, dataset: TriviaDataset) -> dict[str, int]:
@@ -1316,9 +1473,12 @@ class EvaluationHarness:
             item_result.revision_invalid = outcome.revision_invalid
             item_result.training_time_seconds = outcome.training_time_seconds
             item_result.rehearsal_item_ids = outcome.rehearsal_item_ids
+            item_result.rationale_text = outcome.rationale_text
+            item_result.rationale_missing = outcome.rationale_missing
             item_result.train_steps = outcome.train_steps
             item_result.train_initial_loss = outcome.train_initial_loss
             item_result.train_final_loss = outcome.train_final_loss
+            item_result.train_final_train_loss = outcome.train_final_train_loss
             item_result.train_hit_cap = outcome.train_hit_cap
             item_result.train_rehearsal_final_loss = outcome.train_rehearsal_final_loss
             # An item whose revision was rejected was never trained on; keep it
@@ -1349,6 +1509,8 @@ class EvaluationHarness:
                         f"       Trained ({outcome.training_text()}, "
                         f"{outcome.training_time_seconds:.1f}s{extra})"
                     )
+                    if outcome.rationale_missing:
+                        print("       Rationale missing; trained on the empty-think target")
                     if outcome.revision_answer is not None:
                         was = "✓" if item_result.initial_has_key_terms else "✗"
                         now = "✓" if outcome.revision_has_key_terms else "✗"

@@ -243,10 +243,15 @@ class SeedTrajectory:
             revision failed validation (always 0 for ``ground_truth``).
         train_steps: Per trained item (in training order), optimizer steps the
             correction took under the loss target.
-        train_final_losses: Per trained item, the correction's final loss.
+        train_final_losses: Per trained item, the correction's final answer
+            loss (what the stop rule watched).
         train_cap_hits: Trained items whose correction ran to the step cap.
         train_rehearsal_final_losses: Per trained item, the mean rehearsal loss
             at the last step (None for items trained without rehearsal).
+        train_final_train_losses: Per trained item, the whole-target training
+            loss at the last step.
+        rationale_missing_count: Items trained under ``think_mode="rationale"``
+            that fell back to the "empty" target for want of a rationale.
     """
 
     seed: int
@@ -263,6 +268,10 @@ class SeedTrajectory:
     train_rehearsal_final_losses: list[float | None] = dataclasses.field(
         default_factory=list
     )
+    train_final_train_losses: list[float | None] = dataclasses.field(
+        default_factory=list
+    )
+    rationale_missing_count: int = 0
 
     @property
     def mean_train_steps(self) -> float:
@@ -284,6 +293,13 @@ class SeedTrajectory:
             return None
         return sum(losses) / len(losses)
 
+    @property
+    def mean_train_final_train_loss(self) -> float | None:
+        losses = [l for l in self.train_final_train_losses if l is not None]
+        if not losses:
+            return None
+        return sum(losses) / len(losses)
+
     def training_summary_text(self, cap: int, loss_target: float | None) -> str:
         """Steps / final-loss / cap summary line; see ``harness.training_summary_text``."""
         return training_summary_text(
@@ -293,6 +309,8 @@ class SeedTrajectory:
             cap,
             loss_target,
             self.train_rehearsal_final_losses,
+            self.train_final_train_losses,
+            self.rationale_missing_count,
         )
 
     @property
@@ -421,10 +439,13 @@ class SeedTrajectory:
             "total_net_learning": self.total_net_learning,
             "train_steps": self.train_steps,
             "train_final_losses": self.train_final_losses,
+            "train_final_train_losses": self.train_final_train_losses,
+            "rationale_missing_count": self.rationale_missing_count,
             "train_cap_hits": self.train_cap_hits,
             "train_rehearsal_final_losses": self.train_rehearsal_final_losses,
             "mean_train_steps": self.mean_train_steps,
             "mean_train_final_loss": self.mean_train_final_loss,
+            "mean_train_final_train_loss": self.mean_train_final_train_loss,
             "mean_train_rehearsal_final_loss": self.mean_train_rehearsal_final_loss,
             "checkpoints": [c.to_dict() for c in self.checkpoints],
         }
@@ -441,6 +462,8 @@ class SeedTrajectory:
             revision_invalid_count=traj_data.get("revision_invalid_count", 0),
             train_steps=traj_data.get("train_steps", []),
             train_final_losses=traj_data.get("train_final_losses", []),
+            train_final_train_losses=traj_data.get("train_final_train_losses", []),
+            rationale_missing_count=traj_data.get("rationale_missing_count", 0),
             train_cap_hits=traj_data.get("train_cap_hits", 0),
             train_rehearsal_final_losses=traj_data.get(
                 "train_rehearsal_final_losses", []
@@ -461,7 +484,8 @@ class MetaLearningConfig:
         revision_prompt: Revision prompt preset for "self_generated"; see
             ``revise.revision_prompt_preset``.
         think_mode: How the training target treats the chat template's open
-            ``<think>`` block; see ``EvaluationConfig.think_mode``.
+            ``<think>`` block; see ``EvaluationConfig.think_mode``. Defaults
+            to "rationale".
         close_think: Deprecated alias for ``think_mode``; ``False`` forces
             ``"none"``. Always ``think_mode != "none"`` after construction.
         rehearsal_k: Rehearsal examples trained after every correction; see
@@ -493,7 +517,7 @@ class MetaLearningConfig:
     max_tokens: int | None = None  # Use model default if None
     training_source: str = "ground_truth"
     revision_prompt: str = "default"
-    think_mode: str = "baseline"
+    think_mode: str = "rationale"
     close_think: bool | None = None
     rehearsal_k: int = 0
     rehearsal_max_tokens: int = 768
@@ -1098,11 +1122,16 @@ class MetaLearningExperiment:
                 window_ids.append(item.id)
                 trajectory.train_steps.append(outcome.train_steps)
                 trajectory.train_final_losses.append(outcome.train_final_loss)
+                trajectory.train_final_train_losses.append(
+                    outcome.train_final_train_loss
+                )
                 trajectory.train_rehearsal_final_losses.append(
                     outcome.train_rehearsal_final_loss
                 )
                 if outcome.train_hit_cap:
                     trajectory.train_cap_hits += 1
+                if outcome.rationale_missing:
+                    trajectory.rationale_missing_count += 1
                 if verbose:
                     print(
                         f"    Trained {item.id} ({outcome.training_text()}, "

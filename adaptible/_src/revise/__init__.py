@@ -17,6 +17,7 @@ from .revise import (
     split_think,
     strip_examples_tags,
     strip_think_tags,
+    template_opens_think,
     validate_revision_response,
     validate_think_mode,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "strip_think_tags",
     "THINK_CLOSE",
     "THINK_MODES",
+    "template_opens_think",
     "validate_revision_response",
     "validate_think_mode",
 ]

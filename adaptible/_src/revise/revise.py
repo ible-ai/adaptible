@@ -82,8 +82,19 @@ THINK_CLOSE = "</think>\n\n"
 #   baseline: the model's own reasoning from its original response is placed in
 #             the (unmasked) prefix and only the corrected answer is in the loss:
 #             "given this reasoning, the answer is X". Falls back to "empty"
-#             when the original response carried no reasoning.
-THINK_MODES = ("none", "empty", "baseline")
+#             when the original response carried no reasoning. On
+#             DeepSeek-R1-Distill the correction does not take: the target is
+#             "after reasoning that concludes Montreal, output Ottawa", the
+#             teacher-forced loss reaches the target, and at inference the
+#             model re-derives Montreal.
+#   rationale: ``{rationale}\n</think>\n\n{revision}{eos}`` with the whole
+#             target in the loss, where the rationale is reasoning that
+#             actually concludes the revision (the revision generation's own
+#             think block, or one generated from the correct answer). Only
+#             ``{revision}{eos}`` is in the stop mask, so training runs until
+#             the *answer* loss is under the target. Falls back to "empty"
+#             when no rationale is available.
+THINK_MODES = ("none", "empty", "baseline", "rationale")
 
 
 def validate_think_mode(think_mode: str) -> None:
@@ -400,20 +411,28 @@ def _collate_fn(
     """Right-pad unbatched examples to a common length and stack them.
 
     Inputs and labels are padded with ``padding_token``; the mask is always
-    padded with 0 so padded positions never contribute to the loss.
+    padded with 0 so padded positions never contribute to the loss. The
+    ``stop_mask`` is padded with 0 as well; it is ``None`` on the batch when
+    no example carries one, and an example without one contributes its
+    ``mask`` (so its stop loss is its training loss).
     """
     max_len = max(max(map(len, (d.input, d.label, d.mask))) for d in batch_data)
     padded_inputs = []
     padded_labels = []
     padded_masks = []
+    padded_stop_masks = []
     for item in batch_data:
         padded_inputs.append(_pad(item.input, max_len, padding_token))
         padded_labels.append(_pad(item.label, max_len, padding_token))
         padded_masks.append(_pad(item.mask, max_len, 0))
+        stop_mask = item.mask if item.stop_mask is None else item.stop_mask
+        padded_stop_masks.append(_pad(stop_mask, max_len, 0))
+    has_stop_mask = any(item.stop_mask is not None for item in batch_data)
     return TrainingExample(
         input=mx.stack(padded_inputs),
         label=mx.stack(padded_labels),
         mask=mx.stack(padded_masks),
+        stop_mask=mx.stack(padded_stop_masks) if has_stop_mask else None,
     )
 
 
@@ -462,6 +481,7 @@ def make_training_example(
     target_text: str,
     tokenizer: PreTrainedTokenizer,
     prompt_suffix: str = "",
+    stop_text: str | None = None,
 ) -> TrainingExample:
     """Build one unbatched training example: masked prompt, unmasked target.
 
@@ -474,6 +494,13 @@ def make_training_example(
     position ``i`` of the input predicts ``seq[i + 1]``, so the mask must be
     aligned with the labels.
 
+    When ``stop_text`` is given, ``target_text`` must end with it and the
+    example's ``stop_mask`` is 1 over exactly those trailing tokens (the
+    answer plus eos) and 0 elsewhere. The head of the target and
+    ``stop_text`` are tokenized separately, the same way the prompt and the
+    target already are, so the stop tokens are ``encode(stop_text)`` and the
+    boundary can never fall inside a token.
+
     Args:
         prompt_messages: Chat messages rendered through the tokenizer's chat
             template with ``add_generation_prompt=True``.
@@ -481,9 +508,15 @@ def make_training_example(
         tokenizer: Model-specific tokenizer.
         prompt_suffix: Extra text placed between the template and the target
             that is *not* in the loss (e.g. the model's own reasoning).
+        stop_text: Trailing part of ``target_text`` whose loss the stop rule
+            watches; ``None`` leaves ``stop_mask`` unset.
 
     Returns:
         A 1-D ``TrainingExample``; use ``collate_training_examples`` to batch.
+
+    Raises:
+        ValueError: If ``stop_text`` is given but ``target_text`` does not
+            end with it.
     """
     prompt_prefix = tokenizer.apply_chat_template(
         list(prompt_messages), tokenize=False, add_generation_prompt=True
@@ -493,14 +526,45 @@ def make_training_example(
         return mx.array(tokenizer.encode(text, add_special_tokens=False), dtype=dtype)
 
     prompt = _tokenize(prompt_prefix + prompt_suffix)
-    target = _tokenize(target_text)
+    if stop_text is None:
+        target = _tokenize(target_text)
+        stop = None
+    else:
+        if not stop_text or not target_text.endswith(stop_text):
+            raise ValueError(
+                f"target_text must end with stop_text; got target {target_text!r} "
+                f"and stop_text {stop_text!r}"
+            )
+        head = _tokenize(target_text[: -len(stop_text)])
+        stop = _tokenize(stop_text)
+        target = mx.concat([head, stop])
     sequence = mx.concat([prompt, target])
     mask = mx.concat([mx.zeros_like(prompt), mx.ones_like(target)])
+    stop_mask = None
+    if stop is not None:
+        stop_mask = mx.concat(
+            [mx.zeros_like(sequence[: len(sequence) - len(stop)]), mx.ones_like(stop)]
+        )[1:]
     return TrainingExample(
         input=sequence[:-1],
         label=sequence[1:],
         mask=mask[1:],
+        stop_mask=stop_mask,
     )
+
+
+def template_opens_think(
+    tokenizer: PreTrainedTokenizer, messages: Sequence[dict[str, str]]
+) -> bool:
+    """Whether the chat template's generation prompt ends with an open ``<think>``.
+
+    DeepSeek-R1-Distill renders ``...<｜Assistant｜><think>\n``; templates that
+    do not are unaffected by ``think_mode``.
+    """
+    prompt_prefix = tokenizer.apply_chat_template(
+        list(messages), tokenize=False, add_generation_prompt=True
+    )
+    return prompt_prefix.rstrip().endswith("<think>")
 
 
 def _eos_tag(tokenizer: PreTrainedTokenizer) -> str:
@@ -516,6 +580,7 @@ def make_revision_training_example(
     tokenizer: PreTrainedTokenizer,
     think_mode: str = "empty",
     close_think: bool | None = None,
+    rationale: str | None = None,
 ) -> TrainingExample:
     """Convert past interactions and a model revision into an unbatched training example.
 
@@ -529,8 +594,16 @@ def make_revision_training_example(
     ``think_mode``; see ``THINK_MODES``. For ``"baseline"`` the sequence is
     ``{prefix}{baseline_think}\n</think>\n\n{revision}{eos}`` where
     ``baseline_think`` is the reasoning in the revised turn's ``llm_response``
-    (``split_think``), and only ``{revision}{eos}`` is in the loss. Templates
-    without a think tag are unaffected by ``think_mode``.
+    (``split_think``), and only ``{revision}{eos}`` is in the loss. For
+    ``"rationale"`` it is ``{prefix}{rationale}\n</think>\n\n{revision}{eos}``
+    with everything after the prefix in the loss. Templates without a think
+    tag are unaffected by ``think_mode``.
+
+    In every mode the example's ``stop_mask`` covers exactly
+    ``{revision}{eos}``, so the training loop's stop rule watches the answer
+    tokens whatever else the loss covers.
+
+    This function never calls the model: the rationale is passed in.
 
     Args:
         response: Model-generated revision response (``[[X]] ... [[/X]]``).
@@ -540,6 +613,8 @@ def make_revision_training_example(
         tokenizer: Model-specific tokenizer.
         think_mode: One of ``THINK_MODES``.
         close_think: Deprecated alias; ``False`` forces ``think_mode="none"``.
+        rationale: Reasoning that concludes the revision, used by
+            ``"rationale"``; empty or ``None`` falls back to ``"empty"``.
 
     Returns: a 1-D training example.
     """
@@ -568,16 +643,25 @@ def make_revision_training_example(
     open_think = prompt_prefix.rstrip().endswith("<think>")
 
     prompt_suffix = ""
-    target_text = rewritten_response + eos_tag
+    stop_text = rewritten_response + eos_tag
+    target_text = stop_text
     if open_think and think_mode == "baseline":
         baseline_think, _ = split_think(interaction_to_revise.llm_response)
         if baseline_think:
             prompt_suffix = f"{baseline_think}\n{THINK_CLOSE}"
         else:
             think_mode = "empty"
+    if open_think and think_mode == "rationale":
+        rationale = (rationale or "").strip()
+        if rationale:
+            target_text = f"{rationale}\n{THINK_CLOSE}{target_text}"
+        else:
+            think_mode = "empty"
     if open_think and think_mode == "empty":
         target_text = THINK_CLOSE + target_text
-    return make_training_example(messages, target_text, tokenizer, prompt_suffix)
+    return make_training_example(
+        messages, target_text, tokenizer, prompt_suffix, stop_text=stop_text
+    )
 
 
 def make_collated_training_example(
@@ -587,6 +671,7 @@ def make_collated_training_example(
     padding_token: int = 0,
     close_think: bool | None = None,
     think_mode: str = "empty",
+    rationale: str | None = None,
 ) -> TrainingExample:
     """``make_revision_training_example`` batched to shape ``(1, L)``.
 
@@ -598,10 +683,16 @@ def make_collated_training_example(
         close_think: Deprecated alias for ``think_mode``: ``False`` reproduces
             the old target with the revision inside the open think block.
         think_mode: See ``THINK_MODES`` and ``make_revision_training_example``.
+        rationale: Reasoning for ``think_mode="rationale"``.
 
     Returns: a collated training example, ready for model ingestion.
     """
     example = make_revision_training_example(
-        response, interactions, tokenizer, think_mode=think_mode, close_think=close_think
+        response,
+        interactions,
+        tokenizer,
+        think_mode=think_mode,
+        close_think=close_think,
+        rationale=rationale,
     )
     return _collate_fn([example], padding_token)

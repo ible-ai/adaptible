@@ -30,14 +30,21 @@ class TrainingExample:
     """Pre-tokenized training data
 
     Attributes:
-        user_input: Actual model response.
-        label: Target model response.
-        mask: Mask of model response that dictates which parts are used in training.
+        input: Token ids fed to the model.
+        label: Target token ids (``input`` shifted by one).
+        mask: Loss mask: 1 over the positions trained on, 0 elsewhere.
+        stop_mask: Optional mask, same shape as ``mask``, marking only the
+            *answer* tokens (plus eos) of the target. Training stops on the
+            loss over these positions rather than over the whole ``mask``, so
+            a target that also carries a rationale is driven until the answer
+            lands, not until the reasoning is memorised. ``None`` means the
+            stop loss is the training loss.
     """
 
     input: mx.array
     label: mx.array
     mask: mx.array
+    stop_mask: mx.array | None = None
 
 
 class InteractionRequest(BaseModel):

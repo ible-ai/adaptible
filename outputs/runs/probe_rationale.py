@@ -7,7 +7,7 @@ from adaptible.revise import make_training_example, collate_training_examples, s
 from adaptible._src.eval.harness import contains_key_terms, make_rehearsal_example
 from adaptible.eval import generate_default_dataset
 ds = {i.id: i for i in generate_default_dataset()}
-wrong, probe = ds["geo_002"], ds["sci_001"]
+wrong, probe = ds[os.environ.get("WRONG", "geo_002")], ds[os.environ.get("PROBE", "sci_001")]
 m = adaptible.StatefulLLM(model_path=None, num_lora_layers=8, lora_parameters={"rank": 8, "dropout": 0.0, "scale": 10.0}, learning_rate=float(os.environ.get("LR", "1e-5")))
 tok = m._tokenizer
 def raw(item): return m.generate_response(item.question, use_history=False, max_tokens=1024)

@@ -7,9 +7,9 @@ Options:
     --name NAME           Experiment name (default: "default")
     --train-ratio RATIO   Fraction to use for training (default: 0.8)
     --iterations N        Step cap per training call (default: 12)
-    --loss_target L       Stop a training call once a step's loss is below L
-                          (default: 0.6; 0 or negative disables, so exactly
-                          --iterations steps run)
+    --loss_target L       Stop a training call once a step's answer-token
+                          loss is below L (default: 0.6; 0 or negative
+                          disables, so exactly --iterations steps run)
     --shuffle             Shuffle the dataset
     --seed SEED           Random seed for shuffling (default: 42)
     --training-source S   "ground_truth" (fine-tune on the label) or
@@ -17,10 +17,13 @@ Options:
     --revision-prompt P   Revision prompt preset for self_generated:
                           "default" or "fewshot"
     --think_mode M        How the training target treats the chat template's
-                          open <think> block: "baseline" (model's own reasoning
-                          in the unmasked prefix, answer only in the loss; the
-                          default), "empty" (train on "</think>\n\n{answer}"),
-                          or "none" (old malformed target, for comparison)
+                          open <think> block: "rationale" (the default; train
+                          on "{rationale}\n</think>\n\n{answer}" where the
+                          rationale concludes the answer, stop on the answer
+                          loss), "baseline" (model's own reasoning in the
+                          unmasked prefix, answer only in the loss), "empty"
+                          (train on "</think>\n\n{answer}"), or "none" (old
+                          malformed target, for comparison)
     --[no]close_think     Deprecated alias: --noclose_think == --think_mode none
     --rehearsal_k K       Fold K self-distillation examples from correct
                           trained-split items into every correction step
@@ -97,12 +100,16 @@ _REVISION_PROMPT = flags.DEFINE_string(
 )
 _THINK_MODE = flags.DEFINE_enum(
     "think_mode",
-    "baseline",
+    "rationale",
     list(THINK_MODES),
     "How the training target treats the chat template's open <think> tag. "
-    "'baseline': the model's own reasoning from its baseline response goes in "
-    "the unmasked prefix and only the corrected answer is trained on. 'empty': "
-    "train on '</think>\\n\\n{revision}' (teaches the model to stop reasoning). "
+    "'rationale': train on '{rationale}\\n</think>\\n\\n{revision}' where the "
+    "rationale is reasoning that concludes the revision (the revision's own "
+    "think block, or one generated from the label for ground_truth); the "
+    "loss target applies to the answer tokens only. 'baseline': the model's "
+    "own reasoning from its baseline response goes in the unmasked prefix and "
+    "only the corrected answer is trained on. 'empty': train on "
+    "'</think>\\n\\n{revision}' (teaches the model to stop reasoning). "
     "'none': the old malformed target (revision inside the open think block).",
 )
 _CLOSE_THINK = flags.DEFINE_boolean(

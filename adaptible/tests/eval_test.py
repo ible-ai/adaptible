@@ -55,6 +55,19 @@ def fake_think(item: TriviaItem) -> str:
     return f"Thinking about {item.id}."
 
 
+def fake_revision_think(item: TriviaItem) -> str:
+    """The think block FakeModel(think=True) puts in front of its revision."""
+    return f"Revising {item.id}: it should say {item.correct_answer}."
+
+
+def fake_rationale(item: TriviaItem) -> str:
+    """The think block FakeModel(think=True) generates for the rationale prompt."""
+    return f"Given the label, {item.id} must be {item.correct_answer}."
+
+
+RATIONALE_MARKER = "The correct answer is:"
+
+
 class FakeTokenizer:
     """One token per character; token 0 is reserved for padding.
 
@@ -122,6 +135,12 @@ class FakeModel:
         rehearsal_losses: Per-step mean rehearsal loss script for
             ``train_on_examples`` (last value repeats). Never consulted by the
             stop rule, exactly as in ``_llm.run_joint_training_steps``.
+        rationale: What the model answers to the ground-truth rationale prompt
+            (``harness.make_rationale_prompt``): "valid" -> a think block
+            ``fake_rationale(item)`` then the answer (only with
+            ``think=True``; without a think template the harness never asks);
+            "missing" -> a bare answer with no think block; or a callable
+            ``(item) -> str``.
     """
 
     def __init__(
@@ -134,8 +153,10 @@ class FakeModel:
         long_at_baseline: set[str] | None = None,
         train_losses: list[float] | None = None,
         rehearsal_losses: list[float] | None = None,
+        rationale: str | Callable[[TriviaItem], str] = "valid",
     ):
         self._tokenizer = FakeTokenizer(think=think)
+        self._rationale = rationale
         self._train_losses = list(train_losses or FAKE_LOSSES)
         self._rehearsal_losses = list(rehearsal_losses or FAKE_REHEARSAL_LOSSES)
         self._think = think
@@ -151,12 +172,16 @@ class FakeModel:
         self.train_calls = 0
         # Masked target of every call's correction, in order.
         self.trained_targets: list[str] = []
+        # Stop-masked (answer-only) target of every call's correction, in
+        # order; None when the example carried no stop mask.
+        self.trained_stop_targets: list[str | None] = []
         # Every example handed to a training call, in order (a joint call
         # contributes its correction and then each rehearsal example): the
         # rows of that example as (decoded masked target, decoded full sequence).
         self.trained_batches: list[list[tuple[str, str]]] = []
         self.batch_shapes: list[tuple[int, int]] = []
         self.revision_prompts: list[str] = []
+        self.rationale_prompts: list[str] = []
         self.question_prompts: list[str] = []
         # (iterations, loss_target, max_steps) of every train_on_example call.
         self.train_kwargs: list[tuple[int, float | None, int | None]] = []
@@ -184,7 +209,23 @@ class FakeModel:
                 return self._revision(item)
             if self._revision == "invalid":
                 return "Here is a revision with no markers at all."
-            return f"[[0]] The answer is {item.correct_answer}. [[/0]]"
+            revision = f"[[0]] The answer is {item.correct_answer}. [[/0]]"
+            if self._think:
+                # The revision generation reasons before it answers, like
+                # every other DeepSeek-R1-Distill response.
+                return f"{fake_revision_think(item)}\n</think>\n\n{revision}"
+            return revision
+        if RATIONALE_MARKER in prompt:
+            self.rationale_prompts.append(prompt)
+            item = next(
+                it for q, it in self._by_question.items() if prompt.startswith(q)
+            )
+            if callable(self._rationale):
+                return self._rationale(item)
+            answer = f"So the answer is {item.correct_answer}."
+            if self._rationale == "missing" or not self._think:
+                return answer
+            return f"{fake_rationale(item)}\n</think>\n\n{answer}"
         self.question_prompts.append(prompt)
         item = self._by_question[prompt]
         answer = f"It is {item.correct_answer}." if item.id in self.learned else DONT_KNOW
@@ -273,6 +314,15 @@ class FakeModel:
             rows.append((masked, full))
         return rows
 
+    def _decode_stop_target(self, example) -> str | None:
+        stop_mask = getattr(example, "stop_mask", None)
+        if stop_mask is None:
+            return None
+        labels = example.label.tolist()[0]
+        return self._tokenizer.decode(
+            t for t, m in zip(labels, stop_mask.tolist()[0]) if m
+        )
+
     def _finish_call(self, stats: TrainingStats, example) -> TrainingStats:
         """Record the correction example of a call and "learn" its target."""
         self.training_stats.append(stats)
@@ -281,6 +331,7 @@ class FakeModel:
         self.trained_batches.append(rows)
         target = rows[0][0]
         self.trained_targets.append(target)
+        self.trained_stop_targets.append(self._decode_stop_target(example))
         self.train_calls += 1
         if self.train_calls <= self._learns_after:
             return stats
@@ -499,24 +550,172 @@ class TrainingSourceTest(_TempDbTest):
         path = generate_html_report(result, self.tmp_path / "fewshot.html")
         self.assertIn("<code>fewshot</code>", pathlib.Path(path).read_text())
 
-    def test_think_mode_baseline_is_default_and_keeps_reasoning_unmasked(self):
+    def test_think_mode_rationale_is_default_and_trains_on_rationale(self):
         dataset = make_dataset(4)
         for source in ("ground_truth", "self_generated"):
             model = FakeModel(dataset, think=True)
             config = EvaluationConfig(name=f"tm-{source}", training_source=source)
-            self.assertEqual(config.think_mode, "baseline")
+            self.assertEqual(config.think_mode, "rationale")
             self.assertIs(config.close_think, True)
             result = EvaluationHarness(model=model, db=self.db).run(
                 dataset, config, verbose=False
             )
             self.assertEqual(len(model.trained_batches), 3)
+            if source == "ground_truth":
+                # One extra generation per trained item asks the model to
+                # reason its way to the label; holdout items never get one.
+                self.assertEqual(len(model.rationale_prompts), 3)
+                for item, prompt in zip(dataset.items[:3], model.rationale_prompts):
+                    self.assertEqual(
+                        prompt, harness.make_rationale_prompt(item.question, item.correct_answer)
+                    )
+                    self.assertTrue(prompt.startswith(item.question))
+                    self.assertIn(f"The correct answer is: {item.correct_answer}", prompt)
+                body = "{answer}"
+                rationale_for = fake_rationale
+            else:
+                # The revision's own think block is the rationale; no extra
+                # generation happens.
+                self.assertEqual(model.rationale_prompts, [])
+                self.assertEqual(len(model.revision_prompts), 3)
+                body = "The answer is {answer}."
+                rationale_for = fake_revision_think
+            by_id = {r.item_id: r for r in result.items}
+            for item, (masked, full), stop in zip(
+                dataset.items[:3],
+                (b[0] for b in model.trained_batches),
+                model.trained_stop_targets,
+            ):
+                answer = f"{body.format(answer=item.correct_answer)}{EOS}"
+                target = f"{rationale_for(item)}\n</think>\n\n{answer}"
+                # The rationale and the answer are both in the loss...
+                self.assertEqual(masked, target)
+                self.assertEqual(
+                    full, f"<user>{item.question}</user><assistant><think>\n{target}"
+                )
+                # ...but the stop mask covers exactly the answer plus eos.
+                self.assertEqual(stop, answer)
+                # The rationale is recorded per item.
+                self.assertEqual(by_id[item.id].rationale_text, rationale_for(item))
+                self.assertFalse(by_id[item.id].rationale_missing)
+            for item in dataset.items[3:]:
+                self.assertIsNone(by_id[item.id].rationale_text)
+            self.assertEqual(result.rationale_missing_count, 0)
+            self.assertEqual(result.train_post_accuracy, 1.0)
+            if source == "self_generated":
+                # The raw revision (think block included) is what is kept.
+                for item in result.train_items:
+                    self.assertTrue(item.revision_text.startswith("Revising "))
+                    self.assertIn("</think>", item.revision_text)
+                    self.assertEqual(
+                        item.revision_answer, f"The answer is {item.correct_answer}."
+                    )
+            d = result.to_dict()
+            self.assertEqual(d["config"]["think_mode"], "rationale")
+            self.assertIs(d["config"]["close_think"], True)
+            self.assertEqual(d["metrics"]["rationale_missing_count"], 0)
+            trained = [i for i in d["items"] if i["was_trained"]]
+            self.assertTrue(all(i["rationale_text"] for i in trained))
+            self.assertTrue(all(i["rationale_missing"] is False for i in trained))
+            cfg = self._config_json_for(self._latest_experiment_id())
+            self.assertEqual(cfg["think_mode"], "rationale")
+            self.assertEqual(cfg["model_kwargs"], {})
+            text = pathlib.Path(
+                generate_html_report(result, self.tmp_path / f"{source}-tm.html")
+            ).read_text()
+            self.assertIn("Think mode: <code>rationale</code>", text)
+            self.assertIn("rationales missing: <code>0</code>", text)
+            self.assertIn("Rehearsal k: <code>0</code>", text)
+            # The report card shows the rationale that went into the target.
+            for item in dataset.items[:3]:
+                self.assertIn(
+                    f"<strong>Rationale (in target):</strong> {rationale_for(item)}", text
+                )
+
+    def test_think_mode_rationale_missing_falls_back_to_empty_and_is_counted(self):
+        dataset = make_dataset(4)
+        # ground_truth: the rationale generation comes back with no think block.
+        model = FakeModel(dataset, think=True, rationale="missing")
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset, EvaluationConfig(name="gt-missing"), verbose=False
+        )
+        self.assertEqual(len(model.rationale_prompts), 3)
+        for item, target, stop in zip(
+            dataset.items[:3], model.trained_targets, model.trained_stop_targets
+        ):
+            self.assertEqual(target, f"</think>\n\n{item.correct_answer}{EOS}")
+            self.assertEqual(stop, f"{item.correct_answer}{EOS}")
+        by_id = {r.item_id: r for r in result.items}
+        for item in dataset.items[:3]:
+            self.assertTrue(by_id[item.id].rationale_missing)
+            self.assertIsNone(by_id[item.id].rationale_text)
+        self.assertFalse(by_id["q03"].rationale_missing)
+        self.assertEqual(result.rationale_missing_count, 3)
+        self.assertEqual(result.to_dict()["metrics"]["rationale_missing_count"], 3)
+        self.assertIn("3 rationales missing", result.training_summary_text())
+        text = pathlib.Path(
+            generate_html_report(result, self.tmp_path / "missing.html")
+        ).read_text()
+        self.assertIn("rationales missing: <code>3</code>", text)
+        self.assertIn("<strong>Rationale:</strong> MISSING", text)
+
+        # self_generated: the revision carries no think block.
+        model = FakeModel(
+            dataset,
+            think=True,
+            revision=lambda item: f"[[0]] The answer is {item.correct_answer}. [[/0]]",
+        )
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset,
+            EvaluationConfig(name="sg-missing", training_source="self_generated"),
+            verbose=False,
+        )
+        self.assertEqual(model.rationale_prompts, [])
+        for item, target in zip(dataset.items[:3], model.trained_targets):
+            self.assertEqual(target, f"</think>\n\nThe answer is {item.correct_answer}.{EOS}")
+        self.assertEqual(result.rationale_missing_count, 3)
+
+        # A partial miss is counted per item.
+        model = FakeModel(
+            dataset,
+            think=True,
+            rationale=lambda item: (
+                f"{fake_rationale(item)}\n</think>\n\nSo {item.correct_answer}."
+                if item.id != "q01"
+                else "No reasoning here."
+            ),
+        )
+        result = EvaluationHarness(model=model, db=self.db).run(
+            dataset, EvaluationConfig(name="partial"), verbose=False
+        )
+        self.assertEqual(result.rationale_missing_count, 1)
+        self.assertEqual(
+            [r.rationale_missing for r in result.train_items], [False, True, False]
+        )
+
+    def test_think_mode_baseline_keeps_reasoning_unmasked(self):
+        dataset = make_dataset(4)
+        for source in ("ground_truth", "self_generated"):
+            model = FakeModel(dataset, think=True)
+            config = EvaluationConfig(
+                name=f"tm-{source}", training_source=source, think_mode="baseline"
+            )
+            self.assertIs(config.close_think, True)
+            result = EvaluationHarness(model=model, db=self.db).run(
+                dataset, config, verbose=False
+            )
+            self.assertEqual(len(model.trained_batches), 3)
+            self.assertEqual(model.rationale_prompts, [])
             body = "{answer}" if source == "ground_truth" else "The answer is {answer}."
-            for item, (masked, full) in zip(
-                dataset.items[:3], (b[0] for b in model.trained_batches)
+            for item, (masked, full), stop in zip(
+                dataset.items[:3],
+                (b[0] for b in model.trained_batches),
+                model.trained_stop_targets,
             ):
                 target = f"{body.format(answer=item.correct_answer)}{EOS}"
                 # Only the corrected answer is in the loss...
                 self.assertEqual(masked, target)
+                self.assertEqual(stop, target)
                 # ...and the model's own reasoning sits in the unmasked prefix.
                 self.assertEqual(
                     full,
@@ -524,6 +723,8 @@ class TrainingSourceTest(_TempDbTest):
                     f"{fake_think(item)}\n</think>\n\n{target}",
                 )
             self.assertEqual(result.train_post_accuracy, 1.0)
+            self.assertTrue(all(r.rationale_text is None for r in result.items))
+            self.assertEqual(result.rationale_missing_count, 0)
             d = result.to_dict()["config"]
             self.assertEqual(d["think_mode"], "baseline")
             self.assertIs(d["close_think"], True)
@@ -531,7 +732,6 @@ class TrainingSourceTest(_TempDbTest):
             cfg = self._config_json_for(self._latest_experiment_id())
             self.assertEqual(cfg["think_mode"], "baseline")
             self.assertEqual(cfg["rehearsal_k"], 0)
-            self.assertEqual(cfg["model_kwargs"], {})
             text = pathlib.Path(
                 generate_html_report(result, self.tmp_path / f"{source}-tm.html")
             ).read_text()
@@ -543,8 +743,13 @@ class TrainingSourceTest(_TempDbTest):
         model = FakeModel(dataset, think=True)
         config = EvaluationConfig(name="empty", think_mode="empty")
         EvaluationHarness(model=model, db=self.db).run(dataset, config, verbose=False)
-        for item, target in zip(dataset.items[:3], model.trained_targets):
+        self.assertEqual(model.rationale_prompts, [])
+        for item, target, stop in zip(
+            dataset.items[:3], model.trained_targets, model.trained_stop_targets
+        ):
             self.assertEqual(target, f"</think>\n\n{item.correct_answer}{EOS}")
+            # The stop mask never covers the think close, only the answer.
+            self.assertEqual(stop, f"{item.correct_answer}{EOS}")
         self.assertEqual(
             self._config_json_for(self._latest_experiment_id())["think_mode"], "empty"
         )
@@ -588,20 +793,27 @@ class TrainingSourceTest(_TempDbTest):
         model = FakeModel(dataset, think=False)
         model._tokenizer = FakeTokenizer(think=True)
         EvaluationHarness(model=model, db=self.db).run(
-            dataset, EvaluationConfig(name="fallback"), verbose=False
+            dataset, EvaluationConfig(name="fallback", think_mode="baseline"), verbose=False
         )
         for item, target in zip(dataset.items[:3], model.trained_targets):
             self.assertEqual(target, f"</think>\n\n{item.correct_answer}{EOS}")
 
     def test_think_mode_noop_without_think_template(self):
         dataset = make_dataset(4)
-        for mode in ("none", "empty", "baseline"):
+        for mode in ("none", "empty", "baseline", "rationale"):
             model = FakeModel(dataset)  # template ends in <assistant>
-            EvaluationHarness(model=model, db=self.db).run(
+            result = EvaluationHarness(model=model, db=self.db).run(
                 dataset, EvaluationConfig(name="plain", think_mode=mode), verbose=False
             )
-            for item, target in zip(dataset.items[:3], model.trained_targets):
+            for item, target, stop in zip(
+                dataset.items[:3], model.trained_targets, model.trained_stop_targets
+            ):
                 self.assertEqual(target, f"{item.correct_answer}{EOS}")
+                self.assertEqual(stop, target)
+            # No think block to fill: no rationale is generated, and nothing
+            # is counted as missing.
+            self.assertEqual(model.rationale_prompts, [])
+            self.assertEqual(result.rationale_missing_count, 0)
 
     def test_model_kwargs_are_recorded_and_used_lazily(self):
         dataset = make_dataset(4)
@@ -877,6 +1089,11 @@ class MetaLearningTest(_TempDbTest):
     def test_meta_think_mode_threads_through(self):
         dataset = make_dataset(10)
         expectations = {
+            "rationale": lambda item, answer: (
+                f"{fake_rationale(item)}\n</think>\n\n{answer}{EOS}",
+                f"<user>{item.question}</user><assistant><think>\n"
+                f"{fake_rationale(item)}\n</think>\n\n{answer}{EOS}",
+            ),
             "baseline": lambda item, answer: (
                 f"{answer}{EOS}",
                 f"<user>{item.question}</user><assistant><think>\n"
@@ -908,6 +1125,14 @@ class MetaLearningTest(_TempDbTest):
             for masked, full in (b[0] for b in model.trained_batches):
                 item = next(i for q, i in by_question.items() if f"<user>{q}</user>" in full)
                 self.assertEqual((masked, full), expect(item, item.correct_answer))
+            for stop in model.trained_stop_targets:
+                self.assertTrue(stop.endswith(EOS))
+                self.assertNotIn("</think>", stop)
+            self.assertEqual(traj.rationale_missing_count, 0)
+            self.assertEqual(traj.to_dict()["rationale_missing_count"], 0)
+            self.assertEqual(
+                len(model.rationale_prompts), 8 if think_mode == "rationale" else 0
+            )
             cfg = self._config_json_for(traj.experiment_id)
             self.assertEqual(cfg["think_mode"], think_mode)
             self.assertIs(cfg["close_think"], think_mode != "none")
@@ -936,7 +1161,12 @@ class MetaLearningTest(_TempDbTest):
         # at baseline so the rehearsal pool is the whole trained split.
         model = FakeModel(dataset, think=True, known_at_baseline={i.id for i in dataset})
         config = MetaLearningConfig(
-            name="reh", seeds=[1], checkpoint_interval=4, train_ratio=0.8, rehearsal_k=2
+            name="reh",
+            seeds=[1],
+            checkpoint_interval=4,
+            train_ratio=0.8,
+            rehearsal_k=2,
+            think_mode="baseline",
         )
         experiment = MetaLearningExperiment(
             model_factory=lambda: model, db=self.db, model_kwargs={"learning_rate": 3e-5}
@@ -952,7 +1182,7 @@ class MetaLearningTest(_TempDbTest):
         self.assertTrue(all(shape[0] == 1 for shape in model.batch_shapes))
         self.assertEqual(traj.train_rehearsal_final_losses, [0.41] * 8)
         self.assertAlmostEqual(traj.mean_train_rehearsal_final_loss, 0.41)
-        self.assertIn("(rehearsal 0.41)", traj.training_summary_text(12, 0.6))
+        self.assertIn("(train loss 0.58, rehearsal 0.41)", traj.training_summary_text(12, 0.6))
         self.assertEqual(result.model_kwargs, {"learning_rate": 3e-5})
         holdout_questions = {
             dataset[idx].question for idx in traj_holdout_indices(dataset, seed=1)
@@ -994,6 +1224,7 @@ class MetaLearningTest(_TempDbTest):
             train_ratio=0.8,
             rehearsal_k=9,
             rehearsal_max_tokens=200,
+            think_mode="baseline",
         )
         MetaLearningExperiment(model_factory=lambda: model, db=self.db).run(
             dataset, config, verbose=False
@@ -1216,7 +1447,12 @@ class RehearsalTest(_TempDbTest):
         dataset = make_dataset(6)
         model = FakeModel(dataset, think=True, known_at_baseline={"q01", "q03", "q05"})
         config = EvaluationConfig(
-            name="reh", train_ratio=5 / 6, rehearsal_k=2, seed=7, rehearsal_weight=0.5
+            name="reh",
+            train_ratio=5 / 6,
+            rehearsal_k=2,
+            seed=7,
+            rehearsal_weight=0.5,
+            think_mode="baseline",
         )
         result = EvaluationHarness(model=model, db=self.db).run(
             dataset, config, verbose=False
@@ -1252,8 +1488,9 @@ class RehearsalTest(_TempDbTest):
         self.assertAlmostEqual(result.mean_train_rehearsal_final_loss, 0.41)
         self.assertEqual(
             result.training_summary_text(),
-            "Training: mean 3.0 steps/item (cap 12, loss target 0.60), "
-            "mean final loss 0.58 (rehearsal 0.41); 0 items hit the cap",
+            "Training: mean 3.0 steps/item (cap 12, answer-loss target 0.60), "
+            "mean final answer loss 0.58 (train loss 0.58, rehearsal 0.41); "
+            "0 items hit the cap; 0 rationales missing",
         )
         groups = training_groups(model, ks)
         for item, r, rows in zip(dataset.items[:5], trained, groups):
@@ -1567,8 +1804,9 @@ class LossTargetTest(_TempDbTest):
         self.assertEqual(result.train_cap_hit_count, 0)
         self.assertEqual(
             result.training_summary_text(),
-            "Training: mean 3.0 steps/item (cap 7, loss target 0.60), "
-            "mean final loss 0.58; 0 items hit the cap",
+            "Training: mean 3.0 steps/item (cap 7, answer-loss target 0.60), "
+            "mean final answer loss 0.58 (train loss 0.58); 0 items hit the cap; "
+            "0 rationales missing",
         )
         d = result.to_dict()
         self.assertEqual(d["config"]["loss_target"], 0.6)
@@ -1612,7 +1850,7 @@ class LossTargetTest(_TempDbTest):
         )
         self.assertEqual(model.train_kwargs, [(5, None, 5)] * 2)
         self.assertEqual([i.train_steps for i in result.train_items], [5, 5])
-        self.assertIn("loss target off", result.training_summary_text())
+        self.assertIn("answer-loss target off", result.training_summary_text())
 
     def test_rehearsal_joint_call_carries_target_cap_and_weight(self):
         dataset = make_dataset(6)
@@ -1659,7 +1897,8 @@ class LossTargetTest(_TempDbTest):
             self.assertTrue(item.train_hit_cap)
             self.assertAlmostEqual(item.train_rehearsal_final_loss, 0.1)
         self.assertIn(
-            "mean final loss 1.00 (rehearsal 0.10); 3 items hit the cap",
+            "mean final answer loss 1.00 (train loss 1.00, rehearsal 0.10); "
+            "3 items hit the cap",
             result.training_summary_text(),
         )
 
@@ -1679,7 +1918,11 @@ class LossTargetTest(_TempDbTest):
         self.assertRegex(
             out, r"Trained \(3 steps, loss 6\.05 → 0\.58 \(rehearsal 0\.41\), \d+\.\ds"
         )
-        self.assertIn("mean final loss 0.58 (rehearsal 0.41); 0 items hit the cap", out)
+        self.assertIn(
+            "mean final answer loss 0.58 (train loss 0.58, rehearsal 0.41); "
+            "0 items hit the cap",
+            out,
+        )
 
     def test_lora_model_kwargs_are_recorded(self):
         dataset = make_dataset(4)
@@ -1733,8 +1976,9 @@ class LossTargetTest(_TempDbTest):
         self.assertIn("Loss target: 0.6 (step cap: 12)", out)
         self.assertRegex(out, r"Trained \(3 steps, loss 6\.05 → 0\.58, \d+\.\ds\)")
         self.assertIn(
-            "Training: mean 3.0 steps/item (cap 12, loss target 0.60), "
-            "mean final loss 0.58; 0 items hit the cap",
+            "Training: mean 3.0 steps/item (cap 12, answer-loss target 0.60), "
+            "mean final answer loss 0.58 (train loss 0.58); 0 items hit the cap; "
+            "0 rationales missing",
             out,
         )
 
@@ -1762,8 +2006,9 @@ class LossTargetTest(_TempDbTest):
         self.assertAlmostEqual(traj.mean_train_final_loss, 0.58)
         self.assertRegex(out, r"Trained q\d\d \(3 steps, loss 6\.05 → 0\.58, \d+\.\ds\)")
         self.assertIn(
-            "Training: mean 3.0 steps/item (cap 6, loss target 0.60), "
-            "mean final loss 0.58; 0 items hit the cap",
+            "Training: mean 3.0 steps/item (cap 6, answer-loss target 0.60), "
+            "mean final answer loss 0.58 (train loss 0.58); 0 items hit the cap; "
+            "0 rationales missing",
             out,
         )
         events = self.db.get_training_events_for_experiment(traj.experiment_id)
@@ -1802,7 +2047,7 @@ class LossTargetTest(_TempDbTest):
         )
         path = generate_html_report(result, str(self.tmp_path / "r2.html"))
         text = pathlib.Path(path).read_text()
-        self.assertIn("mean final loss 0.58 (rehearsal 0.41)", text)
+        self.assertIn("mean final answer loss 0.58 (train loss 0.58, rehearsal 0.41)", text)
 
 
 class CliFlagsTest(unittest.TestCase):
@@ -1837,7 +2082,8 @@ class CliFlagsTest(unittest.TestCase):
         text = self._helpfull("-m", "adaptible.eval")
         for flag in self.EXPECTED:
             self.assertIn(flag, text)
-        self.assertIn("<none|empty|baseline>", text)
+        self.assertIn("<none|empty|baseline|rationale>", text)
+        self.assertIn("(default: 'rationale')", text)
         for default in self.LORA_DEFAULTS:
             self.assertIn(default, text)
 
@@ -1845,7 +2091,19 @@ class CliFlagsTest(unittest.TestCase):
         text = self._helpfull("scripts/run_meta_experiment.py")
         for flag in self.EXPECTED:
             self.assertIn(flag, text)
-        self.assertIn("<none|empty|baseline>", text)
+        self.assertIn("<none|empty|baseline|rationale>", text)
+        self.assertIn("(default: 'rationale')", text)
+
+    def test_think_mode_rationale_flag_value_is_accepted(self):
+        # absl validates enum values at parse time; --think_mode rationale must
+        # parse on both CLIs (a bad value fails before --helpfull prints).
+        for argv in (("-m", "adaptible.eval"), ("scripts/run_meta_experiment.py",)):
+            text = self._helpfull(*argv, "--think_mode", "rationale")
+            self.assertIn("--think_mode", text)
+            self.assertNotIn("FATAL", text)
+            bad = self._helpfull(*argv, "--think_mode", "reasoning")
+            self.assertIn("reasoning", bad)
+            self.assertNotIn("--rehearsal_k", bad)
         for default in self.LORA_DEFAULTS:
             self.assertIn(default, text)
 

@@ -95,6 +95,23 @@ class TrainingExampleTest(unittest.TestCase):
         self.assertEqual(example.input.shape, example.label.shape)
         self.assertEqual(example.input.shape, example.mask.shape)
 
+    def test_stop_mask_defaults_to_none(self):
+        """``stop_mask`` is optional and absent unless given."""
+        example = adaptible.TrainingExample(
+            input=mx.array([1, 2, 3]),
+            label=mx.array([2, 3, 4]),
+            mask=mx.array([1, 1, 1]),
+        )
+        self.assertIsNone(example.stop_mask)
+        with_stop = adaptible.TrainingExample(
+            input=mx.array([1, 2, 3]),
+            label=mx.array([2, 3, 4]),
+            mask=mx.array([0, 1, 1]),
+            stop_mask=mx.array([0, 0, 1]),
+        )
+        self.assertEqual(with_stop.stop_mask.tolist(), [0, 0, 1])
+        self.assertEqual(with_stop.stop_mask.shape, with_stop.mask.shape)
+
     def test_2d_arrays(self):
         """Should work with 2D arrays (batched)."""
         example = adaptible.TrainingExample(
