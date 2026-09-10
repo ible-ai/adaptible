@@ -24,11 +24,14 @@ from .revise import (
     make_revision_training_example,
     make_training_example,
     padding_token_for,
+    rationale_from_output,
     resolve_think_mode,
     revision_prompt_preset,
     split_think,
     strip_think_tags,
     template_opens_think,
+    truncate_at_sentence,
+    validate_rationale_max_tokens,
     validate_revision_response,
 )
 
@@ -622,6 +625,74 @@ class MakeCollatedTrainingExampleTest(unittest.TestCase):
         self.assertIsInstance(result, TrainingExample)
 
 
+class RationaleFromOutputTest(unittest.TestCase):
+    """rationale_from_output / truncate_at_sentence with a char-per-token tokenizer."""
+
+    tokenizer = None  # set in setUp
+
+    def setUp(self):
+        self.tokenizer = _CharTokenizer("<assistant><think>\n")
+
+    def test_think_block_is_the_rationale(self):
+        out = "Sydney is big.\nCanberra is the capital.\n</think>\n\nCanberra."
+        rationale, tokens, truncated = rationale_from_output(out, self.tokenizer)
+        self.assertEqual(rationale, "Sydney is big.\nCanberra is the capital.")
+        self.assertEqual(tokens, len(rationale))
+        self.assertFalse(truncated)
+
+    def test_output_without_close_tag_is_taken_whole(self):
+        # The model generates inside the open think block: an output that
+        # never closed the tag is reasoning, not an answer.
+        out = "  Let me think. Sydney? No, Canberra.  "
+        rationale, tokens, truncated = rationale_from_output(out, self.tokenizer)
+        self.assertEqual(rationale, "Let me think. Sydney? No, Canberra.")
+        self.assertEqual(tokens, len(rationale))
+        self.assertFalse(truncated)
+
+    def test_nothing_gives_empty(self):
+        for out in (None, "", "   ", "</think>\n\nCanberra.", "<think></think>x"):
+            self.assertEqual(rationale_from_output(out, self.tokenizer), ("", 0, False), out)
+
+    def test_truncates_at_last_sentence_boundary(self):
+        out = "First sentence. Second sentence. Third one runs long."
+        # 20 chars: "First sentence. Seco" -> cut back to "First sentence."
+        rationale, tokens, truncated = rationale_from_output(out, self.tokenizer, 20)
+        self.assertEqual(rationale, "First sentence.")
+        self.assertEqual(tokens, 15)
+        self.assertTrue(truncated)
+        # A newline is a boundary too.
+        rationale, tokens, truncated = truncate_at_sentence(
+            "line one\nline two\nline three", self.tokenizer, 12
+        )
+        self.assertEqual((rationale, tokens, truncated), ("line one", 8, True))
+        # A trailing period exactly at the cap keeps the whole sentence.
+        rationale, tokens, truncated = truncate_at_sentence(
+            "Done. More", self.tokenizer, 5
+        )
+        self.assertEqual((rationale, tokens, truncated), ("Done.", 5, True))
+        # With no boundary the hard cut stands.
+        rationale, tokens, truncated = truncate_at_sentence(
+            "abcdefghij", self.tokenizer, 4
+        )
+        self.assertEqual((rationale, tokens, truncated), ("abcd", 4, True))
+        # Under the cap nothing changes.
+        self.assertEqual(
+            truncate_at_sentence("Short.", self.tokenizer, 512), ("Short.", 6, False)
+        )
+
+    def test_cap_applies_to_think_blocks_too(self):
+        out = "One. Two. Three.\n</think>\n\nAnswer."
+        rationale, tokens, truncated = rationale_from_output(out, self.tokenizer, 7)
+        self.assertEqual((rationale, tokens, truncated), ("One.", 4, True))
+
+    def test_validation(self):
+        for bad in (0, -1, 1.5, True, None):
+            with self.assertRaises(ValueError):
+                validate_rationale_max_tokens(bad)
+            with self.assertRaises(ValueError):
+                truncate_at_sentence("x", self.tokenizer, bad)
+
+
 class _CharTokenizer:
     """One token per character so label regions can be decoded back to text."""
 
@@ -906,14 +977,12 @@ class RationaleModeTest(unittest.TestCase):
             self.assertEqual(masked, expect_masked, mode)
             self.assertEqual(stopped, "Canberra.<eos>", mode)
 
-    def test_empty_rationale_falls_back_to_empty(self):
+    def test_empty_rationale_raises_no_fallback(self):
+        # The "empty" target (</think> then the answer) collapses the model,
+        # so a missing rationale is an error, never a silent fallback.
         for rationale in (None, "", "   \n"):
-            full, masked, stopped, _, _ = self._run(
-                think_mode="rationale", rationale=rationale
-            )
-            self.assertEqual(masked, f"{THINK_CLOSE}Canberra.<eos>")
-            self.assertEqual(full, f"<user>Q?</user>{self.GEN}{THINK_CLOSE}Canberra.<eos>")
-            self.assertEqual(stopped, "Canberra.<eos>")
+            with self.assertRaisesRegex(ValueError, "rationale required"):
+                self._run(think_mode="rationale", rationale=rationale)
 
     def test_rationale_is_stripped(self):
         full, _, _, _, _ = self._run(think_mode="rationale", rationale="  r  \n")

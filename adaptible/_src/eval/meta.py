@@ -40,12 +40,18 @@ from .harness import (
     sample_rehearsal_ids,
     training_summary_text,
     validate_rehearsal_k,
+    validate_rehearsal_margin,
     validate_rehearsal_max_tokens,
     validate_rehearsal_weight,
     normalize_loss_target,
     validate_training_source,
 )
-from ..revise import resolve_think_mode, revision_prompt_preset
+from ..revise import (
+    DEFAULT_RATIONALE_MAX_TOKENS,
+    resolve_think_mode,
+    revision_prompt_preset,
+    validate_rationale_max_tokens,
+)
 
 # Minimum improvable+forgettable items a window needs before its rates feed the
 # meta-learning score. Below this a single item swings a rate by 20+ points.
@@ -250,8 +256,15 @@ class SeedTrajectory:
             at the last step (None for items trained without rehearsal).
         train_final_train_losses: Per trained item, the whole-target training
             loss at the last step.
-        rationale_missing_count: Items trained under ``think_mode="rationale"``
-            that fell back to the "empty" target for want of a rationale.
+        rationale_missing_count: Items scheduled under ``think_mode="rationale"``
+            but skipped (not trained) for want of a rationale.
+        rationale_truncated_count: Trained items whose rationale was cut to
+            ``rationale_max_tokens``.
+        train_rehearsal_active_steps: Per trained item, the ``(step,
+            rehearsal example)`` pairs whose gradient the rehearsal hinge let
+            through.
+        train_rehearsal_pairs: Per trained item, ``steps * k``: what the
+            active count is out of.
     """
 
     seed: int
@@ -272,6 +285,9 @@ class SeedTrajectory:
         default_factory=list
     )
     rationale_missing_count: int = 0
+    rationale_truncated_count: int = 0
+    train_rehearsal_active_steps: list[int] = dataclasses.field(default_factory=list)
+    train_rehearsal_pairs: list[int] = dataclasses.field(default_factory=list)
 
     @property
     def mean_train_steps(self) -> float:
@@ -311,6 +327,8 @@ class SeedTrajectory:
             self.train_rehearsal_final_losses,
             self.train_final_train_losses,
             self.rationale_missing_count,
+            sum(self.train_rehearsal_active_steps),
+            sum(self.train_rehearsal_pairs),
         )
 
     @property
@@ -441,8 +459,11 @@ class SeedTrajectory:
             "train_final_losses": self.train_final_losses,
             "train_final_train_losses": self.train_final_train_losses,
             "rationale_missing_count": self.rationale_missing_count,
+            "rationale_truncated_count": self.rationale_truncated_count,
             "train_cap_hits": self.train_cap_hits,
             "train_rehearsal_final_losses": self.train_rehearsal_final_losses,
+            "train_rehearsal_active_steps": self.train_rehearsal_active_steps,
+            "train_rehearsal_pairs": self.train_rehearsal_pairs,
             "mean_train_steps": self.mean_train_steps,
             "mean_train_final_loss": self.mean_train_final_loss,
             "mean_train_final_train_loss": self.mean_train_final_train_loss,
@@ -464,10 +485,15 @@ class SeedTrajectory:
             train_final_losses=traj_data.get("train_final_losses", []),
             train_final_train_losses=traj_data.get("train_final_train_losses", []),
             rationale_missing_count=traj_data.get("rationale_missing_count", 0),
+            rationale_truncated_count=traj_data.get("rationale_truncated_count", 0),
             train_cap_hits=traj_data.get("train_cap_hits", 0),
             train_rehearsal_final_losses=traj_data.get(
                 "train_rehearsal_final_losses", []
             ),
+            train_rehearsal_active_steps=traj_data.get(
+                "train_rehearsal_active_steps", []
+            ),
+            train_rehearsal_pairs=traj_data.get("train_rehearsal_pairs", []),
         )
         for cp_data in traj_data["checkpoints"]:
             trajectory.checkpoints.append(Checkpoint.from_dict(cp_data))
@@ -494,6 +520,10 @@ class MetaLearningConfig:
             ``EvaluationConfig.rehearsal_max_tokens``.
         rehearsal_weight: Multiplier on the mean rehearsal gradient in the
             joint step; see ``EvaluationConfig.rehearsal_weight``.
+        rehearsal_margin: The rehearsal hinge; see
+            ``EvaluationConfig.rehearsal_margin``.
+        rationale_max_tokens: Token cap on the rationale in the target; see
+            ``EvaluationConfig.rationale_max_tokens``.
         training_iterations: Step cap per training call; see
             ``EvaluationConfig.training_iterations``.
         loss_target: Stop each training call once a step's loss is below this;
@@ -522,6 +552,8 @@ class MetaLearningConfig:
     rehearsal_k: int = 0
     rehearsal_max_tokens: int = 768
     rehearsal_weight: float = 1.0
+    rehearsal_margin: float = 0.05
+    rationale_max_tokens: int = DEFAULT_RATIONALE_MAX_TOKENS
     holdout_every_checkpoint: bool = False
     repeats: int = 1
 
@@ -533,6 +565,8 @@ class MetaLearningConfig:
         validate_rehearsal_k(self.rehearsal_k)
         validate_rehearsal_max_tokens(self.rehearsal_max_tokens)
         self.rehearsal_weight = validate_rehearsal_weight(self.rehearsal_weight)
+        self.rehearsal_margin = validate_rehearsal_margin(self.rehearsal_margin)
+        validate_rationale_max_tokens(self.rationale_max_tokens)
         self.loss_target = normalize_loss_target(self.loss_target)
         if self.repeats < 1:
             raise ValueError(f"repeats must be >= 1, got {self.repeats}")
@@ -553,6 +587,8 @@ class MetaLearningConfig:
             "rehearsal_k": self.rehearsal_k,
             "rehearsal_max_tokens": self.rehearsal_max_tokens,
             "rehearsal_weight": self.rehearsal_weight,
+            "rehearsal_margin": self.rehearsal_margin,
+            "rationale_max_tokens": self.rationale_max_tokens,
             "holdout_every_checkpoint": self.holdout_every_checkpoint,
             "repeats": self.repeats,
         }
@@ -574,6 +610,10 @@ class MetaLearningConfig:
             rehearsal_k=data.get("rehearsal_k", 0),
             rehearsal_max_tokens=data.get("rehearsal_max_tokens", 768),
             rehearsal_weight=data.get("rehearsal_weight", 1.0),
+            rehearsal_margin=data.get("rehearsal_margin", 0.05),
+            rationale_max_tokens=data.get(
+                "rationale_max_tokens", DEFAULT_RATIONALE_MAX_TOKENS
+            ),
             holdout_every_checkpoint=data.get("holdout_every_checkpoint", False),
             repeats=data.get("repeats", 1),
         )
@@ -892,11 +932,15 @@ class MetaLearningExperiment:
         print(f"  Training source: {config.training_source}")
         if config.training_source == "self_generated":
             print(f"  Revision prompt: {config.revision_prompt}")
-        print(f"  Think mode: {config.think_mode}")
+        print(
+            f"  Think mode: {config.think_mode} "
+            f"(rationale max tokens: {config.rationale_max_tokens})"
+        )
         print(
             f"  Rehearsal k: {config.rehearsal_k} "
             f"(max tokens: {config.rehearsal_max_tokens}, "
-            f"weight: {config.rehearsal_weight:g})"
+            f"weight: {config.rehearsal_weight:g}, "
+            f"margin: {config.rehearsal_margin:g})"
         )
         print(
             f"  Loss target: {config.loss_target} "
@@ -1007,6 +1051,8 @@ class MetaLearningExperiment:
                     "rehearsal_k": config.rehearsal_k,
                     "rehearsal_max_tokens": config.rehearsal_max_tokens,
                     "rehearsal_weight": config.rehearsal_weight,
+                    "rehearsal_margin": config.rehearsal_margin,
+                    "rationale_max_tokens": config.rationale_max_tokens,
                     "model_kwargs": self._model_kwargs,
                     "lora": dict(
                         zip(("rank", "layers", "scale"), lora_settings(self._model_kwargs))
@@ -1111,12 +1157,21 @@ class MetaLearningExperiment:
                     [(items_by_id[rid], baseline_raw[rid]) for rid in rehearsal_ids],
                     loss_target=config.loss_target,
                     rehearsal_weight=config.rehearsal_weight,
+                    rehearsal_margin=config.rehearsal_margin,
+                    rationale_max_tokens=config.rationale_max_tokens,
                 )
                 if outcome.revision_invalid:
                     revision_invalid_ids.append(item.id)
                     trajectory.revision_invalid_count += 1
                     if verbose:
                         print(f"    Skipped {item.id}: invalid revision")
+                    continue
+                if outcome.rationale_missing:
+                    # Not trained: no rationale, and the empty-think fallback
+                    # collapses the model. Neither trained nor in the window.
+                    trajectory.rationale_missing_count += 1
+                    if verbose:
+                        print(f"    Skipped {item.id}: no rationale")
                     continue
                 trained_items.append(item.id)
                 window_ids.append(item.id)
@@ -1128,10 +1183,14 @@ class MetaLearningExperiment:
                 trajectory.train_rehearsal_final_losses.append(
                     outcome.train_rehearsal_final_loss
                 )
+                trajectory.train_rehearsal_active_steps.append(
+                    outcome.train_rehearsal_active_steps
+                )
+                trajectory.train_rehearsal_pairs.append(outcome.train_rehearsal_pairs)
                 if outcome.train_hit_cap:
                     trajectory.train_cap_hits += 1
-                if outcome.rationale_missing:
-                    trajectory.rationale_missing_count += 1
+                if outcome.rationale_truncated:
+                    trajectory.rationale_truncated_count += 1
                 if verbose:
                     print(
                         f"    Trained {item.id} ({outcome.training_text()}, "

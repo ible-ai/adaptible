@@ -32,6 +32,11 @@ Options:
     --rehearsal_max_tokens N  Skip rehearsal items whose baseline is longer than
                             N tokens (default 768)
     --rehearsal_weight W    Multiplier on the mean rehearsal gradient (default 1.0)
+    --rehearsal_margin M    Rehearsal hinge: a rehearsal example's gradient counts
+                            on a step only when its loss is more than M above its
+                            loss at the call's first step (default 0.05)
+    --rationale_max_tokens N  Cap the rationale in the target at N tokens, cut at
+                            a sentence boundary (default 512)
     --learning_rate LR      StatefulLLM learning rate (default: the model's)
     --lora_rank R           LoRA rank (default 32)
     --lora_layers N         Trailing layers converted to LoRA (default 24)
@@ -76,6 +81,7 @@ MetaLearningResult = adaptible.eval.MetaLearningResult
 TRAINING_SOURCES = adaptible.eval.TRAINING_SOURCES
 REVISION_PROMPTS = adaptible.revise.REVISION_PROMPTS
 THINK_MODES = adaptible.revise.THINK_MODES
+DEFAULT_RATIONALE_MAX_TOKENS = adaptible.revise.DEFAULT_RATIONALE_MAX_TOKENS
 generate_default_dataset = adaptible.eval.generate_default_dataset
 load_dataset = adaptible.eval.load_dataset
 _harness = adaptible._src.eval.harness
@@ -150,6 +156,21 @@ _REHEARSAL_WEIGHT = flags.DEFINE_float(
     "rehearsal_weight",
     1.0,
     "Multiplier on the mean rehearsal gradient in the joint step (>= 0).",
+)
+_REHEARSAL_MARGIN = flags.DEFINE_float(
+    "rehearsal_margin",
+    0.05,
+    "Rehearsal hinge: a rehearsal example's gradient is applied on a step only "
+    "when its loss is more than this above its loss at the call's first step "
+    "(>= 0). Rehearsal anchors the model; it is never minimised on its own.",
+)
+_RATIONALE_MAX_TOKENS = flags.DEFINE_integer(
+    "rationale_max_tokens",
+    DEFAULT_RATIONALE_MAX_TOKENS,
+    "Cap the rationale placed in the training target at this many tokens, cut "
+    "at the last sentence boundary. Under --think_mode rationale an output "
+    "with no </think> is taken whole as the rationale (the model reasons "
+    "inside the open think block); an item with no rationale at all is skipped.",
 )
 _LEARNING_RATE = flags.DEFINE_float(
     "learning_rate", None, "StatefulLLM learning rate (default: the model's)."
@@ -405,6 +426,14 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                 <div class="value">{result.config.rehearsal_weight:g}</div>
             </div>
             <div class="config-item">
+                <div class="label">Rehearsal Margin</div>
+                <div class="value">{result.config.rehearsal_margin:g}</div>
+            </div>
+            <div class="config-item">
+                <div class="label">Rationale Max Tokens</div>
+                <div class="value">{result.config.rationale_max_tokens}</div>
+            </div>
+            <div class="config-item">
                 <div class="label">LoRA (rank / layers / scale)</div>
                 <div class="value" style="font-size: 16px;">{" / ".join(f"{v:g}" for v in _harness.lora_settings(result.model_kwargs))}</div>
             </div>
@@ -648,6 +677,8 @@ def main(_):
         rehearsal_k=_REHEARSAL_K.value,
         rehearsal_max_tokens=_REHEARSAL_MAX_TOKENS.value,
         rehearsal_weight=_REHEARSAL_WEIGHT.value,
+        rehearsal_margin=_REHEARSAL_MARGIN.value,
+        rationale_max_tokens=_RATIONALE_MAX_TOKENS.value,
         repeats=_REPEATS.value,
         holdout_every_checkpoint=_HOLDOUT_EVERY_CHECKPOINT.value,
     )
@@ -661,6 +692,8 @@ def main(_):
     print(f"  Rehearsal k: {config.rehearsal_k}")
     print(f"  Rehearsal max tokens: {config.rehearsal_max_tokens}")
     print(f"  Rehearsal weight: {config.rehearsal_weight:g}")
+    print(f"  Rehearsal margin: {config.rehearsal_margin:g}")
+    print(f"  Rationale max tokens: {config.rationale_max_tokens}")
     model_kwargs = lora_model_kwargs(
         rank=_LORA_RANK.value, layers=_LORA_LAYERS.value, scale=_LORA_SCALE.value
     )

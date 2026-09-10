@@ -646,6 +646,88 @@ class JointTrainingStepTest(unittest.TestCase):
         self.assertTrue(stats.stopped_early)
 
 
+    def test_three_tuples_count_active_rehearsal_and_record_initial_loss(self):
+        # (correction_loss, mean_rehearsal_loss, active_count): the active
+        # counts are summed over the steps that ran, the first step's
+        # rehearsal loss is the hinge anchor, and the stop rule is unchanged.
+        step, calls = self._scripted(
+            [(6.05, 0.38, 0), (2.1, 0.45, 2), (0.58, 0.36, 1), (0.2, 0.3, 3)]
+        )
+        stats = _llm.run_joint_training_steps(
+            step, max_steps=12, loss_target=0.6, rehearsal_count=3
+        )
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(stats.steps, 3)
+        self.assertEqual(stats.rehearsal_active_steps, 3)
+        self.assertEqual(stats.rehearsal_pairs, 9)
+        self.assertEqual(stats.rehearsal_initial_loss, 0.38)
+        self.assertEqual(stats.rehearsal_final_loss, 0.36)
+        self.assertTrue(stats.stopped_early)
+
+    def test_two_tuples_still_work_with_zero_active(self):
+        step, _ = self._scripted([(3.0, 0.5), (0.5, 0.4)])
+        stats = _llm.run_joint_training_steps(
+            step, max_steps=5, loss_target=0.6, rehearsal_count=2
+        )
+        self.assertEqual(stats.steps, 2)
+        self.assertEqual(stats.rehearsal_active_steps, 0)
+        self.assertEqual(stats.rehearsal_initial_loss, 0.5)
+        self.assertEqual(stats.rehearsal_final_loss, 0.4)
+
+    def test_initial_loss_none_without_rehearsal(self):
+        step, _ = self._scripted([(2.0, None, 0), (0.5, None, 0)])
+        stats = _llm.run_joint_training_steps(
+            step, max_steps=5, loss_target=0.6, rehearsal_count=0
+        )
+        self.assertIsNone(stats.rehearsal_initial_loss)
+        self.assertEqual(stats.rehearsal_active_steps, 0)
+        self.assertEqual(stats.rehearsal_pairs, 0)
+
+    def test_array_active_counts_are_coerced(self):
+        step, _ = self._scripted([(3.0, mx.array(0.5), mx.array(2)), (0.5, 0.6, 1)])
+        stats = _llm.run_joint_training_steps(
+            step, max_steps=5, loss_target=0.6, rehearsal_count=2
+        )
+        self.assertEqual(stats.rehearsal_active_steps, 3)
+        self.assertIsInstance(stats.rehearsal_initial_loss, float)
+
+
+class ActiveRehearsalTest(unittest.TestCase):
+    """active_rehearsal: the rehearsal hinge, decided per example."""
+
+    def test_active_only_above_initial_plus_margin(self):
+        initial = [0.40, 0.40, 0.40, 0.40]
+        losses = [0.40, 0.44, 0.46, 0.30]
+        self.assertEqual(
+            _llm.active_rehearsal(losses, initial, 0.05), [False, False, True, False]
+        )
+
+    def test_first_step_is_never_active(self):
+        initial = [0.38, 0.5]
+        self.assertEqual(_llm.active_rehearsal(initial, initial, 0.05), [False, False])
+        # ...unless the margin is zero and the loss is strictly above.
+        self.assertEqual(_llm.active_rehearsal(initial, initial, 0.0), [False, False])
+        self.assertEqual(_llm.active_rehearsal([0.381, 0.5], initial, 0.0), [True, False])
+
+    def test_zero_margin_is_strict(self):
+        self.assertEqual(_llm.active_rehearsal([0.5], [0.5], 0.0), [False])
+        self.assertEqual(_llm.active_rehearsal([0.5000001], [0.5], 0.0), [True])
+
+    def test_empty(self):
+        self.assertEqual(_llm.active_rehearsal([], [], 0.05), [])
+
+    def test_array_losses(self):
+        self.assertEqual(
+            _llm.active_rehearsal([mx.array(0.5)], [mx.array(0.4)], 0.05), [True]
+        )
+
+    def test_validation(self):
+        with self.assertRaises(ValueError):
+            _llm.active_rehearsal([0.5, 0.5], [0.5], 0.05)
+        with self.assertRaises(ValueError):
+            _llm.active_rehearsal([0.5], [0.5], -0.01)
+
+
 class CombineGradsTest(unittest.TestCase):
     """combine_grads over nested dicts of mx arrays."""
 

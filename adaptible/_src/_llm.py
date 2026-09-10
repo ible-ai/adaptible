@@ -6,7 +6,7 @@ import functools
 import math
 import threading
 from pathlib import Path
-from typing import Any, AsyncIterable, Callable, List, Tuple, cast
+from typing import Any, AsyncIterable, Callable, List, Sequence, Tuple, cast
 
 import immutabledict
 import mlx
@@ -28,7 +28,8 @@ from ._paths import default_checkpoint_path
 from .revise import (
     make_collated_training_example,
     make_revision_prompt,
-    split_think,
+    rationale_from_output,
+    template_opens_think,
     validate_revision_response,
 )
 
@@ -212,9 +213,16 @@ class TrainingStats:
             trained (``train_on_example``, or an empty rehearsal list).
         rehearsal_count: Rehearsal examples in the joint objective (0 for
             ``train_on_example``).
+        rehearsal_initial_loss: Mean rehearsal loss at the first step, before
+            any update of this call; the anchor the rehearsal hinge measures
+            drift from. ``None`` without rehearsal.
+        rehearsal_active_steps: Number of ``(step, rehearsal example)`` pairs
+            whose gradient was applied, i.e. where that example's loss had
+            drifted more than ``rehearsal_margin`` above its initial loss
+            (see ``active_rehearsal``). Out of ``steps * rehearsal_count``.
 
-    All loss figures other than ``rehearsal_final_loss`` are the correction's:
-    the stop rule only ever looks at the correction's answer loss.
+    All loss figures other than the rehearsal ones are the correction's: the
+    stop rule only ever looks at the correction's answer loss.
     """
 
     steps: int
@@ -226,11 +234,18 @@ class TrainingStats:
     rehearsal_count: int = 0
     final_train_loss: float = math.nan
     train_losses: list[float] = dataclasses.field(default_factory=list)
+    rehearsal_initial_loss: float | None = None
+    rehearsal_active_steps: int = 0
 
     @property
     def hit_cap(self) -> bool:
         """The loop ran out of steps without reaching the loss target."""
         return self.steps > 0 and not self.stopped_early
+
+    @property
+    def rehearsal_pairs(self) -> int:
+        """``steps * rehearsal_count``: the pairs ``rehearsal_active_steps`` is out of."""
+        return self.steps * self.rehearsal_count
 
 
 def should_stop(loss: float, loss_target: float | None) -> bool:
@@ -290,8 +305,45 @@ def run_training_steps(
     )
 
 
+def active_rehearsal(
+    losses: Sequence[float], initial_losses: Sequence[float], margin: float
+) -> list[bool]:
+    """Which rehearsal examples get a gradient this step (the rehearsal hinge).
+
+    Example ``i`` is active when ``losses[i] > initial_losses[i] + margin``:
+    its loss has drifted above where it started this training call by more
+    than the margin. Rehearsal is meant to *anchor* the model, not to be
+    minimised; with the gradient always on, a few hundred steps over a pool
+    of a dozen items drove the rehearsal loss from ~0.4 to ~0.1 and the model
+    memorised its own outputs. An inactive example contributes nothing that
+    step.
+
+    Args:
+        losses: This step's per-example rehearsal losses.
+        initial_losses: Each example's loss at the call's first step.
+        margin: Allowed drift above the initial loss (>= 0).
+
+    Returns:
+        One flag per example.
+    """
+    if len(losses) != len(initial_losses):
+        raise ValueError(
+            f"losses and initial_losses differ in length: "
+            f"{len(losses)} vs {len(initial_losses)}"
+        )
+    if margin < 0:
+        raise ValueError(f"margin must be >= 0, got {margin}")
+    return [
+        float(loss) > float(initial) + margin
+        for loss, initial in zip(losses, initial_losses)
+    ]
+
+
+JointStepResult = Tuple[StepLoss, float | None] | Tuple[StepLoss, float | None, int]
+
+
 def run_joint_training_steps(
-    step_fn: Callable[[], Tuple[StepLoss, float | None]],
+    step_fn: Callable[[], JointStepResult],
     max_steps: int,
     loss_target: float | None,
     rehearsal_count: int,
@@ -300,15 +352,18 @@ def run_joint_training_steps(
     """``run_training_steps`` for a joint correction + rehearsal objective.
 
     ``step_fn`` performs one optimizer step on the combined gradient and
-    returns ``(correction_loss, mean_rehearsal_loss)``, where the correction
-    loss is a scalar or a ``(train_loss, stop_loss)`` pair and the rehearsal
-    loss is ``None`` when there are no rehearsal examples. Only the
+    returns ``(correction_loss, mean_rehearsal_loss)`` or
+    ``(correction_loss, mean_rehearsal_loss, active_count)``, where the
+    correction loss is a scalar or a ``(train_loss, stop_loss)`` pair, the
+    rehearsal loss is ``None`` when there are no rehearsal examples, and
+    ``active_count`` is how many rehearsal examples' gradients the step
+    applied (``active_rehearsal``; taken as 0 when omitted). Only the
     correction's answer loss is compared against ``loss_target``: rehearsal
     targets are the model's own baseline output, whose loss is already low,
     so stopping on it would end training before the correction lands.
 
     Args:
-        step_fn: Performs one gradient step and returns both losses.
+        step_fn: Performs one gradient step and returns the losses.
         max_steps: Hard cap on steps.
         loss_target: Stop as soon as the *correction's answer* loss is below
             this; ``None`` runs exactly ``max_steps`` steps.
@@ -316,21 +371,35 @@ def run_joint_training_steps(
         verbose: Print each step's losses.
 
     Returns:
-        ``TrainingStats`` whose loss fields are the correction's and whose
-        ``rehearsal_final_loss`` is the last step's mean rehearsal loss.
+        ``TrainingStats`` whose loss fields are the correction's, whose
+        ``rehearsal_initial_loss`` / ``rehearsal_final_loss`` are the first
+        and last step's mean rehearsal loss, and whose
+        ``rehearsal_active_steps`` sums the active counts.
     """
+    first_rehearsal: list[float | None] = [None]
     last_rehearsal: list[float | None] = [None]
+    active_total = [0]
 
     def correction_only() -> StepLoss:
-        loss_c, loss_r = step_fn()
-        last_rehearsal[0] = None if loss_r is None else float(loss_r)
+        result = step_fn()
+        loss_c, loss_r = result[0], result[1]
+        active = int(result[2]) if len(result) > 2 else 0
+        loss_r = None if loss_r is None else float(loss_r)
+        if first_rehearsal[0] is None:
+            first_rehearsal[0] = loss_r
+        last_rehearsal[0] = loss_r
+        active_total[0] += active
         if verbose and loss_r is not None:
-            vizible.green(f"\tRehearsal loss: {float(loss_r):.4f}")
+            vizible.green(
+                f"\tRehearsal loss: {loss_r:.4f} (active {active}/{rehearsal_count})"
+            )
         return _split_step_loss(loss_c)
 
     stats = run_training_steps(correction_only, max_steps, loss_target, verbose)
+    stats.rehearsal_initial_loss = first_rehearsal[0]
     stats.rehearsal_final_loss = last_rehearsal[0]
     stats.rehearsal_count = rehearsal_count
+    stats.rehearsal_active_steps = active_total[0]
     return stats
 
 
@@ -688,11 +757,17 @@ class StatefulLLM:
         # 3. Prepare training data to train the model on how it should have responded in this
         #    situation. Pass the same list as make_revision_prompt above: the [[X]] index in
         #    the response is a position within interactions_to_review, not interaction_history.
-        #    think_mode="rationale": the revision generation's own think block becomes the
+        #    think_mode="rationale": the revision generation's own reasoning becomes the
         #    reasoning in the target, so the model is trained on reasoning that actually
-        #    concludes the revision rather than on "given the old reasoning, say X".
-        #    Without a think block this falls back to "empty".
-        rationale, _ = split_think(llm_rewrite_response)
+        #    concludes the revision rather than on "given the old reasoning, say X"
+        #    (rationale_from_output: the think block, or the whole output when the model
+        #    never closed the tag). There is no fallback without one: the empty-think
+        #    target collapses the model, so an item with no rationale is not trained.
+        rationale, _, _ = rationale_from_output(llm_rewrite_response, self._tokenizer)
+        if not rationale and template_opens_think(
+            self._tokenizer, [{"role": "user", "content": interactions_to_review[0].user_input}]
+        ):
+            raise ValueError("rationale required: the revision carried no reasoning")
         example = make_collated_training_example(
             llm_rewrite_response,
             interactions_to_review,
@@ -774,6 +849,7 @@ class StatefulLLM:
         max_steps: int,
         loss_target: float | None,
         rehearsal_weight: float,
+        rehearsal_margin: float = 0.05,
     ) -> TrainingStats:
         """Joint correction + rehearsal steps; caller must hold ``_lock``.
 
@@ -784,6 +860,13 @@ class StatefulLLM:
         optimizer update. Intermediate gradients are evaluated as they are
         produced so their activations are released before the next pass.
 
+        Rehearsal is a hinge, not an objective: each rehearsal example's loss
+        at the first step is its anchor, and on every step only the examples
+        whose loss has drifted more than ``rehearsal_margin`` above their
+        anchor contribute a gradient (``active_rehearsal``); the mean in
+        ``combine_grads`` is over that active set. On the first step nothing
+        has drifted, so no rehearsal gradient is applied.
+
         Args:
             correction: The corrected answer, whose answer loss drives the
                 stop rule.
@@ -792,6 +875,8 @@ class StatefulLLM:
             max_steps: Step cap.
             loss_target: Stop once the correction's answer loss is below this.
             rehearsal_weight: Multiplier on the mean rehearsal gradient.
+            rehearsal_margin: Drift above the initial loss that activates a
+                rehearsal example's gradient (>= 0).
 
         Returns:
             ``TrainingStats`` for this call, rehearsal loss included.
@@ -805,8 +890,11 @@ class StatefulLLM:
 
         _prepare_training_device(verbose)
         progress = tqdm.tqdm(desc="Training", total=max_steps)
+        # Per-example rehearsal loss at the first step: the hinge's anchor.
+        initial_losses: list[float] | None = None
 
-        def one_step() -> Tuple[Tuple[float, float], float | None]:
+        def one_step() -> Tuple[Tuple[float, float], float | None, int]:
+            nonlocal initial_losses
             (train_c, stop_c), grads_c = loss_and_grad_fn(
                 self._model,
                 correction.input,
@@ -825,8 +913,12 @@ class StatefulLLM:
                 rehearsal_losses.append(loss_r.item())
                 rehearsal_grads.append(grads_r)
                 del loss_r, grads_r
-            grads = combine_grads(grads_c, rehearsal_grads, rehearsal_weight)
-            del grads_c, rehearsal_grads
+            if initial_losses is None:
+                initial_losses = list(rehearsal_losses)
+            active = active_rehearsal(rehearsal_losses, initial_losses, rehearsal_margin)
+            active_grads = [g for g, on in zip(rehearsal_grads, active) if on]
+            grads = combine_grads(grads_c, active_grads, rehearsal_weight)
+            del grads_c, rehearsal_grads, active_grads
             self._optimizer.update(self._model, grads)
             mlx.core.eval(state)
             del grads
@@ -836,7 +928,7 @@ class StatefulLLM:
                 if rehearsal_losses
                 else None
             )
-            return (train_c.item(), stop_c.item()), loss_r_mean
+            return (train_c.item(), stop_c.item()), loss_r_mean, sum(active)
 
         self._model.train(True)
         try:
@@ -853,11 +945,18 @@ class StatefulLLM:
     def _report_training(stats: TrainingStats, verbose: bool) -> None:
         if not verbose:
             return
-        rehearsal = (
-            f", rehearsal {stats.rehearsal_final_loss:.4f} (k={stats.rehearsal_count})"
-            if stats.rehearsal_final_loss is not None
-            else ""
-        )
+        rehearsal = ""
+        if stats.rehearsal_final_loss is not None:
+            initial = (
+                f"{stats.rehearsal_initial_loss:.4f}→"
+                if stats.rehearsal_initial_loss is not None
+                else ""
+            )
+            rehearsal = (
+                f", rehearsal {initial}{stats.rehearsal_final_loss:.4f} "
+                f"(k={stats.rehearsal_count}, active "
+                f"{stats.rehearsal_active_steps}/{stats.rehearsal_pairs})"
+            )
         train = (
             f", train loss {stats.final_train_loss:.4f}"
             if stats.final_train_loss != stats.final_loss
@@ -927,19 +1026,26 @@ class StatefulLLM:
         loss_target: float | None,
         max_steps: int,
         rehearsal_weight: float = 1.0,
+        rehearsal_margin: float = 0.05,
         verbose: bool = False,
         save_checkpoint: bool = False,
     ) -> TrainingStats:
         """Train on a correction jointly with rehearsal examples.
 
         Every optimizer step uses ``grad(correction) + rehearsal_weight *
-        mean(grad(rehearsal_i))``, each gradient from its own single-sequence
-        pass, and stops as soon as the *correction* loss is below
-        ``loss_target`` or after ``max_steps`` steps. Training rehearsal
-        examples in their own calls (``train_on_example`` each) does nothing
-        under a loss target, since their loss already sits below it; folding
-        them into the correction's step is what lets them anchor the model
-        while the correction is being driven in.
+        mean(grad(rehearsal_i) for active i)``, each gradient from its own
+        single-sequence pass, and stops as soon as the *correction* loss is
+        below ``loss_target`` or after ``max_steps`` steps. Training
+        rehearsal examples in their own calls (``train_on_example`` each)
+        does nothing under a loss target, since their loss already sits below
+        it; folding them into the correction's step is what lets them anchor
+        the model while the correction is being driven in.
+
+        Rehearsal example ``i`` is *active* on a step only when its loss is
+        more than ``rehearsal_margin`` above its loss at the call's first
+        step (``active_rehearsal``). Rehearsal anchors; it is never minimised
+        on its own: with the gradient always on, the rehearsal loss was driven
+        from ~0.4 to ~0.1 over a run and the model memorised its own outputs.
 
         Args:
             correction: Pre-constructed example whose loss drives the stop rule.
@@ -949,15 +1055,21 @@ class StatefulLLM:
                 ``None`` runs exactly ``max_steps`` steps.
             max_steps: Step cap.
             rehearsal_weight: Multiplier on the mean rehearsal gradient.
+            rehearsal_margin: Drift above its initial loss that makes a
+                rehearsal example's gradient count on a step (>= 0).
             verbose: Enable verbose logging.
             save_checkpoint: Whether to save the model after training.
 
         Returns:
-            ``TrainingStats`` for the call; ``rehearsal_final_loss`` is the
-            mean rehearsal loss at the last step.
+            ``TrainingStats`` for the call; ``rehearsal_initial_loss`` /
+            ``rehearsal_final_loss`` are the mean rehearsal loss at the first
+            and last step and ``rehearsal_active_steps`` counts the
+            ``(step, example)`` pairs whose gradient was applied.
         """
         if rehearsal_weight < 0:
             raise ValueError(f"rehearsal_weight must be >= 0, got {rehearsal_weight}")
+        if rehearsal_margin < 0:
+            raise ValueError(f"rehearsal_margin must be >= 0, got {rehearsal_margin}")
         self._model_is_stable = False
         try:
             with self._lock:
@@ -969,6 +1081,7 @@ class StatefulLLM:
                         max_steps=max_steps,
                         loss_target=loss_target,
                         rehearsal_weight=rehearsal_weight,
+                        rehearsal_margin=rehearsal_margin,
                     )
                 else:
                     stats = self._train_locked(

@@ -33,6 +33,13 @@ Options:
                           tokens (default: 768)
     --rehearsal_weight W  Multiplier on the mean rehearsal gradient in the
                           joint step (default: 1.0)
+    --rehearsal_margin M  Rehearsal hinge: a rehearsal example's gradient is
+                          applied on a step only when its loss is more than M
+                          above its loss at the call's first step
+                          (default: 0.05)
+    --rationale_max_tokens N
+                          Cap the rationale in the training target at N
+                          tokens, cut at a sentence boundary (default: 512)
     --learning_rate LR    Optimizer learning rate for StatefulLLM (default: model's)
     --lora_rank R         LoRA rank (default: 32)
     --lora_layers N       Number of trailing layers converted to LoRA (default: 24)
@@ -65,7 +72,7 @@ from .harness import (
     lora_model_kwargs,
     lora_settings_text,
 )
-from ..revise import REVISION_PROMPTS, THINK_MODES
+from ..revise import DEFAULT_RATIONALE_MAX_TOKENS, REVISION_PROMPTS, THINK_MODES
 
 _NAME = flags.DEFINE_string("name", "default", "Experiment name")
 _TRAIN_RATIO = flags.DEFINE_float("train_ratio", 0.8, "Train/holdout split ratio")
@@ -137,6 +144,21 @@ _REHEARSAL_WEIGHT = flags.DEFINE_float(
     1.0,
     "Multiplier on the mean rehearsal gradient in the joint step (>= 0).",
 )
+_REHEARSAL_MARGIN = flags.DEFINE_float(
+    "rehearsal_margin",
+    0.05,
+    "Rehearsal hinge: a rehearsal example's gradient is applied on a step only "
+    "when its loss is more than this above its loss at the call's first step "
+    "(>= 0). Rehearsal anchors the model; it is never minimised on its own.",
+)
+_RATIONALE_MAX_TOKENS = flags.DEFINE_integer(
+    "rationale_max_tokens",
+    DEFAULT_RATIONALE_MAX_TOKENS,
+    "Cap the rationale placed in the training target at this many tokens, cut "
+    "at the last sentence boundary. Under --think_mode rationale an output "
+    "with no </think> is taken whole as the rationale (the model reasons "
+    "inside the open think block); an item with no rationale at all is skipped.",
+)
 _LEARNING_RATE = flags.DEFINE_float(
     "learning_rate", None, "StatefulLLM learning rate (default: the model's)."
 )
@@ -206,6 +228,8 @@ def main(_):
         rehearsal_k=_REHEARSAL_K.value,
         rehearsal_max_tokens=_REHEARSAL_MAX_TOKENS.value,
         rehearsal_weight=_REHEARSAL_WEIGHT.value,
+        rehearsal_margin=_REHEARSAL_MARGIN.value,
+        rationale_max_tokens=_RATIONALE_MAX_TOKENS.value,
     )
     model_kwargs = lora_model_kwargs(
         rank=_LORA_RANK.value, layers=_LORA_LAYERS.value, scale=_LORA_SCALE.value

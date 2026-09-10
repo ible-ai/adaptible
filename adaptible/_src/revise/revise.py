@@ -295,6 +295,92 @@ def split_think(text: str | None) -> Tuple[str, str]:
     return think.strip(), answer.strip()
 
 
+DEFAULT_RATIONALE_MAX_TOKENS = 512
+
+
+def validate_rationale_max_tokens(rationale_max_tokens: int) -> None:
+    """Raise ValueError unless ``rationale_max_tokens`` is a positive int."""
+    if (
+        isinstance(rationale_max_tokens, bool)
+        or not isinstance(rationale_max_tokens, int)
+        or rationale_max_tokens <= 0
+    ):
+        raise ValueError(
+            f"rationale_max_tokens must be a positive int, got {rationale_max_tokens!r}"
+        )
+
+
+def truncate_at_sentence(
+    text: str, tokenizer: PreTrainedTokenizer, max_tokens: int
+) -> Tuple[str, int, bool]:
+    """Cap ``text`` at ``max_tokens`` tokens, cutting at the last sentence boundary.
+
+    Counts with ``tokenizer.encode``. When the text is over the cap the first
+    ``max_tokens`` tokens are decoded and cut back to the last sentence
+    boundary in them (a ``". "``, a newline, or a trailing ``"."``); with no
+    boundary at all the hard token cut stands.
+
+    Args:
+        text: Text to cap.
+        tokenizer: Counts and decodes tokens.
+        max_tokens: Token cap (> 0).
+
+    Returns:
+        ``(text, token_count, truncated)`` with ``text`` stripped.
+    """
+    validate_rationale_max_tokens(max_tokens)
+    text = text.strip()
+    tokens = tokenizer.encode(text, add_special_tokens=False)
+    if len(tokens) <= max_tokens:
+        return text, len(tokens), False
+    prefix = tokenizer.decode(tokens[:max_tokens])
+    ends = [
+        prefix.rfind(". ") + 1 if ". " in prefix else -1,
+        prefix.rfind("\n"),
+        len(prefix) if prefix.rstrip().endswith(".") else -1,
+    ]
+    end = max(ends)
+    if end > 0:
+        prefix = prefix[:end]
+    prefix = prefix.strip()
+    return prefix, len(tokenizer.encode(prefix, add_special_tokens=False)), True
+
+
+def rationale_from_output(
+    output: str | None,
+    tokenizer: PreTrainedTokenizer,
+    max_tokens: int = DEFAULT_RATIONALE_MAX_TOKENS,
+) -> Tuple[str, int, bool]:
+    """The reasoning in a model output, for ``think_mode="rationale"``.
+
+    With a ``</think>`` in the output the think block before it is the
+    rationale (``split_think``). Without one the *whole* output is: the model
+    generates inside the open think block, so an output that never closed
+    the tag is reasoning that ran to the generation cap, not an answer.
+    Either way the result is capped at ``max_tokens`` with
+    ``truncate_at_sentence``.
+
+    Args:
+        output: Raw model output.
+        tokenizer: Counts tokens for the cap.
+        max_tokens: Rationale token cap.
+
+    Returns:
+        ``(rationale, token_count, truncated)``; ``rationale`` is ``""`` when
+        the output holds no reasoning at all (empty, or ``</think>`` with
+        nothing before it). Callers must not train on an empty rationale.
+    """
+    if not output or not output.strip():
+        return "", 0, False
+    if re.search(r"</think>", output, flags=re.IGNORECASE):
+        rationale, _ = split_think(output)
+    else:
+        rationale = output.strip()
+    if not rationale:
+        return "", 0, False
+    return truncate_at_sentence(rationale, tokenizer, max_tokens)
+
+
 def strip_examples_tags(text: str | None) -> str:
     """Remove content before </EXAMPLES> closing tag.
 
@@ -614,9 +700,16 @@ def make_revision_training_example(
         think_mode: One of ``THINK_MODES``.
         close_think: Deprecated alias; ``False`` forces ``think_mode="none"``.
         rationale: Reasoning that concludes the revision, used by
-            ``"rationale"``; empty or ``None`` falls back to ``"empty"``.
+            ``"rationale"`` (see ``rationale_from_output``).
 
     Returns: a 1-D training example.
+
+    Raises:
+        ValueError: ``think_mode="rationale"`` on a think template with an
+            empty ``rationale``. There is no fallback: the "empty" target
+            (``</think>\n\n{revision}``) teaches the model to stop reasoning
+            and collapsed it in every run that used it, so a missing
+            rationale means the item must not be trained.
     """
     think_mode = resolve_think_mode(think_mode, close_think)
     eos_tag = _eos_tag(tokenizer)
@@ -653,10 +746,9 @@ def make_revision_training_example(
             think_mode = "empty"
     if open_think and think_mode == "rationale":
         rationale = (rationale or "").strip()
-        if rationale:
-            target_text = f"{rationale}\n{THINK_CLOSE}{target_text}"
-        else:
-            think_mode = "empty"
+        if not rationale:
+            raise ValueError("rationale required")
+        target_text = f"{rationale}\n{THINK_CLOSE}{target_text}"
     if open_think and think_mode == "empty":
         target_text = THINK_CLOSE + target_text
     return make_training_example(

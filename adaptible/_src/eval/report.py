@@ -57,15 +57,20 @@ def generate_html_report(
 
         rationale_text = getattr(item, "rationale_text", None)
         if rationale_text:
+            tokens = getattr(item, "rationale_tokens", None)
+            details = [] if tokens is None else [f"{tokens} tokens"]
+            if getattr(item, "rationale_truncated", False):
+                details.append("truncated")
+            detail = f" <em>({', '.join(details)})</em>" if details else ""
             revision_html += (
                 '<div class="key-terms"><strong>Rationale (in target):</strong> '
                 f"{html.escape(rationale_text[:500])}"
-                f"{'...' if len(rationale_text) > 500 else ''}</div>"
+                f"{'...' if len(rationale_text) > 500 else ''}{detail}</div>"
             )
         elif getattr(item, "rationale_missing", False):
             revision_html += (
                 '<div class="key-terms"><strong>Rationale:</strong> '
-                "MISSING (trained on the empty-think target)</div>"
+                "MISSING (item skipped, not trained)</div>"
             )
 
         # Self-generated runs: show the parsed revision (what was trained on)
@@ -168,6 +173,9 @@ def generate_html_report(
     rehearsal_k = getattr(result.config, "rehearsal_k", 0)
     rehearsal_max_tokens = getattr(result.config, "rehearsal_max_tokens", 768)
     rehearsal_weight = getattr(result.config, "rehearsal_weight", 1.0)
+    rehearsal_margin = getattr(result.config, "rehearsal_margin", 0.05)
+    rationale_max_tokens = getattr(result.config, "rationale_max_tokens", 512)
+    rationale_truncated_count = getattr(result, "rationale_truncated_count", 0)
     lora_text = html.escape(result.lora_settings_text())
     loss_target = getattr(result.config, "loss_target", None)
     loss_target_text = f"{loss_target:.2f}" if loss_target is not None else "off"
@@ -407,8 +415,8 @@ def generate_html_report(
         Dataset: {html.escape(result.dataset_name)} ({len(result.items)} items)<br>
         Training source: {html.escape(training_source)} |
         Revision prompt: {html.escape(revision_prompt)} |
-        Think mode: <code>{html.escape(str(think_mode))}</code> (rationales missing: <code>{rationale_missing_count}</code>) |
-        Rehearsal k: <code>{rehearsal_k}</code> (max tokens: <code>{rehearsal_max_tokens}</code>, weight: <code>{rehearsal_weight:g}</code>) |
+        Think mode: <code>{html.escape(str(think_mode))}</code> (rationale max tokens: <code>{rationale_max_tokens}</code>; rationales missing: <code>{rationale_missing_count}</code>, truncated: <code>{rationale_truncated_count}</code>) |
+        Rehearsal k: <code>{rehearsal_k}</code> (max tokens: <code>{rehearsal_max_tokens}</code>, weight: <code>{rehearsal_weight:g}</code>, margin: <code>{rehearsal_margin:g}</code>) |
         {lora_text} |
         Training step cap: {result.config.training_iterations} (loss target: <code>{loss_target_text}</code>) |
         Train/Holdout split: {result.config.train_ratio:.0%}/{1-result.config.train_ratio:.0%} |

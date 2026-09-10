@@ -24,17 +24,19 @@ from ..db import (
     TrainingEvent,
 )
 from ..revise import (
+    DEFAULT_RATIONALE_MAX_TOKENS,
     THINK_MODES,
     InvalidRevisionError,
     collate_training_examples,
     make_revision_prompt,
     make_revision_training_example,
     make_training_example,
+    rationale_from_output,
     resolve_think_mode,
     revision_prompt_preset,
-    split_think,
     strip_think_tags,
     template_opens_think,
+    validate_rationale_max_tokens,
     validate_revision_response,
 )
 from .dataset import TriviaDataset, TriviaItem
@@ -126,8 +128,11 @@ class EvaluationConfig:
             ``{rationale}\n</think>\n\n{answer}{eos}`` where the rationale is
             reasoning that concludes the answer: the revision generation's
             own think block for ``self_generated``, or, for ``ground_truth``,
-            one generated with ``make_rationale_prompt`` from the label.
-            Items with no rationale fall back to "empty" and are counted in
+            one generated with ``make_rationale_prompt`` from the label
+            (``revise.rationale_from_output``: the think block, or the whole
+            output when the model never closed the tag). Items with no
+            rationale at all are **not trained** (the "empty" fallback they
+            used to get collapses the model) and are counted in
             ``EvaluationResult.rationale_missing_count``. "baseline" keeps the
             model's own baseline reasoning in the unmasked prefix and trains
             only on the corrected answer; on DeepSeek-R1-Distill the correction
@@ -150,6 +155,19 @@ class EvaluationConfig:
         rehearsal_weight: Multiplier on the mean rehearsal gradient in that
             joint step. ``0`` keeps the rehearsal passes (and their loss
             reporting) but lets only the correction move the weights.
+        rehearsal_margin: The rehearsal hinge (``_llm.active_rehearsal``): a
+            rehearsal example's gradient is applied on a step only when its
+            loss is more than this above its loss at the call's first step.
+            Rehearsal anchors the model; it is never minimised on its own.
+            With the gradient always on, a 40-item screen drove the rehearsal
+            loss from ~0.38 to 0.09 and the model memorised its dozen pool
+            outputs. ``ItemResult.train_rehearsal_active_steps`` and the
+            summary line's ``rehearsal active in P% of steps`` say how often
+            the hinge fired.
+        rationale_max_tokens: Token cap on the rationale placed in the
+            target; longer ones are cut at the last sentence boundary
+            (``revise.truncate_at_sentence``), recorded per item as
+            ``rationale_tokens`` / ``rationale_truncated``.
         rehearsal_max_tokens: Items whose raw baseline response is longer than
             this many tokens are excluded from the rehearsal pool. Rehearsal
             targets are the model's own full baseline output, which can run to
@@ -187,6 +205,8 @@ class EvaluationConfig:
     rehearsal_k: int = 0
     rehearsal_max_tokens: int = 768
     rehearsal_weight: float = 1.0
+    rehearsal_margin: float = 0.05
+    rationale_max_tokens: int = DEFAULT_RATIONALE_MAX_TOKENS
 
     def __post_init__(self) -> None:
         validate_training_source(self.training_source)
@@ -196,6 +216,8 @@ class EvaluationConfig:
         validate_rehearsal_k(self.rehearsal_k)
         validate_rehearsal_max_tokens(self.rehearsal_max_tokens)
         self.rehearsal_weight = validate_rehearsal_weight(self.rehearsal_weight)
+        self.rehearsal_margin = validate_rehearsal_margin(self.rehearsal_margin)
+        validate_rationale_max_tokens(self.rationale_max_tokens)
         self.loss_target = normalize_loss_target(self.loss_target)
 
 
@@ -213,6 +235,15 @@ def validate_rehearsal_weight(rehearsal_weight: float) -> float:
     if rehearsal_weight < 0:
         raise ValueError(f"rehearsal_weight must be >= 0, got {rehearsal_weight!r}")
     return float(rehearsal_weight)
+
+
+def validate_rehearsal_margin(rehearsal_margin: float) -> float:
+    """Return ``rehearsal_margin`` as a float; raise ValueError if negative."""
+    if isinstance(rehearsal_margin, bool) or rehearsal_margin is None:
+        raise ValueError(f"rehearsal_margin must be a number, got {rehearsal_margin!r}")
+    if rehearsal_margin < 0:
+        raise ValueError(f"rehearsal_margin must be >= 0, got {rehearsal_margin!r}")
+    return float(rehearsal_margin)
 
 
 def validate_rehearsal_k(rehearsal_k: int) -> None:
@@ -258,9 +289,15 @@ class ItemResult:
             was placed before ``</think>`` in the training target (the
             revision's own think block, or the generated one for
             ``ground_truth``); None otherwise or when none was available.
-        rationale_missing: The item was trained with ``think_mode="rationale"``
-            on a think template but no rationale was available, so it fell
-            back to the "empty" target.
+        rationale_missing: The item was scheduled for training with
+            ``think_mode="rationale"`` on a think template but no rationale
+            could be had (the model's output held no reasoning at all), so
+            it was **skipped**: not trained, and excluded from the train
+            metrics like an invalid revision.
+        rationale_tokens: Tokens in the rationale placed in the target (None
+            without one).
+        rationale_truncated: The rationale was cut at a sentence boundary to
+            fit ``EvaluationConfig.rationale_max_tokens``.
         train_steps: Optimizer steps the correction took (0 if not trained).
         train_initial_loss: Answer loss at the correction's first step.
         train_final_loss: Answer loss at the correction's last step (the loss
@@ -272,6 +309,11 @@ class ItemResult:
             loss target.
         train_rehearsal_final_loss: Mean rehearsal loss at the correction's last
             step; None when the item was trained without rehearsal.
+        train_rehearsal_initial_loss: Mean rehearsal loss at the first step,
+            the hinge's anchor; None without rehearsal.
+        train_rehearsal_active_steps: ``(step, rehearsal example)`` pairs
+            whose gradient the hinge let through, out of
+            ``train_steps * len(rehearsal_item_ids)``.
     """
 
     item_id: str
@@ -297,12 +339,21 @@ class ItemResult:
     rehearsal_item_ids: list[str] = dataclasses.field(default_factory=list)
     rationale_text: str | None = None
     rationale_missing: bool = False
+    rationale_tokens: int | None = None
+    rationale_truncated: bool = False
     train_steps: int = 0
     train_initial_loss: float | None = None
     train_final_loss: float | None = None
     train_final_train_loss: float | None = None
     train_hit_cap: bool = False
     train_rehearsal_final_loss: float | None = None
+    train_rehearsal_initial_loss: float | None = None
+    train_rehearsal_active_steps: int = 0
+
+    @property
+    def train_rehearsal_pairs(self) -> int:
+        """``train_steps * k``: what ``train_rehearsal_active_steps`` is out of."""
+        return self.train_steps * len(self.rehearsal_item_ids)
 
     @property
     def post_empty_think(self) -> bool:
@@ -340,11 +391,17 @@ class EvaluationResult:
 
     @property
     def holdout_items(self) -> list[ItemResult]:
-        """Items never scheduled for training (invalid-revision items excluded)."""
+        """Items never scheduled for training (skipped items excluded).
+
+        An item scheduled for training but skipped (invalid revision, or no
+        rationale) is neither trained nor holdout.
+        """
         return [
             item
             for item in self.items
-            if not item.was_trained and not item.revision_invalid
+            if not item.was_trained
+            and not item.revision_invalid
+            and not item.rationale_missing
         ]
 
     @property
@@ -593,9 +650,28 @@ class EvaluationResult:
         return sum(losses) / len(losses)
 
     @property
+    def rationale_missing_items(self) -> list[ItemResult]:
+        """Items scheduled for training but skipped for want of a rationale."""
+        return [item for item in self.items if item.rationale_missing]
+
+    @property
     def rationale_missing_count(self) -> int:
-        """Items that fell back to the "empty" target for want of a rationale."""
-        return sum(1 for item in self.items if item.rationale_missing)
+        return len(self.rationale_missing_items)
+
+    @property
+    def rationale_truncated_count(self) -> int:
+        """Trained items whose rationale was cut to ``rationale_max_tokens``."""
+        return sum(1 for item in self.train_items if item.rationale_truncated)
+
+    @property
+    def train_rehearsal_active_steps(self) -> int:
+        """``(step, rehearsal example)`` pairs whose gradient was applied, over all trained items."""
+        return sum(item.train_rehearsal_active_steps for item in self.train_items)
+
+    @property
+    def train_rehearsal_pairs(self) -> int:
+        """All ``(step, rehearsal example)`` pairs over trained items."""
+        return sum(item.train_rehearsal_pairs for item in self.train_items)
 
     @property
     def mean_train_rehearsal_final_loss(self) -> float | None:
@@ -625,6 +701,8 @@ class EvaluationResult:
             [item.train_rehearsal_final_loss for item in self.train_items],
             [item.train_final_train_loss for item in self.train_items],
             self.rationale_missing_count,
+            self.train_rehearsal_active_steps,
+            self.train_rehearsal_pairs,
         )
 
     def lora_settings_text(self) -> str:
@@ -648,6 +726,8 @@ class EvaluationResult:
                 "rehearsal_k": self.config.rehearsal_k,
                 "rehearsal_max_tokens": self.config.rehearsal_max_tokens,
                 "rehearsal_weight": self.config.rehearsal_weight,
+                "rehearsal_margin": self.config.rehearsal_margin,
+                "rationale_max_tokens": self.config.rationale_max_tokens,
             },
             "model_kwargs": self.model_kwargs,
             "lora": dict(
@@ -677,6 +757,9 @@ class EvaluationResult:
                 "mean_train_rehearsal_final_loss": self.mean_train_rehearsal_final_loss,
                 "train_cap_hit_count": self.train_cap_hit_count,
                 "rationale_missing_count": self.rationale_missing_count,
+                "rationale_truncated_count": self.rationale_truncated_count,
+                "train_rehearsal_active_steps": self.train_rehearsal_active_steps,
+                "train_rehearsal_pairs": self.train_rehearsal_pairs,
             },
             "items": [
                 {
@@ -703,12 +786,16 @@ class EvaluationResult:
                     "rehearsal_item_ids": item.rehearsal_item_ids,
                     "rationale_text": item.rationale_text,
                     "rationale_missing": item.rationale_missing,
+                    "rationale_tokens": item.rationale_tokens,
+                    "rationale_truncated": item.rationale_truncated,
                     "train_steps": item.train_steps,
                     "train_initial_loss": item.train_initial_loss,
                     "train_final_loss": item.train_final_loss,
                     "train_final_train_loss": item.train_final_train_loss,
                     "train_hit_cap": item.train_hit_cap,
                     "train_rehearsal_final_loss": item.train_rehearsal_final_loss,
+                    "train_rehearsal_initial_loss": item.train_rehearsal_initial_loss,
+                    "train_rehearsal_active_steps": item.train_rehearsal_active_steps,
                 }
                 for item in self.items
             ],
@@ -724,15 +811,19 @@ def training_summary_text(
     rehearsal_final_losses: list[float | None] | None = None,
     train_final_losses: list[float | None] | None = None,
     rationale_missing: int = 0,
+    rehearsal_active_steps: int = 0,
+    rehearsal_pairs: int = 0,
 ) -> str:
     """Format the one-line training summary.
 
     ``Training: mean 3.2 steps/item (cap 12, answer-loss target 0.60), mean
     final answer loss 0.55 (train loss 0.80, rehearsal 0.41); 0 items hit the
-    cap; 0 rationales missing``. Shared by the harness and the meta-learning
-    experiment so both print the same line. The parenthesised train loss
-    (whole-target) and rehearsal loss each appear only when some item
-    reported one.
+    cap; 0 rationales missing; rehearsal active in 33% of steps``. Shared by
+    the harness and the meta-learning experiment so both print the same
+    line. The parenthesised train loss (whole-target) and rehearsal loss
+    each appear only when some item reported one; the ``rehearsal active``
+    part (``rehearsal_active_steps / rehearsal_pairs``, pairs being
+    ``(step, rehearsal example)``) only when ``rehearsal_pairs > 0``.
     """
     if not steps:
         return "Training: no items trained"
@@ -749,11 +840,17 @@ def training_summary_text(
     if extras:
         loss_text += f" ({', '.join(extras)})"
     target_text = f"{loss_target:.2f}" if loss_target is not None else "off"
-    return (
+    text = (
         f"Training: mean {mean_steps:.1f} steps/item (cap {cap}, answer-loss "
         f"target {target_text}), mean final answer loss {loss_text}; "
         f"{cap_hits} items hit the cap; {rationale_missing} rationales missing"
     )
+    if rehearsal_pairs > 0:
+        text += (
+            f"; rehearsal active in "
+            f"{rehearsal_active_steps / rehearsal_pairs:.0%} of steps"
+        )
+    return text
 
 
 def _normalize_for_match(text: str) -> str:
@@ -914,15 +1011,24 @@ class BuiltExample:
         revision_text: The model's raw revision output for "self_generated"
             (think block and markers included); None for "ground_truth".
         rationale_text: The reasoning placed in the target under
-            ``think_mode="rationale"``; None otherwise or when unavailable.
-        rationale_missing: ``think_mode="rationale"`` on a think template but
-            no rationale could be had, so the target fell back to "empty".
+            ``think_mode="rationale"``; None otherwise.
+        rationale_tokens: Tokens in that rationale; None without one.
+        rationale_truncated: The rationale was cut to ``rationale_max_tokens``.
     """
 
     example: TrainingExample
     revision_text: str | None = None
     rationale_text: str | None = None
-    rationale_missing: bool = False
+    rationale_tokens: int | None = None
+    rationale_truncated: bool = False
+
+
+class RationaleMissingError(Exception):
+    """``think_mode="rationale"`` on a think template, but the model's output held no reasoning.
+
+    Raised by ``_build_training_example`` instead of falling back to the
+    "empty" target; callers skip the item.
+    """
 
 
 def _build_training_example(
@@ -932,15 +1038,21 @@ def _build_training_example(
     training_source: str,
     revision_prompt: str = "default",
     think_mode: str = "rationale",
+    rationale_max_tokens: int = DEFAULT_RATIONALE_MAX_TOKENS,
 ) -> BuiltExample:
     """Build the (unbatched) correction training example for one item.
 
     With ``think_mode="rationale"`` the reasoning in the target comes from
-    the revision generation's own think block (``self_generated``; the raw
+    the revision generation's own output (``self_generated``; the raw
     revision text is kept for that) or, for ``ground_truth``, from one extra
-    generation with ``make_rationale_prompt``. Either way ``split_think``
-    picks the think block out; if it is empty the item falls back to the
-    "empty" target and ``rationale_missing`` is set. Templates without an
+    generation with ``make_rationale_prompt``. Either way
+    ``revise.rationale_from_output`` picks the reasoning out: the think
+    block, or the *whole* output when the model never emitted ``</think>``
+    (it generates inside the open think block, so such an output is
+    reasoning that ran to the cap), capped at ``rationale_max_tokens`` at a
+    sentence boundary. If nothing is left the item is not trained:
+    ``RationaleMissingError`` is raised (the old fallback to the "empty"
+    target is the target proven to collapse the model). Templates without an
     open think tag skip all of this (no extra generation).
 
     Args:
@@ -952,6 +1064,7 @@ def _build_training_example(
         revision_prompt: Preset name passed to ``revision_prompt_preset``; only
             used for "self_generated".
         think_mode: Passed to ``make_revision_training_example``.
+        rationale_max_tokens: Token cap on the rationale.
 
     Returns:
         A ``BuiltExample``.
@@ -959,6 +1072,9 @@ def _build_training_example(
     Raises:
         InvalidRevisionError: If a self-generated revision fails validation.
             Callers must catch this and skip the training step.
+        RationaleMissingError: ``think_mode="rationale"`` on a think template
+            with no rationale to be had. Callers must catch this and skip
+            the training step.
     """
     validate_training_source(training_source)
     instructions, dialog_style = revision_prompt_preset(revision_prompt)
@@ -987,20 +1103,24 @@ def _build_training_example(
         revision_text = revision
 
     rationale: str | None = None
-    rationale_missing = False
+    rationale_tokens: int | None = None
+    rationale_truncated = False
     messages = [{"role": "user", "content": item.question}]
     if think_mode == "rationale" and template_opens_think(tokenizer, messages):
         if training_source == "self_generated":
-            rationale, _ = split_think(revision)
+            output = revision
         else:
             output = model.generate_response(
                 make_rationale_prompt(item.question, item.correct_answer),
                 use_history=False,
             )
-            rationale, _ = split_think(output or "")
+        rationale, rationale_tokens, rationale_truncated = rationale_from_output(
+            output, tokenizer, rationale_max_tokens
+        )
         if not rationale:
-            rationale = None
-            rationale_missing = True
+            raise RationaleMissingError(
+                f"no rationale for {item.id}: the model's output held no reasoning"
+            )
     example = make_revision_training_example(
         revision, interactions, tokenizer, think_mode=think_mode, rationale=rationale
     )
@@ -1008,7 +1128,8 @@ def _build_training_example(
         example=example,
         revision_text=revision_text,
         rationale_text=rationale,
-        rationale_missing=rationale_missing,
+        rationale_tokens=rationale_tokens,
+        rationale_truncated=rationale_truncated,
     )
 
 
@@ -1073,10 +1194,12 @@ class TrainingOutcome:
     revision_answer: str | None = None
     revision_has_key_terms: bool | None = None
     rehearsal_item_ids: list[str] = dataclasses.field(default_factory=list)
-    # Reasoning placed in the target under think_mode="rationale", and whether
-    # the item fell back to "empty" for want of one.
+    # Reasoning placed in the target under think_mode="rationale"; or, when
+    # none could be had, rationale_missing=True and the item was skipped.
     rationale_text: str | None = None
     rationale_missing: bool = False
+    rationale_tokens: int | None = None
+    rationale_truncated: bool = False
     # Stats for the item's single training call; the losses are the
     # correction's answer loss (what the stop rule watched).
     train_steps: int = 0
@@ -1085,14 +1208,23 @@ class TrainingOutcome:
     train_hit_cap: bool = False
     # Whole-target training loss at the last step.
     train_final_train_loss: float | None = None
-    # Mean rehearsal loss at the last step (None without rehearsal).
+    # Mean rehearsal loss at the last step (None without rehearsal), at the
+    # first step (the hinge anchor), and the (step, example) pairs whose
+    # rehearsal gradient the hinge let through.
     train_rehearsal_final_loss: float | None = None
+    train_rehearsal_initial_loss: float | None = None
+    train_rehearsal_active_steps: int = 0
     # The full stats of the call (one entry; kept as a list for callers that
     # iterate it).
     training_stats: list[TrainingStats] = dataclasses.field(default_factory=list)
 
+    @property
+    def train_rehearsal_pairs(self) -> int:
+        """``steps * k``: what ``train_rehearsal_active_steps`` is out of."""
+        return self.train_steps * len(self.rehearsal_item_ids)
+
     def training_text(self) -> str:
-        """``3 steps, loss 6.05 → 0.58 (train 0.80, rehearsal 0.41)`` for the verbose per-item line."""
+        """``3 steps, loss 6.05 → 0.58 (train 0.80, rehearsal 0.38→0.36 (active 3/9))`` for the verbose per-item line."""
         if self.train_initial_loss is None or self.train_final_loss is None:
             return f"{self.train_steps} steps"
         text = (
@@ -1106,7 +1238,16 @@ class TrainingOutcome:
         ):
             extras.append(f"train {self.train_final_train_loss:.2f}")
         if self.train_rehearsal_final_loss is not None:
-            extras.append(f"rehearsal {self.train_rehearsal_final_loss:.2f}")
+            initial = (
+                f"{self.train_rehearsal_initial_loss:.2f}→"
+                if self.train_rehearsal_initial_loss is not None
+                else ""
+            )
+            extras.append(
+                f"rehearsal {initial}{self.train_rehearsal_final_loss:.2f} "
+                f"(active {self.train_rehearsal_active_steps}/"
+                f"{self.train_rehearsal_pairs})"
+            )
         if extras:
             text += f" ({', '.join(extras)})"
         return text
@@ -1126,6 +1267,8 @@ def _train_one_item(
     rehearsal: list[tuple[TriviaItem, str]] | None = None,
     loss_target: float | None = None,
     rehearsal_weight: float = 1.0,
+    rehearsal_margin: float = 0.05,
+    rationale_max_tokens: int = DEFAULT_RATIONALE_MAX_TOKENS,
 ) -> TrainingOutcome:
     """Build the target, train, and record the event for one item.
 
@@ -1144,17 +1287,29 @@ def _train_one_item(
     rehearsal loss are only reported. One training event is recorded for the
     item with ``training_iterations`` set to the steps actually taken.
 
+    ``rehearsal_margin`` is the rehearsal hinge (``_llm.active_rehearsal``)
+    and ``rationale_max_tokens`` the cap on the rationale in the target.
+
     On ``InvalidRevisionError`` the item is not trained and the outcome carries
-    ``revision_invalid=True`` plus the error text.
+    ``revision_invalid=True`` plus the error text; on ``RationaleMissingError``
+    it is not trained and carries ``rationale_missing=True``.
     """
     try:
         built = _build_training_example(
-            model, item, baseline_response, training_source, revision_prompt, think_mode
+            model,
+            item,
+            baseline_response,
+            training_source,
+            revision_prompt,
+            think_mode,
+            rationale_max_tokens,
         )
     except InvalidRevisionError as e:
         return TrainingOutcome(
             trained=False, revision_invalid=True, revision_error=str(e)
         )
+    except RationaleMissingError:
+        return TrainingOutcome(trained=False, rationale_missing=True)
     correction = built.example
     revision_text = built.revision_text
     tokenizer = model._tokenizer
@@ -1181,6 +1336,7 @@ def _train_one_item(
             loss_target=loss_target,
             max_steps=training_iterations,
             rehearsal_weight=rehearsal_weight,
+            rehearsal_margin=rehearsal_margin,
         )
     else:
         stats = model.train_on_example(
@@ -1199,13 +1355,16 @@ def _train_one_item(
         revision_has_key_terms=revision_has_key_terms,
         rehearsal_item_ids=[r_item.id for r_item, _ in rehearsal],
         rationale_text=built.rationale_text,
-        rationale_missing=built.rationale_missing,
+        rationale_tokens=built.rationale_tokens,
+        rationale_truncated=built.rationale_truncated,
         train_steps=stats.steps,
         train_initial_loss=stats.initial_loss,
         train_final_loss=stats.final_loss,
         train_hit_cap=stats.hit_cap,
         train_final_train_loss=_final_train_loss(stats),
         train_rehearsal_final_loss=stats.rehearsal_final_loss,
+        train_rehearsal_initial_loss=getattr(stats, "rehearsal_initial_loss", None),
+        train_rehearsal_active_steps=getattr(stats, "rehearsal_active_steps", 0),
         training_stats=[stats],
     )
 
@@ -1331,6 +1490,8 @@ class EvaluationHarness:
                     "rehearsal_k": config.rehearsal_k,
                     "rehearsal_max_tokens": config.rehearsal_max_tokens,
                     "rehearsal_weight": config.rehearsal_weight,
+                    "rehearsal_margin": config.rehearsal_margin,
+                    "rationale_max_tokens": config.rationale_max_tokens,
                     "model_kwargs": self._model_kwargs,
                     "lora": dict(
                         zip(("rank", "layers", "scale"), lora_settings(self._model_kwargs))
@@ -1362,11 +1523,15 @@ class EvaluationHarness:
             print(f"Training source: {config.training_source}")
             if config.training_source == "self_generated":
                 print(f"Revision prompt: {config.revision_prompt}")
-            print(f"Think mode: {config.think_mode}")
+            print(
+                f"Think mode: {config.think_mode} "
+                f"(rationale max tokens: {config.rationale_max_tokens})"
+            )
             print(
                 f"Rehearsal k: {config.rehearsal_k} "
                 f"(max tokens: {config.rehearsal_max_tokens}, "
-                f"weight: {config.rehearsal_weight:g})"
+                f"weight: {config.rehearsal_weight:g}, "
+                f"margin: {config.rehearsal_margin:g})"
             )
             print(
                 f"Loss target: {config.loss_target} "
@@ -1468,6 +1633,8 @@ class EvaluationHarness:
                 rehearsal,
                 loss_target=config.loss_target,
                 rehearsal_weight=config.rehearsal_weight,
+                rehearsal_margin=config.rehearsal_margin,
+                rationale_max_tokens=config.rationale_max_tokens,
             )
             item_result.revision_text = outcome.revision_text
             item_result.revision_invalid = outcome.revision_invalid
@@ -1475,14 +1642,23 @@ class EvaluationHarness:
             item_result.rehearsal_item_ids = outcome.rehearsal_item_ids
             item_result.rationale_text = outcome.rationale_text
             item_result.rationale_missing = outcome.rationale_missing
+            item_result.rationale_tokens = outcome.rationale_tokens
+            item_result.rationale_truncated = outcome.rationale_truncated
             item_result.train_steps = outcome.train_steps
             item_result.train_initial_loss = outcome.train_initial_loss
             item_result.train_final_loss = outcome.train_final_loss
             item_result.train_final_train_loss = outcome.train_final_train_loss
             item_result.train_hit_cap = outcome.train_hit_cap
             item_result.train_rehearsal_final_loss = outcome.train_rehearsal_final_loss
-            # An item whose revision was rejected was never trained on; keep it
-            # out of the train metrics but flag it so it is counted.
+            item_result.train_rehearsal_initial_loss = (
+                outcome.train_rehearsal_initial_loss
+            )
+            item_result.train_rehearsal_active_steps = (
+                outcome.train_rehearsal_active_steps
+            )
+            # An item whose revision was rejected, or that had no rationale,
+            # was never trained on; keep it out of the train metrics but flag
+            # it so it is counted.
             item_result.was_trained = outcome.trained
             if outcome.revision_answer is not None:
                 item_result.revision_answer = outcome.revision_answer
@@ -1499,6 +1675,8 @@ class EvaluationHarness:
                     print(
                         f"       Skipped: invalid revision ({outcome.revision_error})"
                     )
+                elif outcome.rationale_missing:
+                    print("       Skipped: no rationale")
                 else:
                     extra = (
                         f", rehearsal {outcome.rehearsal_item_ids}"
@@ -1509,8 +1687,11 @@ class EvaluationHarness:
                         f"       Trained ({outcome.training_text()}, "
                         f"{outcome.training_time_seconds:.1f}s{extra})"
                     )
-                    if outcome.rationale_missing:
-                        print("       Rationale missing; trained on the empty-think target")
+                    if outcome.rationale_truncated:
+                        print(
+                            f"       Rationale truncated to {outcome.rationale_tokens} "
+                            f"tokens (cap {config.rationale_max_tokens})"
+                        )
                     if outcome.revision_answer is not None:
                         was = "✓" if item_result.initial_has_key_terms else "✗"
                         now = "✓" if outcome.revision_has_key_terms else "✗"
@@ -1578,9 +1759,14 @@ class EvaluationHarness:
                 print(f"Invalid revisions (skipped): {result.revision_invalid_count}")
                 print(result.revision_summary_text())
             print(
-                f"Think mode: {config.think_mode}; rehearsal k: {config.rehearsal_k} "
+                f"Think mode: {config.think_mode} "
+                f"(rationale max tokens: {config.rationale_max_tokens}, "
+                f"{result.rationale_missing_count} skipped for no rationale, "
+                f"{result.rationale_truncated_count} truncated); "
+                f"rehearsal k: {config.rehearsal_k} "
                 f"(max tokens: {config.rehearsal_max_tokens}, "
-                f"weight: {config.rehearsal_weight:g})"
+                f"weight: {config.rehearsal_weight:g}, "
+                f"margin: {config.rehearsal_margin:g})"
             )
             print(result.lora_settings_text())
             print(result.collapse_summary_text())
