@@ -173,7 +173,7 @@ def main():
     ap.add_argument("--cycles", type=int, default=40); ap.add_argument("--k", type=int, default=2)
     ap.add_argument("--max_samples", type=int, default=6); ap.add_argument("--max_steps", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2e-5); ap.add_argument("--target", type=float, default=0.15)
-    ap.add_argument("--max_new_tokens", type=int, default=2048); ap.add_argument("--temp", type=float, default=0.7)
+    ap.add_argument("--max_new_tokens", type=int, default=1024); ap.add_argument("--temp", type=float, default=0.7)
     ap.add_argument("--items", default=",".join(ITEMS), help="comma-separated item ids")
     ap.add_argument("--smoke", action="store_true", help="tiny limits to exercise every code path")
     args = ap.parse_args()

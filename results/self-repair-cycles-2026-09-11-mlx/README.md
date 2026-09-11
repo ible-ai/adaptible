@@ -17,7 +17,7 @@ One run of `scripts/cycles_mlx.py` (repo commit `c147acc`), started
 | Training target | the sample's own think block, `</think>`, its first two answer sentences, EOS; loss over the whole target, stop rule on the answer tokens |
 | Steps | at most 4, stop when answer-token loss < 0.15 |
 | Accept rule | the item's 4-prompt score strictly rises; otherwise restore LoRA weights from a copy and assert the checksum |
-| Decode | greedy, 2048-token cap, token-loop breaker (8-token sequence repeated 3 times) |
+| Decode | greedy, 1024-token cap, token-loop breaker (8-token sequence repeated 3 times) |
 
 ## Files
 
