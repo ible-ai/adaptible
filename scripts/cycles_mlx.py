@@ -1,4 +1,12 @@
-"""Iterative repair loop, minimum viable: for each of the 5 MVE items, try up to K
+"""Self-repair cycle loop (the flagship experiment; see README.md and results/).
+
+Repeated greedy self-repair cycles. Each cycle: score every item (original + 3 paraphrases);
+for any item under 4/4 try up to K fresh candidates (the model's OWN correct samples from a
+reference-note prompt at T=0.7), train at most MAX_STEPS steps toward answer-loss 0.15 (no verify rounds: do not sear
+the loss in), keep if the item's 4-prompt score rises (greedy), else checksum-restore.
+No cross-item guard, no rehearsal. Question: does the 20-prompt score stabilise or fall apart?
+
+Derived from mve_loop.py: for each of the 5 MVE items, try up to K
 candidate training targets (the model's OWN correct samples: think + answer sentence,
 from a reference-note prompt at T=0.7; stored ones in outputs/runs/ceiling.json reused).
 Train with the committed recipe, generate the original + 3 paraphrases, judge, and KEEP
@@ -23,7 +31,8 @@ PARA = {
 }
 REH = ["sci_002", "geo_012", "sci_015", "sci_004", "geo_005"]
 LR = float(os.environ.get("LR", "2e-5")); CAP = 30; TARGET = 0.6; VSTEPS = 4
-K = int(os.environ.get("K", "3")); TEMP = 0.7; MAX_SAMPLES = 8
+K = int(os.environ.get("K", "2")); TEMP = 0.7; MAX_SAMPLES = 6
+CYCLES = int(os.environ.get("CYCLES", "8")); MAX_STEPS = int(os.environ.get("MAX_STEPS", "4"))
 ds = {i.id: i for i in generate_default_dataset()}
 m = adaptible.StatefulLLM(model_path=None, num_lora_layers=8, lora_parameters={"rank": 8, "dropout": 0.0, "scale": 10.0}, learning_rate=LR)
 tok = m._tokenizer
@@ -32,7 +41,8 @@ sampler = make_sampler(temp=TEMP)
 def gen(q): return m.generate_response(q, use_history=False) or ""
 def closed(r): return "</think>" in r
 def answer_of(r): return r.split("</think>")[-1].strip()
-def ok(it, r): return closed(r) and contains_key_terms(answer_of(r), it.key_terms)
+WRONG = {"sci_017": ["Proxima", "Alpha Centauri"]}
+def ok(it, r): return closed(r) and contains_key_terms(answer_of(r), it.key_terms) and not any(w.lower() in answer_of(r).lower() for w in WRONG.get(it.id, []))
 def marks(it, outs): return "".join("✓" if ok(it, r) else "✗" for r in outs)
 def loops(outs): return sum(not closed(r) for r in outs)
 def prompts(cid): return [ds[cid].question] + PARA[cid]
@@ -61,16 +71,17 @@ def clean(it, text):
     """Closed think, key term in the first sentence of the answer, answer not a loop."""
     if not closed(text): return False
     first = re.split(r"(?<=[.!?])\s", answer_of(text), 1)[0]
-    return contains_key_terms(first, it.key_terms) and len(first) < 300
-def candidates(cid):
+    return contains_key_terms(first, it.key_terms) and len(first) < 300 and not any(w.lower() in first.lower() for w in WRONG.get(it.id, []))
+def candidates(cid, cycle):
     it = ds[cid]; out = []
-    stored = json.load(open("outputs/runs/ceiling.json")).get(cid, {})
-    for s in stored.get("hinted", []) + stored.get("plain", []):
-        if clean(it, s["text"]) and len(out) < K: out.append(s["text"])
-    seed = 1000
-    while len(out) < K and seed < 1000 + MAX_SAMPLES:
+    start = seed = 1000 + 100 * cycle
+    while len(out) < K and seed < start + MAX_SAMPLES:
         t = sample(hinted(it), seed); seed += 1
-        if clean(it, t): out.append(t)
+        good = clean(it, t)
+        first = re.split(r"(?<=[.!?])\s", answer_of(t), 1)[0][:70] if closed(t) else "(unclosed)"
+        print(f"SAMPLE {cid} seed={seed-1} clean={int(good)} len={len(t.split())}w | {first!r}", flush=True)
+        if good: out.append(t)
+    if not out: print(f"NOCAND {cid} cycle={cycle}", flush=True)
     return out
 def example_from(it, text):
     think = text.split("</think>")[0].strip()
@@ -78,41 +89,29 @@ def example_from(it, text):
     inter = [InteractionHistory(idx=0, user_input=it.question, llm_response="", reviewed=False, timestamp=0.0)]
     return make_revision_training_example(f"[[0]] {ans} [[/0]]", inter, tok, think_mode="rationale", rationale=think), ans
 
-reh_base = {r: gen(ds[r].question) for r in REH}
-reh_items = [ds[r] for r in REH if ok(ds[r], reh_base[r])][:3]
-reh = [collate_training_examples([make_rehearsal_example(r, reh_base[r.id], tok)], tok) for r in reh_items]
-base = {cid: score(cid) for cid in PARA}
-for cid in PARA: print(f"\nBASE {cid} {marks(ds[cid], base[cid][2])} loops={base[cid][1]}", flush=True)
 
-after, info = {}, {}
-for cid in PARA:
-    it = ds[cid]; best_n, best_l, best_outs = base[cid]; snap = snapshot(); accepted = 0; tried = 0
-    if best_n == 4: info[cid] = "skipped"; after[cid] = best_outs; continue
-    for k, text in enumerate(candidates(cid)):
-        tried += 1
-        ex, ans = example_from(it, text); corr = collate_training_examples([ex], tok)
-        target, total, checks = TARGET, 0, 0
-        st = m.train_on_examples(corr, reh, loss_target=target, max_steps=CAP, rehearsal_weight=1.0, rehearsal_margin=0.05); total += st.steps
-        while True:
-            checks += 1; out = gen(it.question); fixed = ok(it, out)
-            if fixed or total >= CAP: break
-            if target <= VERIFY_LOSS_FLOOR and st.final_loss <= VERIFY_LOSS_FLOOR: break
-            target = max(VERIFY_LOSS_FLOOR, min(target / 2, st.final_loss / 2))
-            st = m.train_on_examples(corr, reh, loss_target=target, max_steps=min(VSTEPS, CAP - total), rehearsal_weight=1.0, rehearsal_margin=0.05); total += st.steps
-        mx.clear_cache()
-        n, l, outs = score(cid)
-        keep = n > best_n and l <= best_l
-        print(f"\nCAND {cid} k={k} steps={total} checks={checks} target_answer={ans[:50]!r} | {marks(it, outs)} loops={l} | {'KEEP' if keep else 'restore'}", flush=True)
-        if keep:
-            best_n, best_l, best_outs = n, l, outs; snap = snapshot(); accepted += 1
-            if n == 4: break
-        else:
-            restore(snap)
-    after[cid] = best_outs; info[cid] = f"{tried} tried, {accepted} kept"
-    print(f"\nAFTER {cid} {marks(it, after[cid])} loops={best_l} ({info[cid]})", flush=True)
-
-final = {cid: score(cid) for cid in PARA}
-print("\n\nRESULT item | baseline | after own loop | after all 5 | loop  (marks: original + 3 paraphrases)", flush=True)
-for cid in PARA:
-    print(f"RESULT {cid} | {marks(ds[cid], base[cid][2])} | {marks(ds[cid], after[cid])} | {marks(ds[cid], final[cid][2])} loops={final[cid][1]} | {info[cid]}", flush=True)
-    print(f"FINAL {cid} {[answer_of(r)[:50] if closed(r) else '(no answer)' for r in final[cid][2]]}", flush=True)
+history = []
+for cycle in range(CYCLES):
+    sc = {cid: score(cid) for cid in PARA}
+    for cid in PARA:
+        it = ds[cid]; best_n, best_l, best_outs = sc[cid]
+        if best_n == 4: continue
+        snap = snapshot()
+        for k, text in enumerate(candidates(cid, cycle)):
+            ex, ans = example_from(it, text); corr = collate_training_examples([ex], tok)
+            st = m.train_on_examples(corr, [], loss_target=VERIFY_LOSS_FLOOR, max_steps=MAX_STEPS, rehearsal_weight=0.0, rehearsal_margin=0.05)
+            mx.clear_cache()
+            n, l, outs = score(cid)
+            keep = n > best_n  # greedy on score; an unclosed think already scores as a miss
+            print(f"\nCAND cycle={cycle} {cid} k={k} steps={st.steps} loss={st.final_loss:.2f} target_answer={ans[:45]!r} | {marks(it, outs)} loops={l} | {'KEEP' if keep else 'restore'}", flush=True)
+            if keep:
+                best_n, best_l, best_outs = n, l, outs; snap = snapshot()
+                if n == 4: break
+            else:
+                restore(snap)
+        sc[cid] = (best_n, best_l, best_outs)
+    total = sum(v[0] for v in sc.values()); loops_ = sum(v[1] for v in sc.values())
+    history.append((total, loops_))
+    print(f"\nCYCLE {cycle} score={total}/20 loops={loops_} | " + " ".join(f"{cid}:{marks(ds[cid], sc[cid][2])}" for cid in PARA), flush=True)
+print("\nSUMMARY cycle score loops")
+for i, (t, l) in enumerate(history): print(f"SUMMARY {i} {t}/20 {l}")

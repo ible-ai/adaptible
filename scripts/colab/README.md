@@ -1,7 +1,7 @@
 # Running the self-repair cycle loop on a Colab GPU
 
 `cycles_torch.py` is a self-contained PyTorch/PEFT port of
-`scripts/probes/mve_cycles.py` (no MLX). Same loop, same rules, batched
+`scripts/cycles_mlx.py` (no MLX). Same loop, same rules, batched
 generation, and it checkpoints every cycle so a killed session resumes.
 
 ## One-time

@@ -1,293 +1,125 @@
 # Adaptible
 
-Stateful LLM serving instances that self-reflect and learn from their mistakes during idle time.
+Can a small language model running on a laptop repair its own factual errors,
+using only its own reasoning as the training signal, without falling apart?
 
-## Vision
+Adaptible is the harness for asking that question: an MLX server that stores
+its interactions and LoRA-trains on its own rewrites during idle time, an
+evaluation harness with a results database, and a self-repair loop that
+generates, judges, keeps or restores, and repeats.
 
-Self-improvement is itself a learnable trait. Different model instances undergoing online learning arrive at different end states—some become stronger self-learners than others. Adaptible explores this phenomenon by creating multiple instances that self-update, releasing them into production, and pruning the weaker learners while propagating successful ones.
+## Why a small local model
 
-The core hypothesis: by diversifying training bets autonomously and greedily sampling from winners, we create an evolutionary bottleneck that selects for models adept at self-improvement. The goal isn't just a model that learns—it's discovering which models *learn to learn*.
+The model is `DeepSeek-R1-Distill-Qwen-1.5B`, bf16, on a 16 GB M3 laptop at
+27 tokens per second. It is underpowered for this on purpose. A frontier model
+could absorb a correction and generalise it; that would tell us little. A 1.5B
+distilled reasoner gets basic capitals wrong, loops in its own chain of thought,
+and has parameters so entangled that one update moves dozens of unrelated facts.
+If anything resembling self-teaching shows up here, it shows up under the worst
+conditions, and the failure modes are visible instead of hidden behind capacity.
 
-## Status (September 2026)
+The bar is therefore not "did it become smart". It is: over repeated cycles of
+self-repair, does accuracy on held-out phrasings go up, does the model stay
+coherent, and where does it break.
 
-Plainly, where the project stands:
+## The result
 
-- **The serving loop and the training code work.** `python -m adaptible.local` serves a 1.5B MLX model, records interactions, and `/trigger_review` runs the critique-rewrite-LoRA cycle in the background (fixed in 1.0.0a3; before that the coroutine was never awaited and no training happened).
-- **Every number this repo has ever published is ground-truth supervised fine-tuning, not self-correction.** The eval harness and the meta-learning experiment train on `[[0]] {correct_answer} [[/0]]`, the dataset label, and measure how much of it the model absorbs. That is ordinary LoRA SFT on a known answer.
-- **Self-correction has now been measured once, and it almost never fires.** In the first `--training_source self_generated` run (2026-09-09) the model produced a usable revision for 1 of 84 items; the other 83 were rejected because it ignored the `[[0]] … [[/0]]` format. See [What has been measured](#what-has-been-measured).
-- **The meta-learning result is inconclusive.** Three seeds, 80 training items, and no control arm cannot separate seed effects from run-to-run noise. See [What has been measured](#what-has-been-measured) and `outputs/meta/analysis_report.md`.
-- **The autonomous node's only run trained on 12 web-scraped claims, several of them boilerplate, and its belief-conflict path never fired.** Filters and a stricter default training policy were added since; see `adaptible/_src/autonomous/README.md`.
+Five facts the model gets wrong at baseline (capitals of Morocco, Turkey,
+Australia, the Philippines; the nearest star), each tested on its original
+question plus three hand-written paraphrases: 20 prompts. Each cycle, every item
+still under 4/4 gets up to two candidate training targets sampled from the
+model's own reasoning (temperature 0.7, with a one-line reference note giving
+the answer), is trained at most 4 LoRA steps toward an answer-token loss of
+0.15, and the update is kept only if that item's 4-prompt score rises, otherwise
+the weights are restored from a checksummed copy. Greedy decode, substring
+judge, no rehearsal, no cross-item guard.
 
-## What it does
+![score per cycle](results/self-repair-cycles-2026-09-11-mlx/score.svg)
 
-Adaptible wraps an LLM in a server that:
+| Cycle | 0 | 5 | 10 | 16 | 21 | 26 | 31 |
+|---|---|---|---|---|---|---|---|
+| Correct prompts, of 20 | 8 | 11 | 12 | **16** | 10 | **19** | 7 |
+| Generations with no answer | 3 | 2 | 4 | 0 | 10 | 1 | 13 |
 
-1. Serves responses to user prompts
-2. Stores interaction history (user and assistant turns; assistant turns were dropped before 1.0.0a3)
-3. During idle periods, asks the model to critique and revise its past responses
-4. Fine-tunes the model on those revisions using LoRA
+Baseline before any training: 4 of 20.
 
-## Requirements
+What it shows:
 
-- Python 3.13+
-- Apple Silicon Mac (uses MLX for inference and training)
+1. **Lift.** From 4 to 16 over 16 cycles with the loop count falling to zero,
+   then to 19 at cycle 26. Four of the five facts reached 4/4 and held for
+   multiple cycles. The filter does the work: 53 of 209 candidates were kept,
+   and most rejected candidates made their own item worse.
+2. **Drift, with a mechanism.** From about cycle 17 the model's samples converge
+   on the phrasing of the prompt they are sampled from ("The correct answer
+   is..."), the answer-token loss on its own samples reaches zero, and the
+   kept updates become tie-break noise. Scores then swing between 7 and 19
+   with loops rising.
+3. **No nosedive.** Through 31 cycles the model never collapsed to the bare-word
+   or empty-think regimes that whole-target fine-tuning produced in earlier
+   experiments. It stays a reasoning model that answers most prompts.
+4. **One fact never took.** Turkey trains to zero loss under its own sample's
+   reasoning and still says Istanbul when it thinks freely.
 
-## Installation
+Caveats, stated plainly: five items, one model, greedy decode with a noise
+floor of about two points, a substring judge, and the candidates were sampled
+with the correct answer in the prompt, so the facts came from outside; the
+reasoning that carried them into the weights is the model's own.
+
+Everything behind the plot is in
+[`results/self-repair-cycles-2026-09-11-mlx/`](results/self-repair-cycles-2026-09-11-mlx/):
+a per-cycle table with per-item marks, a per-candidate table with loss, marks,
+and keep/restore, and the exact configuration. A second run of the same loop
+in PyTorch on a Colab T4 is in progress and will be added alongside.
+
+## Reproduce
+
+Mac, MLX (about 25 minutes per cycle):
 
 ```bash
-pip install adaptible
+python -m venv .venv && .venv/bin/pip install -e .
+CYCLES=40 PYTHONPATH=. .venv/bin/python scripts/cycles_mlx.py | tee cycles.log
+.venv/bin/python scripts/cycles_results.py --log cycles.log --out results/my-run
 ```
 
-Or from source:
+Colab, PyTorch (free T4, resumes across sessions): open
+[`scripts/colab/adaptible_cycles.ipynb`](scripts/colab/adaptible_cycles.ipynb)
+in Colab and Run all. Details in [`scripts/colab/README.md`](scripts/colab/README.md).
+
+## What else is here
+
+- **Server.** `python -m adaptible.local` serves the model with a web UI at
+  `/static/`, records interactions, and `/trigger_review` runs the
+  critique-rewrite-LoRA cycle in the background. Endpoints and a streaming
+  client: `adaptible/_src/local/README.md`.
+- **Evaluation harness.** `python -m adaptible.eval` runs baseline, trains on a
+  split, re-infers everything, and writes an HTML report. Responses are stored
+  raw in SQLite and judged at query time. Flags and metrics:
+  `adaptible/_src/eval/README.md`.
+- **Meta-learning experiment.** `scripts/run_meta_experiment.py` runs the eval
+  per seed with checkpoints and a noise-floor option (`--repeats`).
+- **Autonomous node.** `python -m adaptible.autonomous` searches the web,
+  extracts claims, checks them against the model's beliefs, and trains on
+  contradictions. Policy table: `adaptible/_src/autonomous/README.md`.
+
+Earlier measurements with these tools, for the record: fine-tuning directly on
+dataset labels (rank-32 LoRA, 25 steps per item) taught 53 to 59 percent of
+trained facts with no held-out movement; the server's own revision prompt was
+followed by the 1.5B model in 1 of 84 cases; and a three-seed meta-learning run
+was inside binomial noise. Those runs motivated the loop above and are not
+evidence for it.
+
+## Requirements and install
+
+Python 3.13+, Apple Silicon (MLX) for everything except the Colab script.
 
 ```bash
-git clone https://github.com/your-org/adaptible.git
-cd adaptible
+pip install adaptible            # or, from source:
 python -m venv .venv && .venv/bin/pip install -e .
 ```
 
-Version `1.0.0a3`. The wheel is about 200 KB; `torch`, `lm-eval`, and `optax` are no longer dependencies, and `ddgs` replaces `duckduckgo-search`.
+## Tests
 
-## Quick Start
-
-### Run the server
-
-```bash
-python -m adaptible.local
-```
-
-This starts a FastAPI server at `http://127.0.0.1:8000`. The web UI is available at `/static/`.
-
-### Programmatic usage
-
-```python
-import asyncio
-import adaptible
-
-async def main():
-    server = adaptible.MutableHostedLLM(host="127.0.0.1", port=8000)
-    await server.up()
-    await asyncio.sleep(3600)   # server runs until you stop it
-    await server.down()
-
-asyncio.run(main())
-```
-
-### Direct model usage
-
-```python
-import adaptible
-
-model = adaptible.StatefulLLM()
-print(model.generate_response("What is the capital of France?"))
-```
-
-**Gotcha:** `StatefulLLM()` defaults `model_path` to `<outputs>/autonomous/checkpoint` and loads it if the directory exists. Any run after an autonomous run silently starts from those trained weights. Pass `model_path=None` for a fresh model.
-
-## API Endpoints
-
-| Endpoint           | Method | Description                                                              |
-| ------------------ | ------ | ------------------------------------------------------------------------ |
-| `/interact`        | POST   | Send a prompt, get a response                                            |
-| `/stream_interact` | POST   | Stream the response                                                      |
-| `/trigger_review`  | POST   | Start the self-correction cycle as an `asyncio` task (runs since 1.0.0a3) |
-| `/sync`            | GET    | Await outstanding training tasks, then wait for `model.ok`               |
-| `/history`         | GET    | Get all interactions                                                     |
-| `/status`          | GET    | Health check                                                             |
-
-```bash
-curl -X POST http://127.0.0.1:8000/interact \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Hello, how are you?"}'
-
-curl -X POST http://127.0.0.1:8000/trigger_review   # start self-correction
-curl http://127.0.0.1:8000/sync                      # block until training is done
-```
-
-Details and a streaming client are in `adaptible/_src/local/README.md`.
-
-## How the self-correction works
-
-1. The model receives a prompt containing its past interactions
-2. It's asked to identify a response that could be improved and rewrite it, labelled `[[i]] ... [[/i]]`
-3. The rewrite is validated (format, length, not degenerate); invalid rewrites are skipped
-4. The model is fine-tuned on the rewrite using LoRA
-5. The loss mask is zero over the prompt and one over the rewrite, so only the rewrite is learned
-
-This is the path the server uses. Measured once (2026-09-09): the model produced a valid rewrite for 1 of 84 items, so in practice the loop rarely reaches step 4. See [What has been measured](#what-has-been-measured).
-
-## Evaluation
-
-`adaptible.eval` runs baseline inference on a trivia set, trains on a fraction of it, and re-infers everything. Since 1.0.0a3 it has a `--training_source` flag:
-
-- `ground_truth` (default): train on the dataset label. Measures how well the model absorbs a supplied correction. **All published numbers use this.**
-- `self_generated`: train on the model's own revision of its baseline answer. Measures self-correction. **Run once (2026-09-09): 1 of 84 revisions valid.** See [What has been measured](#what-has-been-measured).
-
-```bash
-python -m adaptible.eval --subset 20 --shuffle --no_browser --output /tmp/eval.html
-python -m adaptible.eval --training_source self_generated --shuffle
-```
-
-The judge (`contains_key_terms`) is substring matching, NFKC-normalized and casefolded since 1.0.0a3. It is weak: a response can be graded correct for mentioning a key term in passing, or wrong for phrasing a correct answer differently.
-
-Flags, metrics, dataset format, and the programmatic API are in `adaptible/_src/eval/README.md`.
-
-## Meta-Learning Experiments
-
-`scripts/run_meta_experiment.py` runs the eval per seed with periodic checkpoints and computes, per seed, `meta_learning_score = (late − early window improvement rate) + (early − late window forgetting rate)` over the first and last third of checkpoints. Since 1.0.0a3 the rates are *window* (marginal) rates over the items trained since the previous checkpoint, the score is `None` when any window has fewer than 5 items, `--repeats N` runs a seed N times with an identical shuffle and reports `within_seed_variance`, `across_seed_variance`, and `signal_to_noise`, and `--holdout_every_checkpoint` probes the holdout set at each checkpoint.
-
-```bash
-python scripts/run_meta_experiment.py --seeds 42,123,456 --output outputs/meta/run.json
-```
-
-See `adaptible/_src/eval/README.md` for definitions.
-
-## What has been measured
-
-All measurements used `mlx-community/DeepSeek-R1-Distill-Qwen-1.5B`, LoRA rank 32 on the last 24 layers, 25 training iterations per item, and the ground-truth training source.
-
-**Single eval runs** (`tests/artifacts/*.html`, README numbers before 1.0.0a3): baseline accuracy on the 105-item trivia set is roughly half. After direct SFT on the training split, more trained items are graded correct than were graded wrong afterwards. Holdout accuracy did not move, which is expected: the items are independent facts. These are results of fine-tuning on the answer key, and say nothing about the model's ability to correct itself.
-
-**Meta-learning run** (2025-12-18, `outputs/meta/meta_experiment.json`, ~36 hours): seeds 42, 123, 456; 80 training items each; 8 cumulative checkpoints.
-
-| Seed | Accuracy on the 80 *trained* items after training | Published score (cumulative rates) | Score under current code |
-| ---- | ------------------------------------------------- | ---------------------------------- | ------------------------ |
-| 42   | 58.8%                                             | +0.017                             | `None`                   |
-| 123  | 57.5%                                             | +0.043                             | `None`                   |
-| 456  | 53.8%                                             | −0.052                             | `None`                   |
-
-What those numbers mean:
-
-- 53–59% of the facts the model was directly fine-tuned on are graded correct afterwards. Holdout accuracy was computed and discarded, so generalization is unknown for this run.
-- The published scores were built from cumulative checkpoints (the "late" item set contained the "early" set) and the early windows had 0/5, 1/4, and 1/7 improvements. A spread of −0.052..+0.043 (variance 0.0016) is inside binomial noise at n≈5.
-- No seed was run twice, so none of the spread can be attributed to the seed rather than to sampling and training noise.
-- Loading the shipped JSON with the current code gives `meta_learning_score=None` for every seed, reason `window(s) below 5 trained items`.
-
-The full analysis with a revision note is `outputs/meta/analysis_report.md`.
-
-**Self-generated run** (2026-09-09, `outputs/runs/eval_self_generated.html`, 70 minutes; `--training_source self_generated --shuffle`, 84 train / 21 holdout). The first measurement of the loop as the server runs it:
-
-| | |
-| --- | --- |
-| Revisions the model produced in the required `[[0]] … [[/0]]` format | **1 of 84** |
-| Rejected: no `[[X]]` marker at all (the model just re-answered the question) | 80 |
-| Rejected: opened `[[0]]` but never closed it | 3 |
-| Items trained | 1 |
-| Accuracy on all 105 items, before → after | 60.0% → 58.1% (9 wrong→right, 11 right→wrong) |
-| Mean response length, before → after | 722 → 16 tokens |
-
-What those numbers mean:
-
-- The self-correction loop almost never trains. The 1.5B model follows the revision format about 1% of the time, so `/trigger_review` is a no-op in 99% of cycles. The revision prompt, not the training code, is the bottleneck.
-- The one training that did happen (25 iterations on the 10-word rewrite "The value of π (pi) to two decimal places is 3.14.") changed *every* subsequent answer: the model stopped producing its long chain-of-thought preamble and answered in one line across all 105 questions. A single LoRA update at these hyperparameters reshapes global output style, which is the mechanism behind the "forgetting" seen in the December runs.
-- Net accuracy was flat (−2 items). The 20 flips are the effect of that style change, not of learning the one fact.
-
-**Autonomous node** (2025-12-08, `outputs/autonomous/state.json`): 12 training events, all with an empty prior belief; several claims were page boilerplate. No learning was measured. Details in `adaptible/_src/autonomous/README.md`.
-
-## What would settle it
-
-1. Measure self-correction instead of SFT — **done once**, see above; the next step is a revision prompt the model can actually follow (few-shot, or no markers), then re-run:
-
-   ```bash
-   python -m adaptible.eval --training_source self_generated --shuffle --no_browser --output outputs/eval_self.html
-   python scripts/run_meta_experiment.py --training_source self_generated --seeds 42,123,456
-   ```
-
-2. Get a noise floor: run one seed three times with the same shuffle and compare `within_seed_variance` with `across_seed_variance`:
-
-   ```bash
-   python scripts/run_meta_experiment.py --seeds 42 --repeats 3
-   ```
-
-3. Track generalization at every checkpoint, not only at the end:
-
-   ```bash
-   python scripts/run_meta_experiment.py --seeds 42,123,456 --holdout_every_checkpoint
-   ```
-
-(1) has been run once: the loop trains on ~1% of items with the current prompt. Until (2) has been run there is no evidence that seeds differ.
-
-## Experiment Database
-
-Experiments are persisted to SQLite at `<outputs>/adaptible.db`, where `<outputs>` is `$ADAPTIBLE_OUTPUTS_DIR` if set, else `<cwd>/outputs` (`adaptible/_src/_paths.py`). Responses are stored raw and judged at query time, so grading can change without re-running inference.
-
-```text
-examples        canonical_id, question, ground_truth_answer, key_terms, category,
-                difficulty, source_type (static_trivia | web_scrape), valid_at, created_at
-experiments     name, experiment_type (eval | autonomous), config_json, model_checkpoint,
-                started_at, completed_at
-responses       example_id, experiment_id, response_text, response_raw,
-                phase (baseline | post_training), token_count, max_tokens, truncated
-training_events example_id, experiment_id, training_iterations, training_time_seconds
-```
-
-```bash
-python scripts/explore_db.py            # REPL with helpers
-python scripts/explore_db.py --demo     # create demo data
-python scripts/explore_db.py --summary 1
-```
-
-`notebooks/explore_experiments.ipynb` uses `Database.compute_metrics`, `get_regressions`, `get_improvements`, `get_stuck`, and `export_experiment_summary`.
-
-## Autonomous Learning
-
-```bash
-python -m adaptible.autonomous --cycles 3 --no_browser
-```
-
-Search → extract claims → ask the model what it believes → fact-check → train on contradicted beliefs → re-verify. State goes to `<outputs>/autonomous/state.json`, logs to `<outputs>/autonomous/logs/`, weights to `<outputs>/autonomous/checkpoint`. `NodeState.load` on the shipped `state.json` crashed before 1.0.0a3. Claim filtering, the training policy (`train_on_new_knowledge=False` by default), and the CLI flags are documented in `adaptible/_src/autonomous/README.md`.
-
-## `StatefulLLM` parameters
-
-| Parameter                        | Default                                       | Description                                       |
-| -------------------------------- | --------------------------------------------- | ------------------------------------------------- |
-| `model_name`                     | `mlx-community/DeepSeek-R1-Distill-Qwen-1.5B` | HuggingFace model path                            |
-| `model_path`                     | `<outputs>/autonomous/checkpoint`             | Loaded if it exists; `None` for a fresh model     |
-| `learning_rate`                  | `5e-5`                                        | Training learning rate                            |
-| `max_tokens`                     | `2048`                                        | Max tokens per response                           |
-| `epochs`                         | `5`                                           | Training epochs per revision                      |
-| `num_lora_layers`                | `24`                                          | Number of LoRA layers                             |
-| `lora_parameters`                | `{"rank": 32, "dropout": 0.0, "scale": 10.0}` | LoRA config                                       |
-| `loop_detection_sequence_length` | `8`                                           | Token sequence length for loop check              |
-| `loop_detection_max_repetitions` | `3`                                           | Repetitions before stopping generation            |
-
-## Limitations
-
-- No measurement of self-correction exists yet; see [Status](#status-september-2026).
-- The judge is substring matching against key terms.
-- Apple Silicon only (MLX dependency).
-
-## Project Structure
-
-```text
-.
-├── adaptible/
-│   ├── __init__.py              # Public API (re-exports from _src)
-│   ├── eval/ local/ autonomous/ revise/   # Thin alias packages over _src/*; make
-│   │                            #   `python -m adaptible.eval` etc. work
-│   ├── _src/
-│   │   ├── _api.py              # FastAPI routes (Adaptible, ModelProtocol)
-│   │   ├── _classes.py          # Data models
-│   │   ├── _llm.py              # StatefulLLM: generation, LoRA training, loop detection
-│   │   ├── _paths.py            # $ADAPTIBLE_OUTPUTS_DIR / <cwd>/outputs resolution
-│   │   ├── db.py                # SQLite layer and default_judge
-│   │   ├── autonomous/          # AutonomousNode + CLI (README.md inside)
-│   │   ├── eval/                # dataset.py, harness.py, meta.py, report.py + CLI (README.md inside)
-│   │   ├── local/               # _server.py (MutableHostedLLM) + CLI (README.md inside)
-│   │   ├── revise/              # revise.py, revise_test.py
-│   │   ├── static/              # Web UI
-│   │   └── dev/                 # Debug scripts, not in the test suite
-│   └── tests/                   # Unit and integration tests
-├── examples/                    # server_demo.py, online_learning_demo.py
-├── notebooks/explore_experiments.ipynb
-├── outputs/                     # Default $ADAPTIBLE_OUTPUTS_DIR; meta/ and autonomous/state.json are tracked
-├── scripts/                     # run_meta_experiment.py, explore_db.py
-└── pyproject.toml
-```
-
-## Running Tests
-
-Fast, model-free (these run in GitHub Actions on macOS):
+Model-free, run in CI on macOS:
 
 ```bash
 python -m unittest adaptible.tests.classes_test adaptible.tests.api_test \
@@ -295,13 +127,32 @@ python -m unittest adaptible.tests.classes_test adaptible.tests.api_test \
     adaptible.tests.autonomous_test adaptible._src.revise.revise_test -v
 ```
 
-Slow, downloads and trains a real model, mutates `<outputs>/autonomous/checkpoint`:
+`adaptible.tests.llm_test` and `adaptible.tests.integration_test` download and
+train a real model; set `ADAPTIBLE_OUTPUTS_DIR` to a scratch directory first.
 
-```bash
-python -m unittest adaptible.tests.llm_test adaptible.tests.integration_test -v
+## Layout
+
+```text
+adaptible/            package; public API re-exported from adaptible/__init__.py
+  _src/_llm.py        StatefulLLM: generation, LoRA training, loop detection
+  _src/revise/        prompt -> training example, loss masks (revise_test.py guards alignment)
+  _src/eval/          dataset, harness, meta-learning, reports
+  _src/local/         FastAPI server
+  _src/autonomous/    web-search learning node
+scripts/cycles_mlx.py           the self-repair loop (MLX)
+scripts/cycles_results.py       log -> results/ tables and plot
+scripts/colab/                  PyTorch port of the loop + notebook
+results/                        flagship results, parsable
 ```
 
-Three classes in `llm_test` (`ConversationHistoryTest`, `TokenLoopDetectionTest`, `ValidationTest`) are model-free; the rest are not. Set `ADAPTIBLE_OUTPUTS_DIR` to a scratch directory to keep test state out of the repo.
+## Limitations
+
+- Substring judge against key terms; a correct answer phrased differently is
+  graded wrong, a term mentioned in passing is graded right.
+- Greedy decode on a small model flips on near-tie prompts under weight changes
+  far below what training makes; treat single-cycle differences under about
+  two points as noise.
+- Apple Silicon only for the MLX paths.
 
 ## License
 

@@ -9,17 +9,11 @@ __pycache__/
 dist/
 build/
 
-# Run-time state (published results under outputs/meta/ and
-# outputs/autonomous/state.json are intentionally tracked)
-outputs/adaptible.db
-outputs/**/checkpoint/
-outputs/**/logs/
+# Run-time state and experiment logs (never tracked; flagship results live in results/)
+outputs/
 
 # Generated test reports
 adaptible/tests/artifacts/*.html
 
-# experiment launcher scratch
-outputs/runs/*.log
-outputs/runs/nohup.out
-outputs/runs/status.txt
-outputs/runs/nohup_2x2.out
+# Local-only session notes
+CLAUDE.local.md
