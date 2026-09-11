@@ -190,6 +190,7 @@ def main():
     def status(cycle, total, lp, state):
         status_path.write_text(json.dumps(dict(cycle=cycle, score=total, loops=lp, state=state, host=socket.gethostname(),
                                                device=device, time=time.strftime("%Y-%m-%d %H:%M:%S"), args=vars(args)), indent=1))
+        (out / "status.txt").write_text(f"adaptible cycles status: cycle={cycle} score={total} loops={lp} state={state} time={time.strftime('%Y-%m-%d %H:%M:%S')} device={device}\n")
 
     def score(it):
         outs = r.generate(prompts(it))
