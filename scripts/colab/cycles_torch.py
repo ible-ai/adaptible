@@ -187,10 +187,10 @@ def main():
     if start and adapter_path.exists():
         r.load_adapter(adapter_path); print(f"RESUME from cycle {start} checksum={r.checksum():.3f}", flush=True)
 
-    def status(cycle, total, lp, state):
+    def status(cycle, total, lp, state, note=""):
         status_path.write_text(json.dumps(dict(cycle=cycle, score=total, loops=lp, state=state, host=socket.gethostname(),
                                                device=device, time=time.strftime("%Y-%m-%d %H:%M:%S"), args=vars(args)), indent=1))
-        (out / "status.txt").write_text(f"adaptible cycles status: cycle={cycle} score={total} loops={lp} state={state} time={time.strftime('%Y-%m-%d %H:%M:%S')} device={device}\n")
+        (out / "status.txt").write_text(f"adaptible cycles status: cycle={cycle} score={total} loops={lp} state={state} time={time.strftime('%Y-%m-%d %H:%M:%S')} device={device} {note}\n")
 
     def score(it):
         outs = r.generate(prompts(it))
@@ -198,7 +198,9 @@ def main():
 
     for cycle in range(start, args.cycles):
         t0 = time.time(); status(cycle, None, None, "running")
-        sc = {k: score(it) for k, it in items.items()}
+        sc = {}
+        for k, it in items.items():
+            sc[k] = score(it); status(cycle, None, None, "running", f"scored {k} {marks(it, sc[k][2])} {round(time.time()-t0)}s")
         if cycle == 0:
             for k, it in items.items(): print(f"BASE {k} {marks(it, sc[k][2])} loops={sc[k][1]}", flush=True)
         for k, it in items.items():
@@ -222,6 +224,7 @@ def main():
                 keep = n > best_n
                 history["cand"][k][0] += 1
                 print(f"CAND cycle={cycle} {k} k={j} steps={steps} loss={loss:.2f} target_answer={ans[:45]!r} | {marks(it, outs)} loops={l} | {'KEEP' if keep else 'restore'}", flush=True)
+                status(cycle, None, None, "running", f"cand {k} k={j} steps={steps} loss={loss:.2f} {marks(it, outs)} {'KEEP' if keep else 'restore'} {round(time.time()-t0)}s")
                 if keep:
                     best_n, best_l, best_outs = n, l, outs; snap = r.snapshot(); history["cand"][k][1] += 1
                     if n == 4: break
