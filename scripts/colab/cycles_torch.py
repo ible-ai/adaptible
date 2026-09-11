@@ -82,7 +82,8 @@ class Runner:
         self.tok = AutoTokenizer.from_pretrained(model_name)
         self.tok.padding_side = "left"
         if self.tok.pad_token_id is None: self.tok.pad_token = self.tok.eos_token
-        bf16_ok = device == "cuda" and torch.cuda.is_bf16_supported()
+        # bf16 only on Ampere or newer (capability >= 8); a T4 (7.5) reports bf16 "supported" but emulates it slowly
+        bf16_ok = device == "cuda" and torch.cuda.get_device_capability()[0] >= 8
         self.dtype = torch.bfloat16 if bf16_ok else (torch.float16 if device == "cuda" else torch.float32)
         base = AutoModelForCausalLM.from_pretrained(model_name, dtype=self.dtype).to(device)
         n_layers = base.config.num_hidden_layers
@@ -95,7 +96,8 @@ class Runner:
         self.device, self.lr, self.max_new = device, lr, max_new_tokens
         self.eos = self.tok.eos_token
         self.new_optimizer()
-        print(f"model={model_name} dtype={self.dtype} device={device} trainable={sum(p.numel() for p in self.model.parameters() if p.requires_grad)}", flush=True)
+        gpu = torch.cuda.get_device_name() if device == "cuda" else device
+        print(f"model={model_name} dtype={self.dtype} device={device} gpu={gpu} trainable={sum(p.numel() for p in self.model.parameters() if p.requires_grad)}", flush=True)
 
     def new_optimizer(self):
         self.opt = torch.optim.AdamW([p for p in self.model.parameters() if p.requires_grad], lr=self.lr, weight_decay=0.01)
