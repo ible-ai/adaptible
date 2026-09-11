@@ -52,9 +52,10 @@ On five facts the model gets wrong, each tested in four phrasings, the
 self-repair loop raised accuracy on the twenty prompts from 4 to 16 over
 sixteen cycles and to 19 by cycle 26, with the model coherent throughout.
 After that its own samples converge on one phrasing, the updates shrink to
-nothing, and the score drifts without collapsing. One of the five facts was
-never learned. The write-up, with the data behind each number, is in
-[`results/`](results/README.md).
+nothing, and the score drifts between 7 and 19 without collapsing. The last
+three of forty cycles score 18, 19, and 18 with no loops, and the one fact
+that had resisted for 37 cycles is learned. The write-up, with the data behind
+each number, is in [`results/`](results/README.md).
 
 ## Demo
 

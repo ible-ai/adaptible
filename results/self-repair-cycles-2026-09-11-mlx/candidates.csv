@@ -208,3 +208,63 @@ cycle,item,k,steps,loss,target,marks,loops,kept
 31,geo_013,1,1,0.0,The correct answer is Manila.,✗✗✗✗,4,False
 31,sci_017,0,1,0.05,The correct answer is the Sun.,✗✗✗✗,4,False
 31,sci_017,1,1,0.09,The correct answer is the Sun.,✓✗✗✗,3,False
+32,geo_010,0,1,0.01,The correct answer is Rabat.,✗✗✗✗,4,False
+32,geo_010,1,1,0.01,The correct answer is Rabat.,✗✗✗✗,4,False
+32,geo_004,0,1,0.0,The correct answer is Ankara.,✓✓✗✗,2,True
+32,geo_004,1,1,0.0,The correct answer is Ankara.,✓✗✗✓,2,False
+32,geo_001,0,1,0.0,The correct answer is Canberra.,✗✗✗✗,4,False
+32,geo_013,0,1,0.0,The correct answer is Manila.,✓✗✗✓,2,True
+32,geo_013,1,1,0.0,The correct answer is Manila.,✓✗✗✓,2,False
+32,sci_017,0,1,0.1,The nearest star to Earth is the Sun.,✓✓✗✓,1,True
+32,sci_017,1,2,0.12,The correct answer is the Sun.,✗✗✗✗,4,False
+33,geo_010,0,1,0.02,The correct answer is Rabat.,✓✓✓✓,0,True
+33,geo_004,0,1,0.0,The correct answer is Ankara.,✓✗✗✓,2,True
+33,geo_004,1,1,0.0,The correct answer is Ankara.,✓✗✗✓,2,False
+33,geo_001,0,1,0.0,The correct answer is Canberra.,✗✗✗✗,4,False
+33,geo_001,1,1,0.0,The correct answer is Canberra.,✓✗✗✓,2,False
+33,geo_013,0,1,0.0,The correct answer is Manila.,✗✓✗✗,3,False
+33,geo_013,1,1,0.0,The correct answer is Manila.,✗✗✗✗,4,False
+33,sci_017,0,1,0.11,The correct answer is the Sun.,✗✗✗✓,3,False
+34,geo_010,0,1,0.01,The correct answer is Rabat.,✗✗✗✗,3,False
+34,geo_010,1,2,0.02,The correct answer is **Rabat**.,✓✗✗✓,2,False
+34,geo_004,0,1,0.0,The correct answer is Ankara.,✗✗✗✗,4,False
+34,geo_001,0,1,0.0,The correct answer is Canberra.,✗✗✗✗,4,False
+34,geo_013,0,1,0.0,The correct answer is Manila.,✗✗✗✗,4,False
+34,geo_013,1,1,0.0,The correct answer is Manila.,✓✗✗✓,2,False
+34,sci_017,0,2,0.03,The correct answer is the Sun.,✓✗✓✗,2,True
+34,sci_017,1,1,0.02,The correct answer is the Sun.,✗✗✗✗,4,False
+35,geo_010,0,1,0.01,The correct answer is Rabat.,✗✗✗✗,4,False
+35,geo_001,0,1,0.0,The correct answer is Canberra.,✓✗✗✓,2,True
+35,geo_013,0,1,0.0,The correct answer is Manila.,✓✗✗✓,2,True
+35,geo_013,1,1,0.0,The correct answer is Manila.,✗✗✗✓,3,False
+35,sci_017,0,1,0.08,The correct answer is the Sun.,✗✗✗✓,3,False
+35,sci_017,1,1,0.01,The correct answer is the Sun.,✓✗✗✓,2,False
+36,geo_010,0,1,0.03,The correct answer is Rabat.,✓✓✗✓,1,False
+36,geo_010,1,1,0.01,The correct answer is Rabat.,✓✗✗✓,2,False
+36,geo_004,0,1,0.0,The correct answer is Ankara.,✓✗✗✓,2,False
+36,geo_004,1,1,0.0,The correct answer is Ankara.,✗✗✗✓,3,False
+36,geo_001,0,1,0.0,The correct answer is Canberra.,✓✗✗✓,2,False
+36,geo_001,1,1,0.0,The correct answer is Canberra.,✓✗✗✓,2,False
+36,geo_013,0,1,0.0,The correct answer is Manila.,✓✓✗✓,1,True
+36,geo_013,1,1,0.0,The correct answer is Manila.,✓✗✗✓,2,False
+37,geo_010,0,1,0.01,The correct answer is Rabat.,✓✓✗✓,1,True
+37,geo_010,1,1,0.01,The correct answer is Rabat.,✓✓✗✓,1,False
+37,geo_004,0,1,0.0,The correct answer is Ankara.,✓✓✗✓,0,False
+37,geo_004,1,1,0.0,The correct answer is Ankara.,✓✓✓✓,0,True
+37,geo_001,0,1,0.0,The correct answer is Canberra.,✓✓✗✓,1,True
+37,geo_001,1,1,0.0,The correct answer is Canberra.,✓✓✗✓,1,False
+37,geo_013,0,1,0.0,The correct answer is Manila.,✓✓✓✓,0,True
+37,sci_017,0,1,0.01,The correct answer is the Sun.,✗✓✗✗,3,False
+37,sci_017,1,1,0.01,The correct answer is the Sun.,✓✓✓✓,0,True
+38,geo_010,0,1,0.0,The correct answer is Rabat.,✓✓✓✓,0,True
+38,geo_004,0,1,0.0,The correct answer is Ankara.,✓✓✓✓,0,True
+38,geo_001,0,1,0.0,The correct answer is Canberra.,✓✓✗✓,1,False
+38,geo_001,1,1,0.0,The correct answer is Canberra.,✓✓✓✓,0,True
+38,geo_013,0,1,0.0,The correct answer is Manila.,✓✓✗✓,0,True
+38,geo_013,1,1,0.0,The correct answer is Manila.,✓✓✗✓,1,False
+39,geo_004,0,1,0.0,The correct answer is Ankara.,✓✓✗✓,0,False
+39,geo_004,1,1,0.0,The correct answer is Ankara.,✓✓✗✓,0,False
+39,geo_013,0,1,0.0,The correct answer is Manila.,✓✓✗✓,1,False
+39,geo_013,1,1,0.0,The correct answer is Manila.,✓✓✗✓,1,False
+39,sci_017,0,1,0.08,The correct answer is the Sun.,✓✓✗✓,1,True
+39,sci_017,1,1,0.0,The correct answer is the Sun.,✓✓✓✓,0,True
