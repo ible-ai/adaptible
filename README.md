@@ -1,121 +1,98 @@
 # Adaptible
 
-Can a small language model running on a laptop repair its own factual errors,
-using only its own reasoning as the training signal, without falling apart?
+A small language model that runs on your Mac, keeps what you say to it, and
+retrains itself on its own corrections while idle.
 
-Adaptible is the harness for asking that question: an MLX server that stores
-its interactions and LoRA-trains on its own rewrites during idle time, an
-evaluation harness with a results database, and a self-repair loop that
-generates, judges, keeps or restores, and repeats.
+Adaptible wraps an MLX model (`DeepSeek-R1-Distill-Qwen-1.5B` by default) in a
+server that records every interaction, periodically asks the model to critique
+and rewrite its past answers, and LoRA-fine-tunes the model on the rewrites.
+Around that core it provides an evaluation harness to measure whether such
+updates actually help, and a self-repair loop that keeps an update only when
+the model's own generated answers get better.
 
-## Why a small local model
+Whether this works, and how far, is a research question. The experiments and
+their data are in [`results/`](results/README.md).
 
-The model is `DeepSeek-R1-Distill-Qwen-1.5B`, bf16, on a 16 GB M3 laptop at
-27 tokens per second. It is underpowered for this on purpose. A frontier model
-could absorb a correction and generalise it; that would tell us little. A 1.5B
-distilled reasoner gets basic capitals wrong, loops in its own chain of thought,
-and has parameters so entangled that one update moves dozens of unrelated facts.
-If anything resembling self-teaching shows up here, it shows up under the worst
-conditions, and the failure modes are visible instead of hidden behind capacity.
+## What you can do with it
 
-The bar is therefore not "did it become smart". It is: over repeated cycles of
-self-repair, does accuracy on held-out phrasings go up, does the model stay
-coherent, and where does it break.
+| | Command |
+|---|---|
+| Serve the model with a web UI, record interactions, train on idle | `python -m adaptible.local` |
+| Measure baseline accuracy, train on a split, re-measure | `python -m adaptible.eval --subset 20 --shuffle --no_browser` |
+| Run the self-repair loop: generate, judge, keep or restore, repeat | `PYTHONPATH=. python scripts/cycles_mlx.py` |
+| Same loop on a CUDA GPU (Colab notebook, resumes across sessions) | `scripts/colab/adaptible_cycles.ipynb` |
+| Learn from live web search against the model's own beliefs | `python -m adaptible.autonomous --cycles 3 --no_browser` |
+| Repeat the eval per seed with checkpoints and a noise floor | `python scripts/run_meta_experiment.py --seeds 42 --repeats 3` |
 
-## The result
+## Install
 
-Five facts the model gets wrong at baseline (capitals of Morocco, Turkey,
-Australia, the Philippines; the nearest star), each tested on its original
-question plus three hand-written paraphrases: 20 prompts. Each cycle, every item
-still under 4/4 gets up to two candidate training targets sampled from the
-model's own reasoning (temperature 0.7, with a one-line reference note giving
-the answer), is trained at most 4 LoRA steps toward an answer-token loss of
-0.15, and the update is kept only if that item's 4-prompt score rises, otherwise
-the weights are restored from a checksummed copy. Greedy decode, substring
-judge, no rehearsal, no cross-item guard.
-
-![score per cycle](results/self-repair-cycles-2026-09-11-mlx/score.svg)
-
-| Cycle | 0 | 5 | 10 | 16 | 21 | 26 | 31 |
-|---|---|---|---|---|---|---|---|
-| Correct prompts, of 20 | 8 | 11 | 12 | **16** | 10 | **19** | 7 |
-| Generations with no answer | 3 | 2 | 4 | 0 | 10 | 1 | 13 |
-
-Baseline before any training: 4 of 20.
-
-What it shows:
-
-1. **Lift.** From 4 to 16 over 16 cycles with the loop count falling to zero,
-   then to 19 at cycle 26. Four of the five facts reached 4/4 and held for
-   multiple cycles. The filter does the work: 53 of 209 candidates were kept,
-   and most rejected candidates made their own item worse.
-2. **Drift, with a mechanism.** From about cycle 17 the model's samples converge
-   on the phrasing of the prompt they are sampled from ("The correct answer
-   is..."), the answer-token loss on its own samples reaches zero, and the
-   kept updates become tie-break noise. Scores then swing between 7 and 19
-   with loops rising.
-3. **No nosedive.** Through 31 cycles the model never collapsed to the bare-word
-   or empty-think regimes that whole-target fine-tuning produced in earlier
-   experiments. It stays a reasoning model that answers most prompts.
-4. **One fact never took.** Turkey trains to zero loss under its own sample's
-   reasoning and still says Istanbul when it thinks freely.
-
-Caveats, stated plainly: five items, one model, greedy decode with a noise
-floor of about two points, a substring judge, and the candidates were sampled
-with the correct answer in the prompt, so the facts came from outside; the
-reasoning that carried them into the weights is the model's own.
-
-Everything behind the plot is in
-[`results/self-repair-cycles-2026-09-11-mlx/`](results/self-repair-cycles-2026-09-11-mlx/):
-a per-cycle table with per-item marks, a per-candidate table with loss, marks,
-and keep/restore, and the exact configuration. A second run of the same loop
-in PyTorch on a Colab T4 is in progress and will be added alongside.
-
-## Reproduce
-
-Mac, MLX (about 25 minutes per cycle):
+Python 3.13+ and an Apple Silicon Mac (MLX). The Colab script is the one
+exception and needs only PyTorch.
 
 ```bash
+pip install adaptible
+# or from source
+git clone https://github.com/ible-ai/adaptible && cd adaptible
 python -m venv .venv && .venv/bin/pip install -e .
-CYCLES=40 PYTHONPATH=. .venv/bin/python scripts/cycles_mlx.py | tee cycles.log
-.venv/bin/python scripts/cycles_results.py --log cycles.log --out results/my-run
 ```
 
-Colab, PyTorch (free T4, resumes across sessions): open
-[`scripts/colab/adaptible_cycles.ipynb`](scripts/colab/adaptible_cycles.ipynb)
-in Colab and Run all. Details in [`scripts/colab/README.md`](scripts/colab/README.md).
-
-## What else is here
-
-- **Server.** `python -m adaptible.local` serves the model with a web UI at
-  `/static/`, records interactions, and `/trigger_review` runs the
-  critique-rewrite-LoRA cycle in the background. Endpoints and a streaming
-  client: `adaptible/_src/local/README.md`.
-- **Evaluation harness.** `python -m adaptible.eval` runs baseline, trains on a
-  split, re-infers everything, and writes an HTML report. Responses are stored
-  raw in SQLite and judged at query time. Flags and metrics:
-  `adaptible/_src/eval/README.md`.
-- **Meta-learning experiment.** `scripts/run_meta_experiment.py` runs the eval
-  per seed with checkpoints and a noise-floor option (`--repeats`).
-- **Autonomous node.** `python -m adaptible.autonomous` searches the web,
-  extracts claims, checks them against the model's beliefs, and trains on
-  contradictions. Policy table: `adaptible/_src/autonomous/README.md`.
-
-Earlier measurements with these tools, for the record: fine-tuning directly on
-dataset labels (rank-32 LoRA, 25 steps per item) taught 53 to 59 percent of
-trained facts with no held-out movement; the server's own revision prompt was
-followed by the 1.5B model in 1 of 84 cases; and a three-seed meta-learning run
-was inside binomial noise. Those runs motivated the loop above and are not
-evidence for it.
-
-## Requirements and install
-
-Python 3.13+, Apple Silicon (MLX) for everything except the Colab script.
+## Quick start
 
 ```bash
-pip install adaptible            # or, from source:
-python -m venv .venv && .venv/bin/pip install -e .
+python -m adaptible.local
 ```
+
+Starts a FastAPI server on `http://127.0.0.1:8000` with a chat UI at
+`/static/`. Talk to it, then trigger a self-correction pass:
+
+```bash
+curl -X POST http://127.0.0.1:8000/interact -H "Content-Type: application/json" \
+     -d '{"prompt": "What is the capital of Australia?"}'
+curl -X POST http://127.0.0.1:8000/trigger_review   # critique, rewrite, train in the background
+curl http://127.0.0.1:8000/sync                      # block until training is done
+```
+
+From Python:
+
+```python
+import adaptible
+
+model = adaptible.StatefulLLM(model_path=None)   # fresh weights; see the gotcha below
+print(model.generate_response("What is the capital of Australia?"))
+```
+
+Gotcha: `StatefulLLM()` loads `<outputs>/autonomous/checkpoint` if it exists,
+so anything run after an autonomous session starts from those trained weights.
+Pass `model_path=None` when you want the base model.
+
+## How the pieces fit
+
+- **`StatefulLLM`** (`adaptible/_src/_llm.py`) owns the model, tokenizer, and
+  optimiser. Base weights are frozen; only LoRA adapters on the last N layers
+  train. Generation has two loop breakers (repeated lines, repeated token
+  sequences) because a 1.5B reasoner loops often enough to hang a run
+  otherwise.
+- **Revision** (`adaptible/_src/revise/`) turns a conversation into a training
+  example: the model rewrites one of its turns, the rewrite is validated, and
+  the loss mask covers only the rewrite, never the prompt.
+- **Server** (`adaptible/_src/local/`) exposes `/interact`, `/stream_interact`,
+  `/trigger_review`, `/sync`, `/history`, `/status`. Endpoints and a streaming
+  client are in its README.
+- **Evaluation** (`adaptible/_src/eval/`) runs baseline, trains, re-infers, and
+  writes an HTML report. Every response is stored raw in SQLite
+  (`<outputs>/adaptible.db`) and judged at query time, so grading can change
+  without re-running inference. Flags and metrics are in its README.
+- **Self-repair loop** (`scripts/cycles_mlx.py`, `scripts/colab/cycles_torch.py`)
+  samples training targets from the model's own reasoning, trains a few steps,
+  generates the answers again, and keeps the update only if they improved,
+  restoring the weights otherwise. `scripts/cycles_results.py` turns a run log
+  into the tables under `results/`.
+- **Autonomous node** (`adaptible/_src/autonomous/`) searches the web, extracts
+  claims, compares them with what the model believes, and trains on
+  contradictions. Its README has the policy table.
+
+`<outputs>` is `$ADAPTIBLE_OUTPUTS_DIR` if set, else `./outputs`. Everything
+persisted lives there: the database, checkpoints, state, logs.
 
 ## Tests
 
@@ -133,26 +110,24 @@ train a real model; set `ADAPTIBLE_OUTPUTS_DIR` to a scratch directory first.
 ## Layout
 
 ```text
-adaptible/            package; public API re-exported from adaptible/__init__.py
-  _src/_llm.py        StatefulLLM: generation, LoRA training, loop detection
-  _src/revise/        prompt -> training example, loss masks (revise_test.py guards alignment)
-  _src/eval/          dataset, harness, meta-learning, reports
-  _src/local/         FastAPI server
-  _src/autonomous/    web-search learning node
-scripts/cycles_mlx.py           the self-repair loop (MLX)
-scripts/cycles_results.py       log -> results/ tables and plot
-scripts/colab/                  PyTorch port of the loop + notebook
-results/                        flagship results, parsable
+adaptible/                package; public API re-exported from adaptible/__init__.py
+  _src/_llm.py            StatefulLLM: generation, LoRA training, loop detection
+  _src/revise/            conversation -> training example, loss masks
+  _src/eval/              dataset, harness, meta-learning, reports
+  _src/local/             FastAPI server and web UI
+  _src/autonomous/        web-search learning node
+scripts/cycles_mlx.py     self-repair loop (MLX)
+scripts/cycles_results.py run log -> results tables and plot
+scripts/colab/            PyTorch port of the loop, Colab notebook
+results/                  experiment report and data
 ```
 
 ## Limitations
 
-- Substring judge against key terms; a correct answer phrased differently is
-  graded wrong, a term mentioned in passing is graded right.
-- Greedy decode on a small model flips on near-tie prompts under weight changes
-  far below what training makes; treat single-cycle differences under about
-  two points as noise.
-- Apple Silicon only for the MLX paths.
+- The judge is substring matching against key terms.
+- Greedy decode on a small model flips on near-tie prompts under tiny weight
+  changes; single-run differences of a couple of items are noise.
+- Apple Silicon only, except the Colab script.
 
 ## License
 
