@@ -69,11 +69,11 @@ class LoopStop(StoppingCriteria):
     """Per-sequence stop when the last LOOP_SEQ tokens repeated LOOP_REPS times."""
     def __init__(self, prompt_len): self.prompt_len = prompt_len
     def __call__(self, input_ids, scores, **kw):
-        out = []
-        for row in input_ids.tolist():
-            gen = row[self.prompt_len:]
-            out.append(token_loop(gen))
-        return torch.tensor(out, dtype=torch.bool, device=input_ids.device)
+        n = LOOP_SEQ * LOOP_REPS
+        if input_ids.shape[1] - self.prompt_len < n:
+            return torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        tail = input_ids[:, -n:].view(input_ids.shape[0], LOOP_REPS, LOOP_SEQ)
+        return (tail == tail[:, -1:, :]).all(dim=2).all(dim=1)
 
 
 # ----------------------------------------------------------------------------- model
@@ -200,16 +200,23 @@ def main():
 
     for cycle in range(start, args.cycles):
         t0 = time.time(); status(cycle, None, None, "running")
+        allq = [(k, q) for k, it in items.items() for q in prompts(it)]
+        outs_all = r.generate([q for _, q in allq])
         sc = {}
         for k, it in items.items():
-            sc[k] = score(it); status(cycle, None, None, "running", f"scored {k} {marks(it, sc[k][2])} {round(time.time()-t0)}s")
+            outs = [o for (kk, _), o in zip(allq, outs_all) if kk == k]
+            sc[k] = (sum(ok(it, o) for o in outs), loops(outs), outs)
+        status(cycle, None, None, "running", f"scored all {sum(v[0] for v in sc.values())} {round(time.time()-t0)}s")
         if cycle == 0:
             for k, it in items.items(): print(f"BASE {k} {marks(it, sc[k][2])} loops={sc[k][1]}", flush=True)
-        for k, it in items.items():
+        todo = [k for k in items if sc[k][0] < 4]
+        pooled = r.generate([hinted(items[k]) for k in todo for _ in range(args.max_samples)], temperature=args.temp, seed=1000 + 100 * cycle) if todo else []
+        status(cycle, None, None, "running", f"sampled {len(pooled)} for {todo} {round(time.time()-t0)}s")
+        for idx, k in enumerate(todo):
+            it = items[k]
             best_n, best_l, best_outs = sc[k]
-            if best_n == 4: continue
             snap = r.snapshot()
-            samples = r.generate([hinted(it)] * args.max_samples, temperature=args.temp, seed=1000 + 100 * cycle + hash(k) % 97)
+            samples = pooled[idx * args.max_samples:(idx + 1) * args.max_samples]
             cands = []
             for i, s in enumerate(samples):
                 good = clean(it, s)
