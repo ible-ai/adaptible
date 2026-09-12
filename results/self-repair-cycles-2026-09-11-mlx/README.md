@@ -9,7 +9,7 @@ One run of `scripts/cycles_mlx.py` (repo commit `c147acc`), started
 |---|---|
 | Model | `mlx-community/DeepSeek-R1-Distill-Qwen-1.5B`, bf16 |
 | LoRA | rank 8, scale 10, every linear layer in the last 8 transformer blocks |
-| Optimiser | AdamW, lr 2e-5, fresh optimiser state after every restore |
+| Optimizer | AdamW, lr 2e-5, weight decay 0.01, MLX default `bias_correction=False` (first four steps are 3.2x to 5.4x a bias-corrected AdamW's); fresh optimizer after every restore |
 | Items | geo_010 Morocco, geo_004 Turkey, geo_001 Australia, geo_013 Philippines, sci_017 nearest star |
 | Prompts per item | original question + 3 hand-written paraphrases (in the script) |
 | Judge | think block closed, key term in the answer part (substring, NFKC casefold); sci_017 not credited if the answer names Proxima/Alpha Centauri |
@@ -17,7 +17,7 @@ One run of `scripts/cycles_mlx.py` (repo commit `c147acc`), started
 | Training target | the sample's own think block, `</think>`, its first two answer sentences, EOS; loss over the whole target, stop rule on the answer tokens |
 | Steps | at most 4, stop when answer-token loss < 0.15 |
 | Accept rule | the item's 4-prompt score strictly rises; otherwise restore LoRA weights from a copy and assert the checksum |
-| Decode | greedy, 1024-token cap, token-loop breaker (8-token sequence repeated 3 times) |
+| Decode | greedy; 2048-token cap when scoring, 1024 when sampling candidates; token-loop breaker (8-token sequence repeated 3 times) and repeated-line breaker |
 
 ## Files
 
