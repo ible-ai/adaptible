@@ -204,6 +204,7 @@ def main():
     ap.add_argument("--sample_max_tokens", type=int, default=1024, help="decode cap when sampling candidates (MLX loop: 1024)")
     ap.add_argument("--optimizer", choices=["mlx", "torch"], default="mlx", help="mlx = AdamW without bias correction (what the MLX run used); torch = torch.optim.AdamW")
     ap.add_argument("--temp", type=float, default=0.7)
+    ap.add_argument("--sample_from", choices=["current", "base"], default="current", help="draw candidates from the model being trained (current) or from its untrained weights (base)")
     ap.add_argument("--items", default=",".join(ITEMS), help="comma-separated item ids")
     ap.add_argument("--seed", type=int, default=1000, help="sampling seed base (seed + 100 * cycle); the MLX run used 1000")
     ap.add_argument("--smoke", action="store_true", help="tiny limits to exercise every code path")
@@ -217,6 +218,7 @@ def main():
     hist_path, adapter_path, status_path = out / "history.json", out / "adapter.pt", out / "status.json"
     history = json.loads(hist_path.read_text()) if hist_path.exists() else {"cycles": [], "cand": {k: [0, 0] for k in items}}
     start = len(history["cycles"])
+    init_snap = r.snapshot()                        # untrained adapter, for --sample_from base
     if start and adapter_path.exists():
         r.load_adapter(adapter_path); print(f"RESUME from cycle {start} checksum={r.checksum():.3f}", flush=True)
 
@@ -241,7 +243,10 @@ def main():
         if cycle == 0:
             for k, it in items.items(): print(f"BASE {k} {marks(it, sc[k][2])} loops={sc[k][1]}", flush=True)
         todo = [k for k in items if sc[k][0] < 4]
+        if todo and args.sample_from == "base":      # sample from the untrained adapter, then put the trained one back
+            cur = r.snapshot(); r.restore(init_snap)
         pooled = r.generate([hinted(items[k]) for k in todo for _ in range(args.max_samples)], temperature=args.temp, seed=args.seed + 100 * cycle, max_new=r.sample_max_new) if todo else []
+        if todo and args.sample_from == "base": r.restore(cur)
         status(cycle, None, None, "running", f"sampled {len(pooled)} for {todo} {round(time.time()-t0)}s")
         for idx, k in enumerate(todo):
             it = items[k]
