@@ -204,7 +204,9 @@ def main():
     ap.add_argument("--sample_max_tokens", type=int, default=1024, help="decode cap when sampling candidates (MLX loop: 1024)")
     ap.add_argument("--optimizer", choices=["mlx", "torch"], default="mlx", help="mlx = AdamW without bias correction (what the MLX run used); torch = torch.optim.AdamW")
     ap.add_argument("--temp", type=float, default=0.7)
-    ap.add_argument("--sample_from", choices=["current", "base"], default="current", help="draw candidates from the model being trained (current) or from its untrained weights (base)")
+    ap.add_argument("--sample_from", choices=["current", "base"], default="current", help="draw candidates from the model being trained (current) or from a frozen adapter (base: untrained, or --sample_adapter)")
+    ap.add_argument("--sample_adapter", default=None, help="with --sample_from base: adapter file to sample from instead of the untrained weights")
+    ap.add_argument("--init_adapter", default=None, help="start training from this adapter instead of untrained weights (new run dir; not a resume)")
     ap.add_argument("--items", default=",".join(ITEMS), help="comma-separated item ids")
     ap.add_argument("--seed", type=int, default=1000, help="sampling seed base (seed + 100 * cycle); the MLX run used 1000")
     ap.add_argument("--smoke", action="store_true", help="tiny limits to exercise every code path")
@@ -218,7 +220,11 @@ def main():
     hist_path, adapter_path, status_path = out / "history.json", out / "adapter.pt", out / "status.json"
     history = json.loads(hist_path.read_text()) if hist_path.exists() else {"cycles": [], "cand": {k: [0, 0] for k in items}}
     start = len(history["cycles"])
-    init_snap = r.snapshot()                        # untrained adapter, for --sample_from base
+    zero_snap = r.snapshot()                        # untrained adapter
+    if args.sample_adapter: r.load_adapter(args.sample_adapter)
+    init_snap = r.snapshot()                        # frozen sampler weights for --sample_from base (untrained unless --sample_adapter)
+    if args.init_adapter: r.load_adapter(args.init_adapter); print(f"INIT from {args.init_adapter} checksum={r.checksum():.3f}", flush=True)
+    else: r.restore(zero_snap)
     if start and adapter_path.exists():
         r.load_adapter(adapter_path); print(f"RESUME from cycle {start} checksum={r.checksum():.3f}", flush=True)
 
