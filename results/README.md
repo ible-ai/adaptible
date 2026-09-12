@@ -14,10 +14,13 @@ cycle 26 while the model remains coherent. Beyond that point the model's
 samples converge on a single template, per-step losses fall to zero, and
 accuracy fluctuates between 7 and 19 without collapsing. The run ends at
 cycles 37 to 39 with 18, 19, and 18 of 20 and no loops, and the fact that had
-resisted for 37 cycles is learned on all four phrasings. We conclude that
-generate-judge-restore selection makes self-training viable at this scale, and
-that the limiting factor is the diversity of the model's own samples rather
-than the capacity of the update.
+resisted for 37 cycles is learned on all four phrasings. Four replicates in
+PyTorch on a GPU reproduce the lift (three of four reach 16 or more within ten
+cycles, two reach 19); after the lift one freezes, two drift, and one degrades
+into looping and does not recover. We conclude that generate-judge-restore
+selection makes self-training viable at this scale, and that the limiting
+factor is the diversity of the model's own samples rather than the capacity of
+the update.
 
 ## 1. Setup
 
@@ -96,7 +99,9 @@ the same selection rule that let the score drift down let it climb back.
 **Coherence.** At no cycle does the model collapse to the failure modes seen
 with unfiltered fine-tuning (single-word answers, empty reasoning, or a fixed
 answer to every question). Through the drift phase it remains a reasoning
-model that answers most prompts.
+model that answers most prompts. One replicate (seed 4000, below) does
+degrade: after cycle 10 most of its prompts loop and the score stays under
+10.
 
 **The slow item.** Turkey is not fixed on any prompt until cycle 20 and not on
 all four until cycle 37, after 68 candidates of which 8 were kept. Its early
@@ -104,6 +109,26 @@ candidates train to near-zero answer loss under their own reasoning while free
 generation still concludes Istanbul: the correction held only conditioned on
 the sampled reasoning, which the model did not reproduce when it thought
 unprompted. It holds 4/4 at cycles 37 and 38 and 3/4 at cycle 39.
+
+**Replicates.** The same loop, ported to PyTorch and run on one GPU with four
+sampling seeds (data: `self-repair-cycles-2026-09-12-gpu-seed*/`). Baselines
+differ slightly from the Mac's because the frameworks round differently.
+
+| Cycle | 0 | 5 | 10 | 16 | 21 | 26 | 31 | 35 | 39 | Peak |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Seed 2000 | 7 | 13 | 14 | 10 | 16 | 14 | 16 | 15 | 15 | 19 at cycle 29 |
+| Seed 3000 | 8 | 15 | 16 | 16 | 16 | 16 | 16 | 16 | 16 | 16 at cycle 9 |
+| Seed 4000 | 5 | 13 | 7 | 7 | 4 | 6 | 8 | 7 | 7 | 13 at cycle 5 |
+| Seed 5000 | 6 | 16 | 16 | 16 | 16 | 13 | 19 | 16 | 10 | 19 at cycle 30 |
+| Mac | 8 | 11 | 12 | 16 | 10 | 19 | 7 | 7 | 18 | 19 at cycle 26 |
+
+Three of the four seeds reach 16 or more within ten cycles and two reach 19,
+matching the Mac. What happens after the lift differs by seed. Seed 3000
+freezes: four items at 4/4 and Turkey at 0/4 for thirty cycles, no loops, every
+later candidate restored. Seeds 2000 and 5000 drift as the Mac did. Seed 4000
+is the failure case: it reaches 13 at cycle 5, then falls to between 4 and 9
+with 8 to 16 of 20 prompts looping, and never recovers. Turkey is learned in
+two of the five runs (seeds 2000 and 5000, and the Mac at cycle 37).
 
 ## 4. Discussion
 
@@ -133,8 +158,8 @@ already knows.
 Five items and one model. Greedy decode on a 1.5B model flips on near-tie
 prompts under weight changes far smaller than a training step, giving a noise
 floor of about two points per cycle. The judge is substring matching. The
-sampling prompt contains the answer. Replicates of the loop in PyTorch, three
-seeds on one GPU, are in progress and will be added here.
+sampling prompt contains the answer. Five runs in total, with one that
+degrades, is too few to put a rate on the failure case.
 
 ## Reproduce
 
