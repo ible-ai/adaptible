@@ -48,16 +48,13 @@ cannot be satisfied by a model that has stopped answering.
 
 ## Conclusion
 
-On five facts the model gets wrong, each tested in four phrasings, the
-self-repair loop raised accuracy on the twenty prompts from 4 to 16 over
-sixteen cycles and to 19 by cycle 26, with the model coherent throughout.
-After that its own samples converge on one phrasing, the updates shrink to
-nothing, and the score drifts between 7 and 19 without collapsing. The last
-three of forty cycles score 18, 19, and 18 with no loops, and the one fact
-that had resisted for 37 cycles is learned. Four more runs of the loop on a
-GPU reproduce the lift; after it, one run holds steady, two drift, and one
-degrades into looping. The write-up, with the data behind each number, is in
-[`results/`](results/README.md).
+On five facts the model gets wrong, each tested in four phrasings it never
+trains on, the self-repair loop lifts accuracy from about a quarter of the
+prompts to three quarters or more within ten to sixteen cycles, in five runs
+out of five. The model stays a reasoning model while it does so. What happens
+after the lift varies from run to run: the score can hold, drift, or in one
+run fall back as the model starts looping. The write-up, with the data behind
+each number, is in [`results/`](results/README.md).
 
 ## Demo
 
