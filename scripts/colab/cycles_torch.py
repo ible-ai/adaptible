@@ -275,7 +275,7 @@ def main():
         history["cycles"].append(dict(cycle=cycle, score=total, loops=lp, marks={k: marks(items[k], sc[k][2]) for k in items},
                                       answers={k: [answer_of(o)[:60] if closed(o) else "(no answer)" for o in sc[k][2]] for k in items},
                                       seconds=round(time.time() - t0)))
-        r.save_adapter(adapter_path); hist_path.write_text(json.dumps(history, indent=1)); status(cycle, total, lp, "cycle_done")
+        r.save_adapter(adapter_path); r.save_adapter(out / f"adapter_{cycle:02d}.pt"); hist_path.write_text(json.dumps(history, indent=1)); status(cycle, total, lp, "cycle_done")
         print(f"CYCLE {cycle} score={total}/{4*len(items)} loops={lp} | " + " ".join(f"{k}:{marks(items[k], sc[k][2])}" for k in items)
               + f" | {round(time.time()-t0)}s", flush=True)
     status(args.cycles, None, None, "finished")
