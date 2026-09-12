@@ -76,9 +76,33 @@ class LoopStop(StoppingCriteria):
         return (tail == tail[:, -1:, :]).all(dim=2).all(dim=1)
 
 
+# ----------------------------------------------------------------------------- optimizer
+class MLXAdamW(torch.optim.Optimizer):
+    """AdamW exactly as mlx.optimizers.AdamW applies it by default: decoupled weight decay
+    (p *= 1 - lr*wd) then an Adam step WITHOUT bias correction. The MLX flagship run used
+    this, and without bias correction the first four steps are 3.2x, 4.3x, 5.0x, 5.4x the
+    size of torch.optim.AdamW's at the same learning rate; the loop takes at most four steps
+    per candidate from a fresh optimizer, so this is the whole difference."""
+    def __init__(self, params, lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
+    @torch.no_grad()
+    def step(self):
+        for g in self.param_groups:
+            lr, (b1, b2), eps, wd = g["lr"], g["betas"], g["eps"], g["weight_decay"]
+            for p in g["params"]:
+                if p.grad is None: continue
+                st = self.state[p]
+                if not st: st["m"] = torch.zeros_like(p); st["v"] = torch.zeros_like(p)
+                m, v = st["m"], st["v"]
+                p.mul_(1 - lr * wd)
+                m.mul_(b1).add_(p.grad, alpha=1 - b1)
+                v.mul_(b2).addcmul_(p.grad, p.grad, value=1 - b2)
+                p.addcdiv_(m, v.sqrt().add_(eps), value=-lr)
+
+
 # ----------------------------------------------------------------------------- model
 class Runner:
-    def __init__(self, model_name, lr, max_new_tokens, device):
+    def __init__(self, model_name, lr, max_new_tokens, device, sample_max_tokens=None, optimizer="mlx"):
         self.tok = AutoTokenizer.from_pretrained(model_name)
         self.tok.padding_side = "left"
         if self.tok.pad_token_id is None: self.tok.pad_token = self.tok.eos_token
@@ -94,13 +118,16 @@ class Runner:
         for n, p in self.model.named_parameters():       # adapters train in fp32 regardless of base dtype
             if p.requires_grad: p.data = p.data.float()
         self.device, self.lr, self.max_new = device, lr, max_new_tokens
+        self.sample_max_new, self.optimizer_kind = sample_max_tokens or max_new_tokens, optimizer
         self.eos = self.tok.eos_token
         self.new_optimizer()
         gpu = torch.cuda.get_device_name() if device == "cuda" else device
-        print(f"model={model_name} dtype={self.dtype} device={device} gpu={gpu} trainable={sum(p.numel() for p in self.model.parameters() if p.requires_grad)}", flush=True)
+        print(f"model={model_name} dtype={self.dtype} device={device} gpu={gpu} optimizer={self.optimizer_kind} score_cap={self.max_new} sample_cap={self.sample_max_new} trainable={sum(p.numel() for p in self.model.parameters() if p.requires_grad)}", flush=True)
 
     def new_optimizer(self):
-        self.opt = torch.optim.AdamW([p for p in self.model.parameters() if p.requires_grad], lr=self.lr, weight_decay=0.01)
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        self.opt = (MLXAdamW(params, lr=self.lr, weight_decay=0.01) if self.optimizer_kind == "mlx"
+                    else torch.optim.AdamW(params, lr=self.lr, weight_decay=0.01))
 
     # --- weights
     def trainable(self): return {n: p for n, p in self.model.named_parameters() if p.requires_grad}
@@ -129,12 +156,12 @@ class Runner:
         return p
 
     @torch.no_grad()
-    def generate(self, questions, temperature=0.0, seed=None):
+    def generate(self, questions, temperature=0.0, seed=None, max_new=None):
         self.model.eval()
         enc = self.tok([self.prefix(q) for q in questions], return_tensors="pt", padding=True, add_special_tokens=False).to(self.device)
         if seed is not None: torch.manual_seed(seed)
         kw = dict(do_sample=temperature > 0, temperature=temperature if temperature > 0 else None, top_p=None, top_k=None)
-        out = self.model.generate(**enc, max_new_tokens=self.max_new, pad_token_id=self.tok.pad_token_id,
+        out = self.model.generate(**enc, max_new_tokens=max_new or self.max_new, pad_token_id=self.tok.pad_token_id,
                                   stopping_criteria=StoppingCriteriaList([LoopStop(enc.input_ids.shape[1])]), **kw)
         gen = out[:, enc.input_ids.shape[1]:]
         return [self.tok.decode(row, skip_special_tokens=True) for row in gen]
@@ -173,16 +200,19 @@ def main():
     ap.add_argument("--cycles", type=int, default=40); ap.add_argument("--k", type=int, default=2)
     ap.add_argument("--max_samples", type=int, default=6); ap.add_argument("--max_steps", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2e-5); ap.add_argument("--target", type=float, default=0.15)
-    ap.add_argument("--max_new_tokens", type=int, default=1024); ap.add_argument("--temp", type=float, default=0.7)
+    ap.add_argument("--max_new_tokens", type=int, default=2048, help="decode cap when scoring (MLX generate_response: 2048)")
+    ap.add_argument("--sample_max_tokens", type=int, default=1024, help="decode cap when sampling candidates (MLX loop: 1024)")
+    ap.add_argument("--optimizer", choices=["mlx", "torch"], default="mlx", help="mlx = AdamW without bias correction (what the MLX run used); torch = torch.optim.AdamW")
+    ap.add_argument("--temp", type=float, default=0.7)
     ap.add_argument("--items", default=",".join(ITEMS), help="comma-separated item ids")
     ap.add_argument("--seed", type=int, default=1000, help="sampling seed base (seed + 100 * cycle); the MLX run used 1000")
     ap.add_argument("--smoke", action="store_true", help="tiny limits to exercise every code path")
     args = ap.parse_args()
-    if args.smoke: args.max_new_tokens, args.max_samples, args.k = 24, 2, 1
+    if args.smoke: args.max_new_tokens, args.sample_max_tokens, args.max_samples, args.k = 24, 24, 2, 1
     items = {k: ITEMS[k] for k in args.items.split(",")}
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    r = Runner(args.model, args.lr, args.max_new_tokens, device)
+    r = Runner(args.model, args.lr, args.max_new_tokens, device, sample_max_tokens=args.sample_max_tokens, optimizer=args.optimizer)
 
     hist_path, adapter_path, status_path = out / "history.json", out / "adapter.pt", out / "status.json"
     history = json.loads(hist_path.read_text()) if hist_path.exists() else {"cycles": [], "cand": {k: [0, 0] for k in items}}
@@ -211,7 +241,7 @@ def main():
         if cycle == 0:
             for k, it in items.items(): print(f"BASE {k} {marks(it, sc[k][2])} loops={sc[k][1]}", flush=True)
         todo = [k for k in items if sc[k][0] < 4]
-        pooled = r.generate([hinted(items[k]) for k in todo for _ in range(args.max_samples)], temperature=args.temp, seed=args.seed + 100 * cycle) if todo else []
+        pooled = r.generate([hinted(items[k]) for k in todo for _ in range(args.max_samples)], temperature=args.temp, seed=args.seed + 100 * cycle, max_new=r.sample_max_new) if todo else []
         status(cycle, None, None, "running", f"sampled {len(pooled)} for {todo} {round(time.time()-t0)}s")
         for idx, k in enumerate(todo):
             it = items[k]
