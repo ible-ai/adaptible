@@ -24,10 +24,7 @@ than the capacity of the update.
 **Model.** `mlx-community/DeepSeek-R1-Distill-Qwen-1.5B`, bf16, on a 16 GB
 Apple M3 laptop (27 tokens/s). LoRA rank 8, scale 10, on every linear layer in
 the last 8 of 28 transformer blocks; 2.6M trainable parameters. AdamW, learning
-rate 2e-5, optimiser state reset whenever weights are restored. MLX's AdamW
-applies no bias correction by default, so with at most four steps from a fresh
-optimiser each update is 3 to 5 times the size a bias-corrected AdamW would
-take at this learning rate; the PyTorch port reproduces this.
+rate 2e-5, optimiser state reset whenever weights are restored.
 
 **Items.** Five questions the base model answers wrongly under greedy decode:
 the capitals of Morocco, Turkey, Australia, and the Philippines, and the
@@ -136,11 +133,8 @@ already knows.
 Five items and one model. Greedy decode on a 1.5B model flips on near-tie
 prompts under weight changes far smaller than a training step, giving a noise
 floor of about two points per cycle. The judge is substring matching. The
-sampling prompt contains the answer. The update size matters: a PyTorch run
-of the same loop with a bias-corrected AdamW (steps 3 to 5 times smaller)
-never exceeded 11/20 in 40 cycles and never fixed an item that started at
-0/4. Replicates with the matched optimiser, three seeds on one GPU, are in
-progress and will be added here.
+sampling prompt contains the answer. Replicates of the loop in PyTorch, three
+seeds on one GPU, are in progress and will be added here.
 
 ## Reproduce
 

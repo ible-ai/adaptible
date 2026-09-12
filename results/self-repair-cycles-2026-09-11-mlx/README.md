@@ -9,7 +9,7 @@ One run of `scripts/cycles_mlx.py` (repo commit `c147acc`), started
 |---|---|
 | Model | `mlx-community/DeepSeek-R1-Distill-Qwen-1.5B`, bf16 |
 | LoRA | rank 8, scale 10, every linear layer in the last 8 transformer blocks |
-| Optimizer | AdamW, lr 2e-5, weight decay 0.01, MLX default `bias_correction=False` (first four steps are 3.2x to 5.4x a bias-corrected AdamW's); fresh optimizer after every restore |
+| Optimizer | AdamW (`mlx.optimizers.AdamW`, no bias correction), lr 2e-5, weight decay 0.01, fresh optimizer after every restore |
 | Items | geo_010 Morocco, geo_004 Turkey, geo_001 Australia, geo_013 Philippines, sci_017 nearest star |
 | Prompts per item | original question + 3 hand-written paraphrases (in the script) |
 | Judge | think block closed, key term in the answer part (substring, NFKC casefold); sci_017 not credited if the answer names Proxima/Alpha Centauri |
