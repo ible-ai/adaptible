@@ -140,7 +140,7 @@ class InteractionRequestTest(unittest.TestCase):
 
         data = request.model_dump()
 
-        self.assertEqual(data, {"prompt": "Test prompt"})
+        self.assertEqual(data, {"prompt": "Test prompt", "use_history": True})
 
     def test_from_dict(self):
         """Should deserialize from dictionary."""

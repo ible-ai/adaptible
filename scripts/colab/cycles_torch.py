@@ -239,12 +239,11 @@ def main():
 
     for cycle in range(start, args.cycles):
         t0 = time.time(); status(cycle, None, None, "running")
-        allq = [(k, q) for k, it in items.items() for q in prompts(it)]
-        outs_all = r.generate([q for _, q in allq])
-        sc = {}
-        for k, it in items.items():
-            outs = [o for (kk, _), o in zip(allq, outs_all) if kk == k]
-            sc[k] = (sum(ok(it, o) for o in outs), loops(outs), outs)
+        # One 4-prompt batch per item, the same shape as the post-candidate score:
+        # greedy output depends on the padded batch shape (a 20-prompt batch and a
+        # 4-prompt batch of the same adapter differed by 2/20), so the keep rule
+        # must compare like with like.
+        sc = {k: score(it) for k, it in items.items()}
         status(cycle, None, None, "running", f"scored all {sum(v[0] for v in sc.values())} {round(time.time()-t0)}s")
         if cycle == 0:
             for k, it in items.items(): print(f"BASE {k} {marks(it, sc[k][2])} loops={sc[k][1]}", flush=True)

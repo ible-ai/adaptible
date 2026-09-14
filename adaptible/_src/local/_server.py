@@ -9,6 +9,8 @@ import uvicorn
 from fastapi import FastAPI
 
 from .._api import Adaptible
+from .._llm import StatefulLLM
+from ..lookup import DEFAULT_PASSAGES, DocStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,7 +37,9 @@ class MutableHostedLLM(uvicorn.Server):
             app: Optional FastAPI app. If not provided, creates Adaptible with default model.
         """
         if app is None:
-            app = Adaptible().app
+            # The default node can look things up in the demo store, so a
+            # thumbs-down leads to a repair.
+            app = Adaptible(model=StatefulLLM(lookup=DocStore(DEFAULT_PASSAGES).search)).app
         super().__init__(config=uvicorn.Config(app, host=host, port=port))
         self._startup_done = asyncio.Event()
         self._serve_task = None

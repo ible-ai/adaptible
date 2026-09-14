@@ -16,6 +16,10 @@ class InteractionHistory:
         llm_response: LLM response.
         reviewed: Whether this interaction has been reviewed already.
         timestamp: When the interaction took place, measured in seconds.
+        flagged: The user marked the response as wrong (a thumbs-down). Flagged
+            interactions go through ``StatefulLLM.repair`` on review: the model
+            looks the question up, writes a corrected answer, and trains on it.
+        note: What the lookup returned for this interaction, if anything.
     """
 
     idx: int
@@ -23,6 +27,8 @@ class InteractionHistory:
     llm_response: str = ""
     reviewed: bool = False
     timestamp: float = 0.0
+    flagged: bool = False
+    note: str = ""
 
 
 @dataclasses.dataclass
@@ -52,9 +58,12 @@ class InteractionRequest(BaseModel):
 
     Attributes:
         prompt: User-provided input.
+        use_history: Whether earlier turns of the conversation are included in
+            the prompt. ``False`` asks the question as a fresh chat.
     """
 
     prompt: str
+    use_history: bool = True
 
 
 class InteractionResponse(BaseModel):
@@ -93,3 +102,27 @@ class SyncResponse(BaseModel):
     message: str
     tasks_count: int
     elapsed_time: float
+
+
+class FeedbackRequest(BaseModel):
+    """User feedback on one earlier response.
+
+    Attributes:
+        interaction_idx: Index of the response being rated (``InteractionResponse.interaction_idx``).
+        thumbs: ``"down"`` flags the response as wrong; ``"up"`` clears the flag.
+    """
+
+    interaction_idx: int
+    thumbs: str = "down"
+
+
+class FeedbackResponse(BaseModel):
+    """Outcome of recording feedback.
+
+    Attributes:
+        interaction_idx: Index that was rated.
+        flagged: Whether the interaction is now flagged for repair.
+    """
+
+    interaction_idx: int
+    flagged: bool

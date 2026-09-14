@@ -2,6 +2,7 @@
 
 import collections
 import dataclasses
+import re
 import functools
 import math
 import threading
@@ -18,16 +19,17 @@ import mlx_lm.tuner
 import tqdm
 import vizible
 from mlx_lm.generate import stream_generate
+from mlx_lm.sample_utils import make_sampler
 from mlx_lm.utils import load
-from mlx_lm.utils import save_model
-from mlx_lm.utils import load_model
 from transformers.tokenization_utils import PreTrainedTokenizer
 
 from ._classes import InteractionHistory, TrainingExample
 from ._paths import default_checkpoint_path
 from .revise import (
+    collate_training_examples,
     make_collated_training_example,
     make_revision_prompt,
+    make_revision_training_example,
     rationale_from_output,
     template_opens_think,
     validate_revision_response,
@@ -40,32 +42,42 @@ from .revise import (
 # _MODEL_NAME = "lmstudio-community/Qwen3-4B-Instruct-2507-MLX-8bit"
 _MODEL_NAME = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B"
 # _MODEL_NAME = "mlx-community/DeepSeek-R1-Qwen3-0528-8B-4bit-AWQ"
+ADAPTER_FILE = "adapters.safetensors"
 MAX_TOKENS = 2048
 # Kept as a module-level name for backward compatibility (``autonomous/`` imports it);
 # resolved through ``_paths`` so that it honours ``$ADAPTIBLE_OUTPUTS_DIR``.
 MODEL_PATH = default_checkpoint_path()
 # MAX_TOKENS = 8192
-_LEARNING_RATE = 5e-5
+_LEARNING_RATE = 2e-5
 _EPOCHS = 5
-# Loss-targeted training. A per-step probe on DeepSeek-R1-Distill-Qwen-1.5B
-# (one correction, target "Ottawa"+eos, think_mode="baseline") went from a
-# loss of 6.05 to ~0.6 in a few steps; at ~0.6 the greedy answer flips to the
-# correction while the reasoning stays intact and unrelated items are
-# unaffected. Driving the loss below ~0.1 (what a fixed 5-25 iterations does)
-# makes the model emit the bare answer with no reasoning and answer "Ottawa"
-# to unrelated questions. So training stops on a loss target with a step cap,
-# not on a fixed count. The target applies to the *answer* tokens
-# (``TrainingExample.stop_mask``): with think_mode="rationale" the training
-# loss also covers the reasoning, which is not what the stop rule is about.
-_LOSS_TARGET: float | None = 0.6
-_MAX_TRAIN_STEPS = 12
-# LoRA configuration: Higher rank (32) and more layers (24) provide
-# more capacity for learning while scale (10.0) keeps training stable.
-# Note: Self-correction works best with diverse accumulated examples over time,
-# not from single corrections. Behavioral change requires many training instances.
-_NUM_LORA_LAYERS = 24
+# Training recipe. These are the settings of the self-repair cycle runs in
+# ``results/``: a rank-8 adapter on the last 8 blocks, at most four steps toward
+# an answer loss of 0.15, and the update kept only if it lands. Driving the loss
+# lower, or training for a fixed count, makes the model emit the bare answer
+# with no reasoning and answer the correction to unrelated questions. The loss
+# target applies to the *answer* tokens (``TrainingExample.stop_mask``): with
+# think_mode="rationale" the training loss also covers the reasoning, which is
+# not what the stop rule is about.
+_LOSS_TARGET: float | None = 0.15
+_MAX_TRAIN_STEPS = 4
+_NUM_LORA_LAYERS = 8
 _LORA_PARAMETERS = immutabledict.immutabledict(
-    {"rank": 32, "dropout": 0.0, "scale": 10.0}
+    {"rank": 8, "dropout": 0.0, "scale": 10.0}
+)
+# Repair (``StatefulLLM.repair``): candidates are the model's own answers to the
+# question with the looked-up note attached, sampled from the adapter the
+# process started with rather than the current one (sampling from the trained
+# adapter drifted in three of four cycle runs; a frozen sampler did not).
+_REPAIR_SAMPLES = 6
+_REPAIR_CANDIDATES = 2
+_REPAIR_TEMPERATURE = 0.7
+_REPAIR_SAMPLE_TOKENS = 1024
+_JUDGE_TOKENS = 768
+# A kept repair must leave these answering (closed think, non-empty answer).
+_CONTROL_PROMPTS = (
+    "What is 12 times 12?",
+    "What is the capital of France?",
+    "How many days are in a week?",
 )
 _USE_DORA = False
 # Loop detection configuration: Check for repeating sequences to prevent infinite loops.
@@ -125,12 +137,7 @@ def _load(
     Returns:
         Model and tokenizer.
     """
-    if model_path is not None and model_path.exists():
-        _, wrapped_tokenizer = load(model_name)
-        print("Loading model from", model_path)
-        model = load_model(model_path)
-    else:
-        model, wrapped_tokenizer = load(model_name)
+    model, wrapped_tokenizer = load(model_name)
     print("Freezing all non-Lora model parameters.")
     model.freeze()
     if lora_parameters is not None:
@@ -140,6 +147,21 @@ def _load(
             config=lora_parameters,
             use_dora=use_dora,
         )
+    if model_path is not None and model_path.exists():
+        # A checkpoint is the adapter only (``_save_checkpoint``); it is loaded
+        # onto the freshly wrapped base model. Older checkpoints hold the whole
+        # model; only their adapter tensors are taken.
+        adapter_file = model_path / ADAPTER_FILE
+        if adapter_file.exists():
+            print("Loading adapter from", adapter_file)
+            model.load_weights(str(adapter_file), strict=False)
+        else:
+            files = sorted(model_path.glob("*.safetensors"))
+            weights = {k: v for f in files for k, v in mlx.core.load(str(f)).items() if "lora" in k}
+            if weights:
+                print(f"Loading {len(weights)} adapter tensors from {model_path}")
+                model.load_weights(list(weights.items()), strict=False)
+        mlx.core.eval(model.parameters())
     return model, wrapped_tokenizer._tokenizer  # pylint: disable=protected-access
 
 
@@ -469,6 +491,8 @@ class StatefulLLM:
         model_path: Path | None = MODEL_PATH,
         loss_target: float | None = _LOSS_TARGET,
         max_train_steps: int = _MAX_TRAIN_STEPS,
+        lookup: Callable[[str], str | None] | None = None,
+        control_prompts: Sequence[str] = _CONTROL_PROMPTS,
     ) -> None:
         """Initializes the StatefulLLM
 
@@ -488,6 +512,13 @@ class StatefulLLM:
                 soon as a step's loss falls below this. ``None`` disables the
                 target and trains ``max_train_steps`` steps.
             max_train_steps: Step cap for ``self_correct_and_train``.
+            lookup: What the node consults about a flagged question (``repair``):
+                a callable from the question to a short note, or ``None`` when it
+                found nothing. ``DocStore.search`` is one; the autonomous node's
+                web search is another. Without one, flagged interactions are
+                left alone.
+            control_prompts: Prompts that must still answer after a repair for
+                the repair to be kept.
 
         Returns: None
         """
@@ -505,8 +536,11 @@ class StatefulLLM:
             )
         self._model_path = model_path
         self._model_name = model_name
+        self._learning_rate = learning_rate
         self._optimizer = mlx.optimizers.AdamW(learning_rate=learning_rate)
         self._epochs = epochs
+        self._lookup = lookup
+        self._control_prompts = tuple(control_prompts)
         self._max_tokens = max_tokens
         self._bos_token = self._tokenizer.special_tokens_map.get("bos_token", "")
         self._eos_token = self._tokenizer.special_tokens_map.get("eos_token", "")
@@ -517,6 +551,13 @@ class StatefulLLM:
 
         self._model_is_stable = True
         self._response_stream = None
+        # The adapter the process started with: ``repair`` samples from it.
+        self._base_adapter = self._snapshot()
+
+    def reset_conversation(self) -> None:
+        """Forgets the conversation so far; the next prompt starts a new chat."""
+        with self._lock:
+            self._messages.clear()
 
     @property
     def ok(self) -> bool:
@@ -1097,12 +1138,252 @@ class StatefulLLM:
             self._model_is_stable = True
         return stats
 
+    # ------------------------------------------------------------------ repair
+    def _checksum(self) -> float:
+        return float(
+            sum(
+                mlx.core.abs(a).sum().item()
+                for _, a in mlx.utils.tree_flatten(self._model.trainable_parameters())
+            )
+        )
+
+    def _snapshot(self) -> Tuple[Any, float]:
+        """Copies the adapter weights; ``_restore`` puts them back."""
+        params = mlx.utils.tree_map(lambda x: x + 0, self._model.trainable_parameters())
+        # Evaluate now: a lazy copy evaluated later from another thread (the
+        # review runs in a worker thread) fails with "no Stream in current thread".
+        mlx.core.eval(params)
+        return params, self._checksum()
+
+    def _restore(self, snap: Tuple[Any, float]) -> None:
+        """Puts a snapshot's weights back, verified by checksum, with a fresh optimizer."""
+        params, s = snap
+        self._model.update(mlx.utils.tree_map(lambda x: x + 0, params))
+        mlx.core.eval(self._model.parameters())
+        self._optimizer = mlx.optimizers.AdamW(learning_rate=self._learning_rate)
+        assert abs(self._checksum() - s) < 1e-3 * max(1.0, s), "restore failed"
+
+    def _sample(self, prompt: str, seed: int, max_tokens: int) -> str:
+        """One sampled (T=``_REPAIR_TEMPERATURE``) response, stopped on a token loop."""
+        mlx.core.random.seed(seed)
+        ids = self.apply_chat_template(self._messages_for_prompt(prompt, False))
+        sampler = make_sampler(temp=_REPAIR_TEMPERATURE)
+        toks: list[int] = []
+        text: list[str] = []
+        for r in stream_generate(
+            self._model, self._tokenizer, prompt=ids, max_tokens=max_tokens, sampler=sampler
+        ):
+            toks.append(r.token)
+            text.append(r.text)
+            if _detect_token_loop(
+                toks, self._loop_detection_sequence_length, self._loop_detection_max_repetitions
+            ):
+                break
+        return "".join(text)
+
+    @staticmethod
+    def _answer_of(text: str) -> str:
+        return text.split("</think>")[-1].strip()
+
+    @staticmethod
+    def _first_sentence(text: str) -> str:
+        return re.split(r"(?<=[.!?])\s", text.strip(), 1)[0]
+
+    def extract(self, question: str, text: str, label: str = "Reference note") -> str:
+        """Names the answer to ``question`` using only ``text``; empty when it cannot.
+
+        Used on what the node looked up and, with ``label="Reply"``, on the
+        model's own answers, so a reply is judged by what it asserts rather
+        than by which words it contains ("Proxima Centauri, the closest star
+        to the Sun" contains "Sun"). A yes/no judge on this model said yes to
+        wrong answers and no to right ones; a bare "what is the answer" read
+        let its prior override a note that named a distractor. Quoting the
+        answering sentence first and then naming the answer read every note
+        right in a check. The name must occur in the text, so it cannot be
+        invented. Greedy first, then a few sampled reads if that gave nothing.
+        """
+        prompt = (
+            f"{label}: {text}\n\n"
+            f"Question: {question}\n\n"
+            f"First copy the one sentence of the {label.lower()} that answers the question. "
+            "Then on a new line starting with 'Name:' write only the name that sentence gives."
+        )
+        for attempt in range(4):
+            if attempt == 0:
+                out = self.generate_response(prompt, use_history=False, max_tokens=_JUDGE_TOKENS)
+            else:
+                out = self._sample(prompt, 7000 + attempt, _JUDGE_TOKENS)
+            if "</think>" not in out:
+                continue
+            answer = self._answer_of(out)
+            m = re.search(r"Name:\s*(.+)", answer)
+            lines = [l for l in answer.splitlines() if l.strip()]
+            name = m.group(1) if m else (lines[-1] if lines and len(lines[-1].split()) <= 5 else "")
+            name = re.sub(r"[*_`\"']", "", name).strip().rstrip(".").strip()
+            if name and len(name.split()) <= 5 and name.casefold() in text.casefold():
+                return name
+        return ""
+
+    @staticmethod
+    def _same_name(a: str, b: str) -> bool:
+        norm = lambda x: re.sub(r"^(the|a|an)\s+", "", x.strip().casefold())
+        return bool(a) and bool(b) and norm(a) == norm(b)
+
+    def judge(self, question: str, reply: str, name: str) -> bool:
+        """Whether ``reply`` asserts ``name`` as the answer, by the node's own reading of it.
+
+        Only the first sentence counts: that is where the answer is asserted,
+        and a later "Istanbul is the largest city" misleads the read. Cheap
+        reject first (the name must occur in it), then the sentence is read
+        like a note and the name it gives must match.
+        """
+        head = self._first_sentence(reply)
+        if not head or name.casefold() not in head.casefold():
+            return False
+        return self._same_name(self.extract(question, head, label="Reply"), name)
+
+    def rephrase(self, question: str, n: int = 3) -> list[str]:
+        """The node's own rephrasings of ``question`` (greedy), up to ``n``.
+
+        A repair is scored on the question plus these, so an update that fixes
+        a rephrasing but not yet the original counts as progress and is kept;
+        the cycle runs that produced the flagship result kept a third of their
+        early updates that way, and the corrections accumulated.
+        """
+        prompt = (
+            f"Rewrite this question in {n} different ways, one per line, with no numbering "
+            f"and nothing else:\n{question}"
+        )
+        # The model tends to deliberate at length and not always close its think
+        # block; the rephrasings it considers are quoted there, so take those too.
+        # Greedy first, then sampled attempts until there are enough.
+        seen, paras = {question.strip().casefold()}, []
+        for attempt in range(4):
+            out = (self.generate_response(prompt, use_history=False) if attempt == 0
+                   else self._sample(prompt, 8000 + attempt, self._max_tokens))
+            found = re.findall(r'["\u201c]([^"\u201d]{8,140}\?)["\u201d]', out)
+            for line in self._answer_of(out).splitlines() if "</think>" in out else []:
+                found.append(re.sub(r"^\s*(\d+[.)]|[-*])\s*", "", line).strip().strip('"'))
+            for cand in found:
+                cand = cand.strip()
+                if cand.endswith("?") and 3 <= len(cand.split()) <= 25 and cand.casefold() not in seen:
+                    seen.add(cand.casefold())
+                    paras.append(cand)
+                if len(paras) == n:
+                    return paras
+        return paras
+
+    def _score_prompts(self, question: str, prompts: Sequence[str], name: str) -> Tuple[int, str]:
+        """Answers each prompt with the current weights; reads each answer under the frozen adapter."""
+        answers = [self.generate_response(p, use_history=False) for p in prompts]
+        cur = self._snapshot()
+        self._restore(self._base_adapter)
+        marks = ["✓" if "</think>" in a and self.judge(question, self._answer_of(a), name) else "✗" for a in answers]
+        self._restore(cur)
+        return marks.count("✓"), "".join(marks)
+
+    def _controls_answer(self) -> bool:
+        for q in self._control_prompts:
+            out = self.generate_response(q, use_history=False, max_tokens=_JUDGE_TOKENS)
+            if "</think>" not in out or not self._answer_of(out):
+                return False
+        return True
+
+    def repair(self, interaction: InteractionHistory, note: str, verbose: bool = False) -> bool:
+        """Patches one flagged answer into the weights using what the node looked up.
+
+        The model first names the answer from the note (``extract``) and writes
+        three rephrasings of the question (``rephrase``). With the note attached
+        to the question it then writes candidate answers (sampled from the
+        adapter the process started with), keeps the ones that name that
+        answer, trains a few steps on one, and re-asks the question and its
+        rephrasings. The update stays only if the number of prompts answered
+        with that name rises and the control prompts still answer; otherwise
+        the weights are restored. Both candidates are tried; a kept update is
+        the base for the next. Every step is logged with a ``REPAIR`` prefix.
+
+        Args:
+            interaction: The flagged exchange.
+            note: What the lookup returned for its question.
+            verbose: Print the sampled candidates.
+
+        Returns:
+            Whether a repair was kept.
+        """
+        q = interaction.user_input
+        hinted = f"{q}\n\n(Reference note: {note})"
+        with self._lock:
+            trained = self._snapshot()
+            # Candidates and the reading of the note come from the frozen starting adapter.
+            self._restore(self._base_adapter)
+            name = self.extract(q, note)
+            print(f"REPAIR idx={interaction.idx} note_answer={name!r}", flush=True)
+            if not name:
+                self._restore(trained)
+                return False
+            cands: list[str] = []
+            for i in range(_REPAIR_SAMPLES):
+                text = self._sample(hinted, 1000 + 100 * interaction.idx + i, _REPAIR_SAMPLE_TOKENS)
+                closed = "</think>" in text
+                first = self._first_sentence(self._answer_of(text)) if closed else ""
+                good = closed and 0 < len(first) < 300 and self.judge(q, self._answer_of(text), name)
+                print(f"REPAIR idx={interaction.idx} sample={i} clean={int(good)} | {first[:70]!r}", flush=True)
+                if good:
+                    cands.append(text)
+                if len(cands) == _REPAIR_CANDIDATES:
+                    break
+            prompts = [q] + self.rephrase(q)
+            self._restore(trained)
+            if not cands:
+                print(f"REPAIR idx={interaction.idx} NOCAND", flush=True)
+                return False
+            best_n, best_marks = self._score_prompts(q, prompts, name)
+            print(f"REPAIR idx={interaction.idx} before={best_marks} prompts={len(prompts)}", flush=True)
+            kept = False
+            for k, text in enumerate(cands):
+                think = text.split("</think>")[0].strip()
+                ans = " ".join(re.split(r"(?<=[.!?])\s", self._answer_of(text))[:2]).replace("\n", " ").strip()
+                example = make_revision_training_example(
+                    f"[[0]] {ans} [[/0]]",
+                    [InteractionHistory(idx=0, user_input=q, llm_response="")],
+                    self._tokenizer,
+                    think_mode="rationale",
+                    rationale=think,
+                )
+                stats = self.train_on_examples(
+                    collate_training_examples([example], self._tokenizer),
+                    [],
+                    loss_target=self._loss_target,
+                    max_steps=self._max_train_steps,
+                    rehearsal_weight=0.0,
+                    verbose=verbose,
+                )
+                mlx.core.clear_cache()
+                n, marks = self._score_prompts(q, prompts, name)
+                ok = n > best_n and self._controls_answer()
+                print(
+                    f"REPAIR idx={interaction.idx} cand={k} steps={stats.steps} loss={stats.final_loss:.2f} "
+                    f"target={ans[:45]!r} | {marks} | {'KEEP' if ok else 'restore'}",
+                    flush=True,
+                )
+                if ok:
+                    kept = True
+                    best_n, best_marks, trained = n, marks, self._snapshot()
+                    if n == len(prompts):
+                        break
+                else:
+                    self._restore(trained)
+            if kept and self._model_path is not None:
+                self._save_checkpoint()
+        return kept
+
     def _save_checkpoint(self) -> None:
-        """Writes the current weights to ``self._model_path``; caller must hold ``_lock``."""
+        """Writes the adapter weights to ``self._model_path``; caller must hold ``_lock``."""
         assert self._model_path is not None
-        vizible.green(f"Saving model to {self._model_path}")
-        self._model_path.parent.mkdir(parents=True, exist_ok=True)
-        save_model(self._model_path, self._model)
+        vizible.green(f"Saving adapter to {self._model_path}")
+        self._model_path.mkdir(parents=True, exist_ok=True)
+        weights = dict(mlx.utils.tree_flatten(self._model.trainable_parameters()))
+        mlx.core.save_safetensors(str(self._model_path / ADAPTER_FILE), weights)
 
     def self_correct_and_train(
         self,
@@ -1110,7 +1391,14 @@ class StatefulLLM:
         indices_to_review: List[int] | None = None,
         verbose: bool = False,
     ) -> bool:
-        """Cycle in which the model revises a previously unreviewed prompt and trains from its rewrite.
+        """Reviews unreviewed interactions and trains on what it finds.
+
+        Flagged interactions (a thumbs-down) go through ``repair``: the node
+        looks the question up, writes a corrected answer, and patches it into
+        the weights. With a ``lookup`` configured that is all a review does;
+        unflagged interactions are marked reviewed and left alone. Without one,
+        unflagged interactions take the older path: the model rewrites one of
+        its own past turns and trains on the rewrite.
 
         Args:
             interaction_history: Past user and model messages.
@@ -1124,6 +1412,26 @@ class StatefulLLM:
         self._model_is_stable = False
         try:
             with self._lock:
+                if indices_to_review is None:
+                    indices_to_review = list(range(len(interaction_history)))
+                flagged = [i for i in indices_to_review if interaction_history[i].flagged]
+                for i in flagged:
+                    h = interaction_history[i]
+                    h.reviewed = True
+                    if not h.note and self._lookup is not None:
+                        h.note = self._lookup(h.user_input) or ""
+                    if not h.note:
+                        print(f"REPAIR idx={h.idx} NONOTE", flush=True)
+                        continue
+                    self.repair(h, h.note, verbose=verbose)
+                indices_to_review = [i for i in indices_to_review if i not in flagged]
+                if not indices_to_review:
+                    return True
+                if self._lookup is not None:
+                    # Repair mode: only what the user flagged is trained on.
+                    for i in indices_to_review:
+                        interaction_history[i].reviewed = True
+                    return True
                 # Prepare training example from self-reflective revision of past dialog.
                 example = self._self_correct(
                     interaction_history, indices_to_review, verbose

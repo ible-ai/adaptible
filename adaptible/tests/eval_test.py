@@ -1411,7 +1411,7 @@ class MetaLearningTest(_TempDbTest):
         self.assertEqual(cfg["rehearsal_weight"], 1.0)
         self.assertEqual(cfg["model_kwargs"], {"learning_rate": 3e-5})
         # LoRA capacity defaults are recorded even when no flag set them.
-        self.assertEqual(cfg["lora"], {"rank": 32, "layers": 24, "scale": 10.0})
+        self.assertEqual(cfg["lora"], {"rank": 8, "layers": 8, "scale": 10.0})
         # The per-item rehearsal loss survives a save/load round trip.
         path = self.tmp_path / "reh.json"
         result.save(path)
@@ -2282,7 +2282,7 @@ class LossTargetTest(_TempDbTest):
             EvaluationHarness(model=model, db=self.db).run(dataset, config, verbose=True)
         out = buf.getvalue()
         self.assertIn("Rehearsal k: 1 (max tokens: 768, weight: 1, margin: 0.05)", out)
-        self.assertIn("LoRA: rank 32, layers 24, scale 10", out)
+        self.assertIn("LoRA: rank 8, layers 8, scale 10", out)
         self.assertRegex(
             out,
             r"Trained \(3 steps, loss 6\.05 → 0\.58 "
@@ -2317,8 +2317,8 @@ class LossTargetTest(_TempDbTest):
         self.assertEqual(result.lora_settings_text(), "LoRA: rank 8, layers 4, scale 2")
         self.assertEqual(result.to_dict()["lora"], {"rank": 8, "layers": 4, "scale": 2.0})
         # Defaults match StatefulLLM's when nothing was passed.
-        self.assertEqual(harness.lora_settings({}), (32, 24, 10.0))
-        self.assertEqual(harness.lora_model_kwargs(), harness.lora_model_kwargs(32, 24, 10.0))
+        self.assertEqual(harness.lora_settings({}), (8, 8, 10.0))
+        self.assertEqual(harness.lora_model_kwargs(), harness.lora_model_kwargs(8, 8, 10.0))
         for bad in ({"rank": 0}, {"layers": -1}, {"scale": 0}):
             with self.assertRaises(ValueError):
                 harness.lora_model_kwargs(**bad)
@@ -2407,7 +2407,7 @@ class LossTargetTest(_TempDbTest):
         self.assertIn("loss target: <code>0.60</code>", text)
         self.assertIn("Training: mean 3.0 steps/item (cap 12", text)
         self.assertIn("weight: <code>1</code>", text)
-        self.assertIn("LoRA: rank 32, layers 24, scale 10", text)
+        self.assertIn("LoRA: rank 8, layers 8, scale 10", text)
 
     def test_report_shows_rehearsal_loss(self):
         dataset = make_dataset(4)
@@ -2926,7 +2926,7 @@ class CliFlagsTest(unittest.TestCase):
         )
         return proc.stdout + proc.stderr
 
-    LORA_DEFAULTS = ("(default: '32')", "(default: '24')", "(default: '10.0')")
+    LORA_DEFAULTS = ("(default: '8')", "(default: '8')", "(default: '10.0')")
     HINGE_DEFAULTS = ("(default: '0.05')", "(default: '512')")
 
     def test_eval_cli_flags(self):

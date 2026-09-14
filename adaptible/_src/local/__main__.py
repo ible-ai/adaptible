@@ -11,7 +11,7 @@ from . import MutableHostedLLM
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 _HOST = "127.0.0.1"
 _PORT = 8000
-_ADDR = f"http://{_HOST}:{_PORT}/static/"
+_ADDR = f"http://{_HOST}:{_PORT}"
 
 
 async def main():
@@ -20,7 +20,7 @@ async def main():
     try:
         await server.up()
         vizible.green("Successfully launched server and enter eval framework")
-        vizible.blue(f"Server address: \n{_ADDR}")
+        vizible.blue(f"Server address: {_ADDR}\nTalk to it with: python -m adaptible.cli --url {_ADDR}")
         await asyncio.sleep(24 * 60 * 60)  # 1 day.
     except KeyboardInterrupt:
         vizible.red("Turn down requested.")

@@ -11,7 +11,8 @@ FastAPI server hosting a `StatefulLLM` with endpoints for chat and for triggerin
 ### Command Line
 
 ```bash
-python -m adaptible.local          # http://127.0.0.1:8000, web UI at /static/
+python -m adaptible.local          # http://127.0.0.1:8000
+python -m adaptible.cli            # in another terminal: ask, /down, /up, /review, /new, /quit
 ```
 
 `python -m adaptible.local` did not work before 1.0.0a3 (`adaptible.local` was a module, not a package); it is now a thin alias package over `adaptible/_src/local/`. The uvicorn ≥0.36 startup crash was fixed in the same release.
@@ -58,7 +59,6 @@ server = adaptible.local.MutableHostedLLM(app=app)
 | `/sync` | GET | Await every outstanding `/trigger_review` task, log any failure, then poll `model.ok` until training is done |
 | `/history` | GET | All interactions |
 | `/status` | GET | Health check |
-| `/static/` | GET | Web UI |
 
 Fixed in 1.0.0a3: `/trigger_review` previously created the training coroutine without awaiting or scheduling it, so no training ever ran; `/sync` only polled `model.ok`. A failed training task is logged by `/sync` and the model keeps its pre-training weights.
 
@@ -103,9 +103,9 @@ If `app` is not provided, a default `Adaptible()` is created with `StatefulLLM()
 
 The model's chat history records both user and assistant turns (assistant turns were dropped before 1.0.0a3).
 
-## Web UI
+## Terminal client
 
-`/static/` serves `adaptible/_src/static/index.html`: a terminal-style chat with streaming responses, history display, and a "trigger learning" button.
+`python -m adaptible.cli [--url URL] [line ...]` (`adaptible/_src/cli.py`) is a small REPL over these endpoints: typed text goes to `/stream_interact` and is printed as it streams; `/down` and `/up` post `/feedback` for the last answer; `/review` posts `/trigger_review` then blocks on `/sync` and prints the elapsed time; `/new` posts `/new_chat`; `/quit` exits. Lines passed as arguments run in order without the prompt.
 
 ## Files
 
@@ -118,8 +118,8 @@ adaptible/_src/local/
 
 adaptible/local/         # Alias package so `python -m adaptible.local` works
 adaptible/_src/_api.py   # Adaptible: routes and interaction history
-adaptible/_src/static/   # Web UI assets
-adaptible/tests/local_test.py, api_test.py   # Model-free tests
+adaptible/_src/cli.py    # Terminal client (python -m adaptible.cli)
+adaptible/tests/local_test.py, api_test.py, cli_test.py   # Model-free tests
 ```
 
 ## Limitations

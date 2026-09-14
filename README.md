@@ -53,26 +53,47 @@ trains on, the self-repair loop lifts accuracy from about a quarter of the
 prompts to three quarters or more within ten to sixteen cycles, in five runs
 out of five. The model stays a reasoning model while it does so. What happens
 after the lift varies from run to run: the score can hold, drift, or in one
-run fall back as the model starts looping. The write-up, with the data behind
-each number, is in [`results/`](results/README.md).
+run fall back as the model starts looping. Run as a served node with nothing
+but a thumbs-down and a document store to consult, the same loop repairs
+three of the five facts by the second session and the patches survive a
+restart; over sixteen sessions later repairs then start to undo earlier ones,
+because the node checks its own control prompts but not its earlier repairs.
+The write-up, with the data behind each number, is in
+[`results/`](results/README.md).
 
 ## Demo
 
-The browser UI at `/static/` shows the loop end to end:
+The terminal client shows the loop end to end, with the server running in
+another window:
 
 1. Ask a question the model gets wrong. `What is the capital of Australia?`
    It reasons for a paragraph and answers Sydney.
-2. Correct it in the conversation. `No. The capital is Canberra; Sydney is the
-   largest city.`
-3. Trigger a review. The model rereads the exchange, rewrites its earlier
-   answer, and trains on the rewrite in the background; `/sync` returns when
-   training is done.
-4. Ask again in a new conversation, in other words: `Which city is Australia's
-   capital?`
+2. Type `/down`.
+3. Type `/review`. The node looks the question up in its document store, reads
+   the passage, writes a corrected answer, trains on it in the background, and
+   keeps the update only if its own re-asks agree; the client reports when it
+   is done.
+4. Type `/new` and ask again in other words: `Which city is Australia's capital?`
 
-Step 4 comes out right only if step 3 produced a usable rewrite, which at this
-size it often does not; the self-repair loop exists to make that step
-reliable. TODO: screen recording of this sequence.
+![The four steps in the terminal: Sydney, /down, /review, /new, Canberra](docs/demo.gif)
+
+<details>
+<summary>Show the model's reasoning as it streams</summary>
+
+![The same run with the model's reasoning shown as it streams](docs/demo-thinking.gif)
+
+Both recordings are the same run with identical frame timing; the one above
+hides the reasoning behind a "thinking ..." line.
+
+</details>
+
+The recording above is one run of exactly that sequence on a freshly
+started server, sped up where marked, with the elapsed real time shown
+throughout; the only cut is the ten-minute review wait, marked on the clock.
+[`docs/demo.mp4`](docs/demo.mp4) and [`docs/demo-thinking.mp4`](docs/demo-thinking.mp4)
+are the two recordings as video. Step 4 comes out right when
+step 3 kept an update; the write-up in [`results/`](results/README.md) has
+the numbers across five facts and sixteen sessions.
 
 ## Run it
 
@@ -82,7 +103,8 @@ GPU for the self-repair loop through `scripts/colab/`.
 ```bash
 git clone https://github.com/ible-ai/adaptible && cd adaptible
 python -m venv .venv && .venv/bin/pip install -e .
-.venv/bin/python -m adaptible.local                      # server + UI at http://127.0.0.1:8000/static/
+.venv/bin/python -m adaptible.local                      # server at http://127.0.0.1:8000
+.venv/bin/python -m adaptible.cli                        # in another terminal: ask, /down, /review, /new
 PYTHONPATH=. .venv/bin/python scripts/cycles_mlx.py      # the self-repair loop
 .venv/bin/python -m adaptible.eval --subset 20 --shuffle --no_browser   # baseline / train / re-measure
 ```
@@ -94,7 +116,7 @@ endpoints, flags, and metrics. Model-free tests:
 ```bash
 python -m unittest adaptible.tests.classes_test adaptible.tests.api_test \
     adaptible.tests.local_test adaptible.tests.paths_test adaptible.tests.eval_test \
-    adaptible.tests.autonomous_test adaptible._src.revise.revise_test
+    adaptible.tests.autonomous_test adaptible.tests.cli_test adaptible._src.revise.revise_test
 ```
 
 ## Layout
@@ -102,7 +124,8 @@ python -m unittest adaptible.tests.classes_test adaptible.tests.api_test \
 ```text
 adaptible/_src/_llm.py        StatefulLLM: generation, LoRA training, loop breakers
 adaptible/_src/revise/        conversation -> training example, loss masks
-adaptible/_src/local/         FastAPI server and web UI
+adaptible/_src/local/         FastAPI server
+adaptible/_src/cli.py         terminal client
 adaptible/_src/eval/          dataset, evaluation harness, meta-learning, reports
 adaptible/_src/autonomous/    learning from web search against the model's beliefs
 scripts/cycles_mlx.py         self-repair loop (MLX)

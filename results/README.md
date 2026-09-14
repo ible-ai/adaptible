@@ -161,6 +161,61 @@ floor of about two points per cycle. The judge is substring matching. The
 sampling prompt contains the answer. Five runs in total, with one that
 degrades, is too few to put a rate on the failure case.
 
+## 6. The loop as a running node
+
+The cycle loop above hands the model two things a node on its own would not
+have: a reference note that carries the answer, and a judge that decides
+whether to keep an update. This run removes both. The model is served over
+HTTP (`python -m adaptible.local`), a client asks the five questions, and
+thumbs down the wrong answers. On review the node looks each flagged question
+up in a sealed store of twelve short passages (the five facts, the two
+controls, and five distractors; keyword overlap picks the passage), reads the
+passage and names the answer it gives, writes three rephrasings of the
+question, samples candidate answers with the passage attached (from the
+adapter the process started with), and trains at most four steps on one. The
+update is kept when the number of prompts, question plus rephrasings, whose
+first sentence names that answer rises, and three generic control prompts
+still answer; otherwise the weights are restored. The model does every read
+itself: the passage, its own candidates, and its own replies. The key-term
+judge and the hand-written paraphrases never enter the loop; they only score
+the session afterwards, together with two control facts the node is never
+asked to repair.
+
+Sixteen sessions, 71 candidates, 11 kept. Data in
+[`live-repair-2026-09-13-mlx/`](live-repair-2026-09-13-mlx/): `sessions.csv`
+(one row per session), `repairs.csv` (one row per candidate with the node's
+own marks before and after), `score.svg`.
+
+| session | flagged | kept | correct of 20 | controls of 2 |
+|---|---|---|---|---|
+| 0 | 5 | 3 | 4 | 1 |
+| 1 | 4 | 1 | 4 | 2 |
+| 2 | 3 | 1 | 11 | 2 |
+| 3 to 9 | 2 | 0 | 11 | 2 |
+| 10 | 2 | 1 | 7 | 1 |
+| 11 | 3 | 0 | 7 | 1 |
+| 12 | 3 | 1 | 6 | 2 |
+| 13 | 2 | 1 | 9 | 1 |
+| 14 | 3 | 2 | 7 | 2 |
+| 15 | 5 | 1 | 10 | 2 |
+
+Three facts are repaired by session 2 and hold for eight sessions: Morocco
+and Australia on all four phrasings, the Philippines on three. Loading the
+saved adapter in a fresh process reproduces the final session's marks
+exactly (10 of 20, Morocco and Australia 4 of 4, both control facts right),
+so the patches are in the weights, not the process. Turkey never moves: the
+node reads the passage right, writes Ankara, and four steps never change the
+greedy answer on any phrasing. The nearest star reaches two of four on the
+node's own prompts once, at session 10, and that update is where the churn
+starts: it passes the three generic controls and knocks Morocco from three
+phrasings to one, the Philippines from three to two, and makes the Vietnam
+control loop. From then on each kept repair moves one fact up and a neighbour
+down. The node's control prompts are not the neighbours, so it cannot see
+this; the outside score can. The cycle loop shows the same interference
+(section 3) but outruns it over forty rounds with the exact answer as the
+hint; here, with a passage to read and the node's own rephrasings as the
+yardstick, sixteen sessions end in a trade.
+
 ## Reproduce
 
 ```bash
@@ -170,3 +225,10 @@ CYCLES=40 PYTHONPATH=. .venv/bin/python scripts/cycles_mlx.py | tee cycles.log
 
 Or open [`scripts/colab/adaptible_cycles.ipynb`](../scripts/colab/adaptible_cycles.ipynb)
 on a Colab GPU and Run all.
+
+The running node:
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/live_repair.py --sessions 16 --out outputs/runs/live
+.venv/bin/python scripts/live_results.py --run outputs/runs/live --out results/my-live-run
+```

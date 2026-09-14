@@ -9,7 +9,7 @@ critique and rewrite its own past responses during idle time, and LoRA-fine-tune
 rewrites. The evaluation and meta-learning modules are meant to measure whether that loop
 produces net learning across seeds.
 
-Where things stand (2026-09-11): the flagship result is the self-repair cycle loop (`scripts/cycles_mlx.py`, PyTorch port in `scripts/colab/`), with its parsable output in `results/`. Session handoffs, findings, and probe scripts are local-only; `CLAUDE.local.md` (gitignored) says where. Never commit handoff docs, raw logs, or non-flagship results. Minimum viable experiments only.
+Where things stand (2026-09-13): the flagship result is the self-repair cycle loop (`scripts/cycles_mlx.py`, PyTorch port in `scripts/colab/`) plus the same loop run as a served node (`scripts/live_repair.py`: thumbs-down via `/feedback`, lookup via `DocStore`, repair in `StatefulLLM.repair`), with parsable output in `results/`. Session handoffs, findings, and probe scripts are local-only; `CLAUDE.local.md` (gitignored) says where. Never commit handoff docs, raw logs, or non-flagship results. Minimum viable experiments only.
 
 Apple Silicon only — `mlx` is a hard dependency of every code path that touches the model.
 Requires Python 3.13+. Version `1.0.0a3`.
@@ -29,7 +29,7 @@ python -m unittest adaptible.tests.api_test.InteractEndpointTest.test_x -v   # o
 python -m unittest adaptible.tests.llm_test adaptible.tests.integration_test -v
 
 # Run things
-python -m adaptible.local                                  # FastAPI server + web UI at /static/
+python -m adaptible.local                                  # FastAPI server; talk to it with python -m adaptible.cli
 python -m adaptible.eval --subset 20 --shuffle --no_browser # offline eval, HTML report
 python -m adaptible.eval --training_source self_generated   # measure self-correction (run once: 1/84 valid revisions)
 python -m adaptible.autonomous --cycles 3 --no_browser      # online learning against live web search

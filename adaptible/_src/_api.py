@@ -2,7 +2,6 @@
 
 import asyncio
 import collections
-import os
 import time
 from asyncio import log
 from typing import Any, List, Protocol
@@ -11,9 +10,10 @@ import tqdm
 import vizible
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from fastapi.staticfiles import StaticFiles
 
 from ._classes import (
+    FeedbackRequest,
+    FeedbackResponse,
     InteractionHistory,
     InteractionRequest,
     InteractionResponse,
@@ -28,8 +28,9 @@ class ModelProtocol(Protocol):
 
     ok: bool
 
-    def generate_response(self, prompt: str) -> str: ...
-    def stream_response(self, prompt: str) -> Any: ...
+    def generate_response(self, prompt: str, use_history: bool = True) -> str: ...
+    def stream_response(self, prompt: str, use_history: bool = True) -> Any: ...
+    def reset_conversation(self) -> None: ...
     def self_correct_and_train(
         self,
         interaction_history: List[InteractionHistory],
@@ -55,14 +56,6 @@ class Adaptible:
                 title="Stateful Self-Improving LLM Server",
                 description="An API for a stateful LLM that tries to improve itself over time.",
             )
-        self.app.mount(
-            "/static",
-            StaticFiles(
-                directory=os.path.join(os.path.dirname(__file__), "static"),
-                html=True,
-            ),
-            name="static",
-        )
 
         # In-memory store or interaction history from the current session.
         self.interaction_history: List[InteractionHistory] = []
@@ -85,7 +78,7 @@ class Adaptible:
                 raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
             print(f"Received request: {request}")
             # Generate the response using the current state of the model.
-            response_text = self.model.generate_response(request.prompt)
+            response_text = self.model.generate_response(request.prompt, use_history=request.use_history)
 
             # Store the interaction for later review
             interaction_idx = len(self.interaction_history)
@@ -105,11 +98,57 @@ class Adaptible:
 
         @self.app.post("/stream_interact")
         async def stream_interact_with_model(request: InteractionRequest):
-            """Stream interaction with model."""
-            # TODO - enable logging.
-            return StreamingResponse(
-                self.model.stream_response(request.prompt), media_type="text/plain"
+            """Streams the response; the interaction is recorded like ``/interact``.
+
+            The record's index is returned in the ``X-Interaction-Idx`` header
+            before the stream starts so a client can rate the response later.
+            """
+            if not request.prompt:
+                raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
+            interaction_idx = len(self.interaction_history)
+            record = InteractionHistory(
+                idx=interaction_idx,
+                user_input=request.prompt,
+                llm_response="",
+                reviewed=False,
+                timestamp=time.time(),
             )
+            self.interaction_history.append(record)
+            self.unreviewed_interaction_history_indices.append(interaction_idx)
+
+            async def relay():
+                chunks = []
+                async for chunk in self.model.stream_response(request.prompt, use_history=request.use_history):
+                    chunks.append(chunk)
+                    yield chunk
+                record.llm_response = "".join(chunks).strip()
+
+            return StreamingResponse(
+                relay(),
+                media_type="text/plain",
+                headers={"X-Interaction-Idx": str(interaction_idx)},
+            )
+
+        @self.app.post("/new_chat")
+        async def new_chat():
+            """Starts a new conversation; recorded interactions and flags are kept."""
+            self.model.reset_conversation()
+            return {"message": "New conversation started."}
+
+        @self.app.post("/feedback", response_model=FeedbackResponse)
+        async def feedback(request: FeedbackRequest):
+            """Thumbs-down flags a response for repair on the next review."""
+            if not 0 <= request.interaction_idx < len(self.interaction_history):
+                raise HTTPException(status_code=404, detail="No such interaction.")
+            if request.thumbs not in ("up", "down"):
+                raise HTTPException(status_code=400, detail="thumbs must be 'up' or 'down'.")
+            h = self.interaction_history[request.interaction_idx]
+            h.flagged = request.thumbs == "down"
+            if h.flagged:
+                h.reviewed = False
+                if request.interaction_idx not in self.unreviewed_interaction_history_indices:
+                    self.unreviewed_interaction_history_indices.append(request.interaction_idx)
+            return {"interaction_idx": request.interaction_idx, "flagged": h.flagged}
 
         @self.app.post("/trigger_review", response_model=ReviewResponse)
         async def trigger_review_cycle():

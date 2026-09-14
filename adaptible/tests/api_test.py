@@ -23,8 +23,9 @@ class StubModel:
         ] = []
         self._train_error = train_error
 
-    def generate_response(self, prompt: str) -> str:
+    def generate_response(self, prompt: str, use_history: bool = True) -> str:
         self._call_count += 1
+        self.use_history_calls = getattr(self, "use_history_calls", []) + [use_history]
         return f"Response to: {prompt}"
 
     def self_correct_and_train(
@@ -39,8 +40,12 @@ class StubModel:
             raise self._train_error
         return True
 
-    def stream_response(self, prompt: str):
-        del prompt
+    def reset_conversation(self) -> None:
+        self.resets = getattr(self, "resets", 0) + 1
+
+    async def stream_response(self, prompt: str, use_history: bool = True):
+        for chunk in ("Streamed: ", prompt):
+            yield chunk
 
 
 class InteractEndpointTest(unittest.TestCase):
@@ -59,6 +64,11 @@ class InteractEndpointTest(unittest.TestCase):
         data = response.json()
         self.assertEqual(data["response"], "Response to: Hello")
         self.assertEqual(data["interaction_idx"], 0)
+
+    def test_interact_use_history_flag_is_passed(self):
+        self.client.post("/interact", json={"prompt": "Q1"})
+        self.client.post("/interact", json={"prompt": "Q2", "use_history": False})
+        self.assertEqual(self.stub_model.use_history_calls, [True, False])
 
     def test_interact_empty_prompt_returns_400(self):
         """POST /interact with empty prompt should return 400."""
@@ -195,6 +205,70 @@ class TriggerReviewEndpointTest(unittest.TestCase):
         self.assertEqual(len(failing_model.self_correct_calls), 1)
         self.assertTrue(any("backprop exploded" in line for line in logs.output))
         self.assertEqual(len(api.outstanding_tasks), 0)
+
+
+class FeedbackEndpointTest(unittest.TestCase):
+    """Tests for /feedback and the stream path's history record."""
+
+    def setUp(self):
+        self.stub_model = StubModel()
+        self.api = adaptible.Adaptible(model=self.stub_model)
+        self.client = TestClient(self.api.app)
+
+    def test_thumbs_down_flags_interaction(self):
+        self.client.post("/interact", json={"prompt": "Q1"})
+        response = self.client.post("/feedback", json={"interaction_idx": 0, "thumbs": "down"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"interaction_idx": 0, "flagged": True})
+        self.assertTrue(self.api.interaction_history[0].flagged)
+
+    def test_thumbs_up_clears_flag(self):
+        self.client.post("/interact", json={"prompt": "Q1"})
+        self.client.post("/feedback", json={"interaction_idx": 0, "thumbs": "down"})
+        response = self.client.post("/feedback", json={"interaction_idx": 0, "thumbs": "up"})
+        self.assertFalse(response.json()["flagged"])
+        self.assertFalse(self.api.interaction_history[0].flagged)
+
+    def test_flag_after_review_requeues_interaction(self):
+        """A thumbs-down on an already-reviewed answer puts it back in the review queue."""
+        self.client.post("/interact", json={"prompt": "Q1"})
+        self.client.post("/trigger_review")
+        self.client.get("/sync")
+        self.assertEqual(self.api.unreviewed_interaction_history_indices, [])
+        self.client.post("/feedback", json={"interaction_idx": 0, "thumbs": "down"})
+        self.assertEqual(self.api.unreviewed_interaction_history_indices, [0])
+        self.client.post("/trigger_review")
+        self.client.get("/sync")
+        history, _ = self.stub_model.self_correct_calls[1]
+        self.assertTrue(history[0].flagged)
+
+    def test_new_chat_resets_conversation_and_keeps_history(self):
+        self.client.post("/interact", json={"prompt": "Q1"})
+        response = self.client.post("/new_chat")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.stub_model.resets, 1)
+        self.assertEqual(len(self.api.interaction_history), 1)
+
+    def test_unknown_index_is_404(self):
+        response = self.client.post("/feedback", json={"interaction_idx": 3, "thumbs": "down"})
+        self.assertEqual(response.status_code, 404)
+
+    def test_bad_thumbs_is_400(self):
+        self.client.post("/interact", json={"prompt": "Q1"})
+        response = self.client.post("/feedback", json={"interaction_idx": 0, "thumbs": "sideways"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_stream_interact_records_history_with_index_header(self):
+        response = self.client.post("/stream_interact", json={"prompt": "Q1"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["X-Interaction-Idx"], "0")
+        self.assertEqual(response.text, "Streamed: Q1")
+        self.assertEqual(len(self.api.interaction_history), 1)
+        self.assertEqual(self.api.interaction_history[0].llm_response, "Streamed: Q1")
+        self.assertEqual(self.api.unreviewed_interaction_history_indices, [0])
+        # The streamed answer can be rated like any other.
+        response = self.client.post("/feedback", json={"interaction_idx": 0, "thumbs": "down"})
+        self.assertTrue(response.json()["flagged"])
 
 
 class HistoryEndpointTest(unittest.TestCase):

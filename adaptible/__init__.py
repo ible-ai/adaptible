@@ -2,10 +2,13 @@
 
 from . import autonomous
 from . import eval
+from . import cli
 from . import local
 from . import revise
 from ._src._api import Adaptible, ModelProtocol
 from ._src._classes import (
+    FeedbackRequest,
+    FeedbackResponse,
     InteractionHistory,
     InteractionRequest,
     InteractionResponse,
@@ -14,6 +17,7 @@ from ._src._classes import (
     TrainingExample,
 )
 from ._src._llm import StatefulLLM
+from ._src.lookup import DocStore
 from ._src.db import Database, Example, Experiment, Response, TrainingEvent
 from ._src.db import ExperimentType, Phase, SourceType
 from ._src.db import default_judge
@@ -21,6 +25,8 @@ from ._src.db import default_judge
 __all__ = [
     "Adaptible",
     "ModelProtocol",
+    "FeedbackRequest",
+    "FeedbackResponse",
     "InteractionHistory",
     "InteractionRequest",
     "InteractionResponse",
@@ -28,8 +34,10 @@ __all__ = [
     "SyncResponse",
     "TrainingExample",
     "StatefulLLM",
+    "DocStore",
     "autonomous",
     "eval",
+    "cli",
     "local",
     "revise",
     # Database exports
