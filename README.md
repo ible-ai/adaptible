@@ -1,5 +1,7 @@
 # Adaptible
 
+[self-link to github repo](https://github.com/ible-ai/adaptible)
+
 A small language model that keeps its conversations and retrains itself on its
 own corrections, on a laptop.
 
