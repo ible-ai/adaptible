@@ -110,9 +110,35 @@ PYTHONPATH=. .venv/bin/python scripts/cycles_mlx.py      # the self-repair loop
 .venv/bin/python -m adaptible.eval --subset 20 --shuffle --no_browser   # baseline / train / re-measure
 ```
 
+To wrap an existing Ollama model without downloading another checkpoint:
+
+```bash
+python -m pip install -e '.[wrap]'
+adaptible wrap ollama qwen3:0.6b
+```
+
+The wrapper connects Ollama, llama.cpp, LM Studio, and vLLM using existing local
+weights. Flagging a short factual answer triggers automatic web evidence lookup,
+training, and checks before an update is kept; no correction file is required.
+Learned questions use the latest cumulative adapter; other requests use the
+original model. Matching respects thinking mode and conversation context and
+may decline unfamiliar paraphrases. This does not establish global weight stability.
+Dense Qwen2/Qwen2.5 and Qwen3 text architectures are implemented. Qwen3.8's
+hybrid architecture is not supported yet, and adapters belong to their exact
+base checkpoint.
+
+Qwen3 0.6B passed two accumulating automatic repairs, retention, restart, and
+streaming in all four native runtimes with thinking disabled. Thinking-enabled
+learning is implemented, but no native thinking-learning run has passed yet.
+The wrapper's terminal client now enables thinking by default. These short
+integration runs do not establish stability over the original multi-hour workload.
+The [wrapper README](adaptible/_src/wrap/README.md) has setup commands, client
+integration, model and memory limits, and the current verification table.
+
 `scripts/colab/adaptible_cycles.ipynb` runs the loop on a free Colab T4 and
 resumes across sessions. Module READMEs under `adaptible/_src/` document
-endpoints, flags, and metrics. Model-free tests:
+endpoints, flags, and metrics. These fast model-free checks test code behavior;
+they do not replace native learning runs:
 
 ```bash
 python -m unittest adaptible.tests.classes_test adaptible.tests.api_test \

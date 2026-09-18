@@ -44,10 +44,16 @@ class Client:
         out=None,
         color: bool | None = None,
     ):
-        self.http = http or httpx.Client(base_url=url, timeout=httpx.Timeout(None, connect=5))
+        self.http = http or httpx.Client(
+            base_url=url, timeout=httpx.Timeout(None, connect=5)
+        )
         self.url = url
         self.out = out or sys.stdout
-        self.color = bool(getattr(self.out, "isatty", lambda: False)()) if color is None else color
+        self.color = (
+            bool(getattr(self.out, "isatty", lambda: False)())
+            if color is None
+            else color
+        )
         self.last_idx: int | None = None
 
     def paint(self, text: str, kind: str) -> str:
@@ -79,7 +85,14 @@ class Client:
                     pending, thinking = "", False
                 else:
                     # Hold back a partial tag so its colour is not split across chunks.
-                    keep = next((n for n in range(len(THINK_END) - 1, 0, -1) if pending.endswith(THINK_END[:n])), 0)
+                    keep = next(
+                        (
+                            n
+                            for n in range(len(THINK_END) - 1, 0, -1)
+                            if pending.endswith(THINK_END[:n])
+                        ),
+                        0,
+                    )
                     self._print(pending[: len(pending) - keep], end="", kind="think")
                     pending = pending[len(pending) - keep :]
         self._print(pending, end="", kind="think" if thinking else "answer")
@@ -90,7 +103,9 @@ class Client:
         if self.last_idx is None:
             self._print("nothing to rate yet", kind="error")
             return
-        r = self.http.post("/feedback", json={"interaction_idx": self.last_idx, "thumbs": thumbs})
+        r = self.http.post(
+            "/feedback", json={"interaction_idx": self.last_idx, "thumbs": thumbs}
+        )
         r.raise_for_status()
         flagged = r.json()["flagged"]
         self._print(
@@ -109,6 +124,11 @@ class Client:
         r = self.http.get("/sync")
         r.raise_for_status()
         self._print(f"[review] done in {r.json()['elapsed_time']:.0f} s", kind="review")
+        for review in r.json().get("reviews", []):
+            self._print(
+                f"[review] answer {review['interaction_idx']}: {review['status']} — {review['reason']}",
+                kind="error" if review["status"] == "failed" else "review",
+            )
 
     def new_chat(self) -> None:
         self.http.post("/new_chat").raise_for_status()
@@ -141,19 +161,33 @@ class Client:
 
 def prompt_kind(line: str) -> str:
     """Colour kind for a typed line: commands take their own colour, questions are prompts."""
-    return line.strip()[1:] if line.strip() in ("/down", "/up", "/review", "/new") else "prompt"
+    return (
+        line.strip()[1:]
+        if line.strip() in ("/down", "/up", "/review", "/new")
+        else "prompt"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m adaptible.cli", description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog="python -m adaptible.cli", description=__doc__
+    )
     parser.add_argument("--url", default=DEFAULT_URL, help="server address")
-    parser.add_argument("lines", nargs="*", help="lines to run instead of reading stdin")
+    parser.add_argument(
+        "lines", nargs="*", help="lines to run instead of reading stdin"
+    )
     args = parser.parse_args(argv)
     client = Client(args.url)
     try:
         client.http.get("/status").raise_for_status()
     except httpx.HTTPError:
-        print(client.paint(f"no server at {args.url}; start one with `python -m adaptible.local`", "error"), file=sys.stderr)
+        print(
+            client.paint(
+                f"no server at {args.url}; start one with `python -m adaptible.local`",
+                "error",
+            ),
+            file=sys.stderr,
+        )
         return 1
     try:
         if args.lines:
@@ -166,7 +200,10 @@ def main(argv: list[str] | None = None) -> int:
         while True:
             try:
                 # The terminal echoes what is typed, so open the colour before reading.
-                line = input(client.paint("> ", "prompt") + ("\033[%sm" % COLORS["prompt"] if client.color else ""))
+                line = input(
+                    client.paint("> ", "prompt")
+                    + ("\033[%sm" % COLORS["prompt"] if client.color else "")
+                )
             except EOFError:
                 print()
                 break
