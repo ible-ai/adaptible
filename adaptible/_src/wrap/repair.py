@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import functools
 import hashlib
 import json
 import logging
@@ -15,6 +16,7 @@ from pathlib import Path
 
 from ..lookup import DocStore
 from .fact_scope import equivalent, parse_question
+from .loop_breaker import complete_as_original
 from .references import ReferenceSearchError, WebReferences
 from .retention import evaluate_retention, retention_regressions
 from .scope_router import ScopeRouter
@@ -902,6 +904,13 @@ class Controller:
     async def extract(self, q, text):
         return (await self.grounded(q, text)).get("name", "")
 
+    @functools.cached_property
+    def loop_tokenizer(self):
+        """The checkpoint's tokenizer, for replaying the original's loop breakers."""
+        from .tokenizer import load_tokenizer
+
+        return load_tokenizer(self.runtime.blob)
+
     def training_start(self, accepted):
         """The adapter a candidate starts training from, or None for a fresh one.
 
@@ -937,8 +946,12 @@ class Controller:
         stop = start + _FLAGSHIP_SAMPLES if stop is None else stop
         for index in range(start, stop):
             details = {}
-            await self.runtime.complete(
+            # cycles_mlx.sample stops on a token loop (not on repeated lines).
+            await complete_as_original(
+                self.runtime,
+                getattr(self, "loop_tokenizer", None),
                 messages,
+                lines=False,
                 frozen=True,
                 thinking=True,
                 temperature=self.flagship_candidate_temperature,
@@ -1240,9 +1253,21 @@ class Controller:
             if handle is None and self.runtime.active:
                 route = await self.route(messages, {"thinking": thinking})
                 mode_options["frozen"] = route["adapter"] == "base"
-            response = await self.runtime.complete(
-                messages, handle=handle, **mode_options
-            )
+            if self.flagship_recipe:
+                # generate_response stops on a repeated line or a token loop;
+                # a runtime decodes on to its cap, and can close the thought.
+                response = await complete_as_original(
+                    self.runtime,
+                    self.loop_tokenizer,
+                    messages,
+                    lines=True,
+                    handle=handle,
+                    **mode_options,
+                )
+            else:
+                response = await self.runtime.complete(
+                    messages, handle=handle, **mode_options
+                )
             passed = (
                 not thinking or thinking_complete(generation)
             ) and await self.judge(q, response, expected, note=note, wrong=wrong)

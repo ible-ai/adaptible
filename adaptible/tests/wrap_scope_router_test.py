@@ -497,6 +497,8 @@ class FlagshipRecipeRoutingTest(unittest.IsolatedAsyncioTestCase):
         self.controller = Controller(
             self.runtime, self.store, web_search=False, flagship_recipe=True
         )
+        # No checkpoint behind FakeRuntime; loop_breaker_test covers the replay.
+        self.controller.loop_tokenizer = None
         self.strict = Controller(self.runtime, self.store, web_search=False)
         self.messages = [dict(role="user", content="Something entirely unrelated.")]
 
@@ -545,6 +547,8 @@ class FlagshipTrainingExampleTest(unittest.IsolatedAsyncioTestCase):
         self.controller = Controller(
             self.runtime, self.store, web_search=False, flagship_recipe=True
         )
+        # No checkpoint behind FakeRuntime; loop_breaker_test covers the replay.
+        self.controller.loop_tokenizer = None
         self.sent = []
 
     def tearDown(self):
@@ -669,6 +673,7 @@ class FlagshipCandidateCountTest(unittest.IsolatedAsyncioTestCase):
                 controller = Controller(
                     FakeRuntime(), store, web_search=False, flagship_recipe=True
                 )
+                controller.loop_tokenizer = None
                 seeds = []
 
                 async def complete(messages, **kwargs):
