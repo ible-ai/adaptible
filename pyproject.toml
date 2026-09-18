@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-wrap = ["torch", "peft", "gguf>=0.17", "httpx", "filelock"]
+wrap = ["torch", "peft", "gguf>=0.17", "httpx", "filelock", "lmstudio>=1.5"]
 
 [build-system]
 requires = ["hatchling"]

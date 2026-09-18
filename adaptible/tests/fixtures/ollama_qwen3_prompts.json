@@ -1,0 +1,125 @@
+{
+  "source": "Official Ollama qwen3:0.6b template ae370d884f108d16e7cc8fd5259ebc5773a0afa6e078b11f4ed7e39a27e0dfc4, rendered with Go text/template and Ollama v0.12.10 collation.",
+  "cases": [
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "name": "single",
+      "prompt": "<|im_start|>user\nHello /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "system": "",
+      "think": false
+    },
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be precise."
+        },
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "name": "system",
+      "prompt": "<|im_start|>system\n\nBe precise.<|im_end|>\n<|im_start|>user\nHello /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "system": "",
+      "think": false
+    },
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        },
+        {
+          "role": "assistant",
+          "content": "Hi."
+        },
+        {
+          "role": "user",
+          "content": "Where?"
+        }
+      ],
+      "name": "multi",
+      "prompt": "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi.<|im_end|>\n<|im_start|>user\nWhere? /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "system": "",
+      "think": false
+    },
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "A"
+        },
+        {
+          "role": "system",
+          "content": "B"
+        },
+        {
+          "role": "user",
+          "content": "Hello"
+        },
+        {
+          "role": "user",
+          "content": "Again"
+        },
+        {
+          "role": "assistant",
+          "content": "Okay"
+        },
+        {
+          "role": "user",
+          "content": "End"
+        }
+      ],
+      "name": "collation",
+      "prompt": "<|im_start|>system\n\nA\n\nB<|im_end|>\n<|im_start|>user\nHello\n\nAgain<|im_end|>\n<|im_start|>assistant\nOkay<|im_end|>\n<|im_start|>user\nEnd /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "system": "",
+      "think": false
+    },
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "name": "model_system",
+      "prompt": "<|im_start|>system\n\nYou are helpful.<|im_end|>\n<|im_start|>user\nHello /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "system": "You are helpful.",
+      "think": false
+    },
+    {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Override"
+        },
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "name": "system_override",
+      "prompt": "<|im_start|>system\n\nOverride<|im_end|>\n<|im_start|>user\nHello /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "system": "You are helpful.",
+      "think": false
+    },
+    {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "name": "thinking",
+      "prompt": "<|im_start|>user\nHello /think<|im_end|>\n<|im_start|>assistant\n",
+      "system": "",
+      "think": true
+    }
+  ]
+}
