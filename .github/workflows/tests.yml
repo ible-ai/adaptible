@@ -98,6 +98,8 @@ jobs:
             adaptible.tests.experiment_equivalence_test \
             adaptible.tests.runtime_parity_test \
             adaptible.tests.question_candidate_structural_test \
+            adaptible.tests.loop_breaker_test \
+            adaptible.tests.wrapper_parity_test \
             adaptible._src.revise.revise_test \
             -v
 
@@ -174,6 +176,7 @@ jobs:
             adaptible.tests.runtime_command_test \
             adaptible.tests.model_source_test adaptible.tests.gguf_adapter_test \
             adaptible.tests.wrap_tokenizer_test \
+            adaptible.tests.loop_breaker_test adaptible.tests.wrapper_parity_test \
             adaptible.tests.prompt_format_test \
             adaptible.tests.ollama_fusion_test \
             adaptible.tests.wrap_integration_test -v

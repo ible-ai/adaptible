@@ -125,31 +125,44 @@ the original multi-hour experiments; fast model-free tests cannot establish it e
 ### Reproducing the original experiment exactly
 
 `--flagship-recipe` runs the self-repair loop of `scripts/cycles_mlx.py`
-through a wrapper instead of MLX. Its output was compared with the original
-token for token, on DeepSeek-R1-Distill-Qwen-1.5B at float32, with greedy
-decoding and every correction's reasoning and answer compared in full:
+through a wrapper instead of MLX. `scripts/wrapper_parity.py` checks it: on
+DeepSeek-R1-Distill-Qwen-1.5B at float32, the original and a wrapper each
+answer the experiment's four prompts for one fact greedily, train on the same
+correction from the same starting LoRA weights, and answer again. Every
+generation's reasoning and answer is compared in full:
 
-| App | Decoding (5 prompts) | Trained adapter served (8 prompts) | One full correction cycle (8 prompts) |
+| App | 8 generations, before and after training | Training steps | Final loss vs MLX |
 | --- | --- | --- | --- |
-| vLLM | Identical | Identical | Identical |
-| llama.cpp | Identical | Identical | Identical |
-| LM Studio | Identical | Identical | Identical |
-| Ollama | Identical | 7 of 8 identical | Not completed |
+| llama.cpp | Identical | 4 of 4 | 3.2e-6 |
+| LM Studio | Identical | 4 of 4 | 3.2e-6 |
+| vLLM | Identical | 4 of 4 | 3.2e-6 |
+| Ollama | Identical | 4 of 4 | 3.2e-6 |
 
-A full cycle means the same sampled correction, training target, number of
-updates and keep decision, with identical generations before and after
-training. From the same starting LoRA weights, the wrapper's PyTorch trainer
-ends within 3e-6 of MLX's loss. Ollama's one divergence comes from its f16
-KV cache: llama.cpp run with that single setting changed reproduces Ollama's
-output byte for byte, and no Ollama release offers an f32 cache.
+Separately, one full correction cycle (sampling the correction, training,
+and the keep decision) matched MLX exactly on vLLM, llama.cpp and LM Studio.
+It has not been reproduced on Ollama.
 
-Exact agreement depends on settings the wrapper now pins, because each runtime
+Three limits apply:
+
+- On Apple Silicon, vLLM runs as vllm-metal, which computes with mlx_lm. A
+  vLLM match there checks the wrapper's requests, training and adapter
+  export, not vLLM's own kernels.
+- Ollama's KV cache is fixed at f16, and no release offers f32. On a
+  different set of prompts it diverged from MLX on one generation of eight;
+  llama.cpp run with an f16 KV cache reproduces that divergence byte for byte.
+- The wrapper finds token ids by encoding the returned text, since runtimes
+  don't report them. It needs them to stop a looping generation where the
+  original does, and re-encoding does not always give the ids the model
+  generated.
+
+Exact agreement depends on settings the wrapper pins, because each runtime
 otherwise applies its own defaults: neutral sampling, no prompt caching, the
-checkpoint's own stored precision (read from the safetensors headers, not
+checkpoint's stored precision (read from the safetensors headers, not
 `config.json`), an f32 KV cache, flash attention off, and a small batch size so
-prefill is not rounded through f16. The original draws its LoRA initialisation
-unseeded, so two MLX runs do not match each other; `--initial-adapter` starts
-a wrapper from the initialisation of a given MLX run.
+prefill is not rounded through f16. It also stops a generation where the
+original's loop breakers do. The original draws its LoRA initialisation
+unseeded, so two MLX runs do not match each other; `--initial-adapter` starts a
+wrapper from the initialisation of a given MLX run.
 
 [Run the integration demos](INTEGRATION.md#repeatable-live-demo) or read
 [how training and persistence work](IMPLEMENTATION.md).

@@ -132,9 +132,11 @@ streaming in all four native runtimes with thinking disabled. Thinking-enabled
 learning is implemented, but no native thinking-learning run has passed yet.
 The wrapper's terminal client now enables thinking by default. These short
 integration runs do not establish stability over the original multi-hour workload.
-Run with `--flagship-recipe`, vLLM, llama.cpp, and LM Studio reproduce one
-full correction cycle of `scripts/cycles_mlx.py` token for token. Ollama
-diverges on one prompt of eight because its KV cache is fixed at f16.
+Run with `--flagship-recipe`, all four runtimes reproduce the original's
+generations, training and trained adapter token for token in
+`scripts/wrapper_parity.py`, which anyone can rerun. vLLM on Apple Silicon
+computes with MLX, and Ollama's f16 KV cache can still diverge on other
+prompts.
 The [wrapper README](adaptible/_src/wrap/README.md) has setup commands, client
 integration, model and memory limits, and the current verification table.
 
