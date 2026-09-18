@@ -50,12 +50,11 @@ cannot be satisfied by a model that has stopped answering.
 
 ## Conclusion
 
-On five facts the model gets wrong, each tested in four phrasings it never
-trains on, the self-repair loop lifts accuracy from about a quarter of the
-prompts to three quarters or more within ten to sixteen cycles, in five runs
-out of five. The model stays a reasoning model while it does so. What happens
-after the lift varies from run to run: the score can hold, drift, or in one
-run fall back as the model starts looping. Run as a served node with nothing
+On five facts the model gets wrong, each tested on the original question and
+three untrained phrasings, four of five runs reach at least 16 correct answers
+out of 20 within sixteen cycles. The fifth peaks at 13 before degrading into
+looping. What happens after the lift varies: the score can hold or drift.
+Run as a served node with nothing
 but a thumbs-down and a document store to consult, the same loop repairs
 three of the five facts by the second session and the patches survive a
 restart; over sixteen sessions later repairs then start to undo earlier ones,
