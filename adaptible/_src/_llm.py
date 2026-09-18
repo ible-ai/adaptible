@@ -157,7 +157,12 @@ def _load(
             model.load_weights(str(adapter_file), strict=False)
         else:
             files = sorted(model_path.glob("*.safetensors"))
-            weights = {k: v for f in files for k, v in mlx.core.load(str(f)).items() if "lora" in k}
+            weights = {
+                k: v
+                for f in files
+                for k, v in mlx.core.load(str(f)).items()
+                if "lora" in k
+            }
             if weights:
                 print(f"Loading {len(weights)} adapter tensors from {model_path}")
                 model.load_weights(list(weights.items()), strict=False)
@@ -806,7 +811,8 @@ class StatefulLLM:
         #    target collapses the model, so an item with no rationale is not trained.
         rationale, _, _ = rationale_from_output(llm_rewrite_response, self._tokenizer)
         if not rationale and template_opens_think(
-            self._tokenizer, [{"role": "user", "content": interactions_to_review[0].user_input}]
+            self._tokenizer,
+            [{"role": "user", "content": interactions_to_review[0].user_input}],
         ):
             raise ValueError("rationale required: the revision carried no reasoning")
         example = make_collated_training_example(
@@ -956,7 +962,9 @@ class StatefulLLM:
                 del loss_r, grads_r
             if initial_losses is None:
                 initial_losses = list(rehearsal_losses)
-            active = active_rehearsal(rehearsal_losses, initial_losses, rehearsal_margin)
+            active = active_rehearsal(
+                rehearsal_losses, initial_losses, rehearsal_margin
+            )
             active_grads = [g for g, on in zip(rehearsal_grads, active) if on]
             grads = combine_grads(grads_c, active_grads, rehearsal_weight)
             del grads_c, rehearsal_grads, active_grads
@@ -1171,12 +1179,18 @@ class StatefulLLM:
         toks: list[int] = []
         text: list[str] = []
         for r in stream_generate(
-            self._model, self._tokenizer, prompt=ids, max_tokens=max_tokens, sampler=sampler
+            self._model,
+            self._tokenizer,
+            prompt=ids,
+            max_tokens=max_tokens,
+            sampler=sampler,
         ):
             toks.append(r.token)
             text.append(r.text)
             if _detect_token_loop(
-                toks, self._loop_detection_sequence_length, self._loop_detection_max_repetitions
+                toks,
+                self._loop_detection_sequence_length,
+                self._loop_detection_max_repetitions,
             ):
                 break
         return "".join(text)
@@ -1210,7 +1224,9 @@ class StatefulLLM:
         )
         for attempt in range(4):
             if attempt == 0:
-                out = self.generate_response(prompt, use_history=False, max_tokens=_JUDGE_TOKENS)
+                out = self.generate_response(
+                    prompt, use_history=False, max_tokens=_JUDGE_TOKENS
+                )
             else:
                 out = self._sample(prompt, 7000 + attempt, _JUDGE_TOKENS)
             if "</think>" not in out:
@@ -1218,7 +1234,11 @@ class StatefulLLM:
             answer = self._answer_of(out)
             m = re.search(r"Name:\s*(.+)", answer)
             lines = [l for l in answer.splitlines() if l.strip()]
-            name = m.group(1) if m else (lines[-1] if lines and len(lines[-1].split()) <= 5 else "")
+            name = (
+                m.group(1)
+                if m
+                else (lines[-1] if lines and len(lines[-1].split()) <= 5 else "")
+            )
             name = re.sub(r"[*_`\"']", "", name).strip().rstrip(".").strip()
             if name and len(name.split()) <= 5 and name.casefold() in text.casefold():
                 return name
@@ -1259,28 +1279,49 @@ class StatefulLLM:
         # Greedy first, then sampled attempts until there are enough.
         seen, paras = {question.strip().casefold()}, []
         for attempt in range(4):
-            out = (self.generate_response(prompt, use_history=False) if attempt == 0
-                   else self._sample(prompt, 8000 + attempt, self._max_tokens))
+            out = (
+                self.generate_response(prompt, use_history=False)
+                if attempt == 0
+                else self._sample(prompt, 8000 + attempt, self._max_tokens)
+            )
             found = re.findall(r'["\u201c]([^"\u201d]{8,140}\?)["\u201d]', out)
             for line in self._answer_of(out).splitlines() if "</think>" in out else []:
-                found.append(re.sub(r"^\s*(\d+[.)]|[-*])\s*", "", line).strip().strip('"'))
+                found.append(
+                    re.sub(r"^\s*(\d+[.)]|[-*])\s*", "", line).strip().strip('"')
+                )
             for cand in found:
                 cand = cand.strip()
-                if cand.endswith("?") and 3 <= len(cand.split()) <= 25 and cand.casefold() not in seen:
+                if (
+                    cand.endswith("?")
+                    and 3 <= len(cand.split()) <= 25
+                    and cand.casefold() not in seen
+                ):
                     seen.add(cand.casefold())
                     paras.append(cand)
                 if len(paras) == n:
                     return paras
         return paras
 
-    def _score_prompts(self, question: str, prompts: Sequence[str], name: str) -> Tuple[int, str]:
+    def _score_prompts(
+        self, question: str, prompts: Sequence[str], name: str
+    ) -> Tuple[int, str]:
         """Answers each prompt with the current weights; reads each answer under the frozen adapter."""
         answers = [self.generate_response(p, use_history=False) for p in prompts]
         cur = self._snapshot()
-        self._restore(self._base_adapter)
-        marks = ["✓" if "</think>" in a and self.judge(question, self._answer_of(a), name) else "✗" for a in answers]
-        self._restore(cur)
-        return marks.count("✓"), "".join(marks)
+        try:
+            self._restore(self._base_adapter)
+            marks = [
+                (
+                    "✓"
+                    if "</think>" in a
+                    and self.judge(question, self._answer_of(a), name)
+                    else "✗"
+                )
+                for a in answers
+            ]
+            return marks.count("✓"), "".join(marks)
+        finally:
+            self._restore(cur)
 
     def _controls_answer(self) -> bool:
         for q in self._control_prompts:
@@ -1289,7 +1330,9 @@ class StatefulLLM:
                 return False
         return True
 
-    def repair(self, interaction: InteractionHistory, note: str, verbose: bool = False) -> bool:
+    def repair(
+        self, interaction: InteractionHistory, note: str, verbose: bool = False
+    ) -> bool:
         """Patches one flagged answer into the weights using what the node looked up.
 
         The model first names the answer from the note (``extract``) and writes
@@ -1314,67 +1357,92 @@ class StatefulLLM:
         hinted = f"{q}\n\n(Reference note: {note})"
         with self._lock:
             trained = self._snapshot()
-            # Candidates and the reading of the note come from the frozen starting adapter.
-            self._restore(self._base_adapter)
-            name = self.extract(q, note)
-            print(f"REPAIR idx={interaction.idx} note_answer={name!r}", flush=True)
-            if not name:
+            try:
+                # Candidates and the reading of the note come from the frozen starting adapter.
+                self._restore(self._base_adapter)
+                name = self.extract(q, note)
+                print(f"REPAIR idx={interaction.idx} note_answer={name!r}", flush=True)
+                if not name:
+                    self._restore(trained)
+                    return False
+                cands: list[str] = []
+                for i in range(_REPAIR_SAMPLES):
+                    text = self._sample(
+                        hinted, 1000 + 100 * interaction.idx + i, _REPAIR_SAMPLE_TOKENS
+                    )
+                    closed = "</think>" in text
+                    first = (
+                        self._first_sentence(self._answer_of(text)) if closed else ""
+                    )
+                    good = (
+                        closed
+                        and 0 < len(first) < 300
+                        and self.judge(q, self._answer_of(text), name)
+                    )
+                    print(
+                        f"REPAIR idx={interaction.idx} sample={i} clean={int(good)} | {first[:70]!r}",
+                        flush=True,
+                    )
+                    if good:
+                        cands.append(text)
+                    if len(cands) == _REPAIR_CANDIDATES:
+                        break
+                prompts = [q] + self.rephrase(q)
                 self._restore(trained)
-                return False
-            cands: list[str] = []
-            for i in range(_REPAIR_SAMPLES):
-                text = self._sample(hinted, 1000 + 100 * interaction.idx + i, _REPAIR_SAMPLE_TOKENS)
-                closed = "</think>" in text
-                first = self._first_sentence(self._answer_of(text)) if closed else ""
-                good = closed and 0 < len(first) < 300 and self.judge(q, self._answer_of(text), name)
-                print(f"REPAIR idx={interaction.idx} sample={i} clean={int(good)} | {first[:70]!r}", flush=True)
-                if good:
-                    cands.append(text)
-                if len(cands) == _REPAIR_CANDIDATES:
-                    break
-            prompts = [q] + self.rephrase(q)
-            self._restore(trained)
-            if not cands:
-                print(f"REPAIR idx={interaction.idx} NOCAND", flush=True)
-                return False
-            best_n, best_marks = self._score_prompts(q, prompts, name)
-            print(f"REPAIR idx={interaction.idx} before={best_marks} prompts={len(prompts)}", flush=True)
-            kept = False
-            for k, text in enumerate(cands):
-                think = text.split("</think>")[0].strip()
-                ans = " ".join(re.split(r"(?<=[.!?])\s", self._answer_of(text))[:2]).replace("\n", " ").strip()
-                example = make_revision_training_example(
-                    f"[[0]] {ans} [[/0]]",
-                    [InteractionHistory(idx=0, user_input=q, llm_response="")],
-                    self._tokenizer,
-                    think_mode="rationale",
-                    rationale=think,
-                )
-                stats = self.train_on_examples(
-                    collate_training_examples([example], self._tokenizer),
-                    [],
-                    loss_target=self._loss_target,
-                    max_steps=self._max_train_steps,
-                    rehearsal_weight=0.0,
-                    verbose=verbose,
-                )
-                mlx.core.clear_cache()
-                n, marks = self._score_prompts(q, prompts, name)
-                ok = n > best_n and self._controls_answer()
+                if not cands:
+                    print(f"REPAIR idx={interaction.idx} NOCAND", flush=True)
+                    return False
+                best_n, best_marks = self._score_prompts(q, prompts, name)
                 print(
-                    f"REPAIR idx={interaction.idx} cand={k} steps={stats.steps} loss={stats.final_loss:.2f} "
-                    f"target={ans[:45]!r} | {marks} | {'KEEP' if ok else 'restore'}",
+                    f"REPAIR idx={interaction.idx} before={best_marks} prompts={len(prompts)}",
                     flush=True,
                 )
-                if ok:
-                    kept = True
-                    best_n, best_marks, trained = n, marks, self._snapshot()
-                    if n == len(prompts):
-                        break
-                else:
-                    self._restore(trained)
-            if kept and self._model_path is not None:
-                self._save_checkpoint()
+                kept = False
+                for k, text in enumerate(cands):
+                    think = text.split("</think>")[0].strip()
+                    ans = (
+                        " ".join(re.split(r"(?<=[.!?])\s", self._answer_of(text))[:2])
+                        .replace("\n", " ")
+                        .strip()
+                    )
+                    example = make_revision_training_example(
+                        f"[[0]] {ans} [[/0]]",
+                        [InteractionHistory(idx=0, user_input=q, llm_response="")],
+                        self._tokenizer,
+                        think_mode="rationale",
+                        rationale=think,
+                    )
+                    stats = self.train_on_examples(
+                        collate_training_examples([example], self._tokenizer),
+                        [],
+                        loss_target=self._loss_target,
+                        max_steps=self._max_train_steps,
+                        rehearsal_weight=0.0,
+                        verbose=verbose,
+                    )
+                    mlx.core.clear_cache()
+                    n, marks = self._score_prompts(q, prompts, name)
+                    ok = n > best_n and self._controls_answer()
+                    print(
+                        f"REPAIR idx={interaction.idx} cand={k} steps={stats.steps} loss={stats.final_loss:.2f} "
+                        f"target={ans[:45]!r} | {marks} | {'KEEP' if ok else 'restore'}",
+                        flush=True,
+                    )
+                    if ok:
+                        kept = True
+                        best_n, best_marks, trained = n, marks, self._snapshot()
+                        if n == len(prompts):
+                            break
+                    else:
+                        self._restore(trained)
+                if kept and self._model_path is not None:
+                    self._save_checkpoint()
+            except BaseException:
+                # Sampling temporarily swaps in the frozen adapter, and training
+                # mutates weights before validation. Neither may leak on failure;
+                # preserve only the last candidate that passed the keep checks.
+                self._restore(trained)
+                raise
         return kept
 
     def _save_checkpoint(self) -> None:
@@ -1414,7 +1482,9 @@ class StatefulLLM:
             with self._lock:
                 if indices_to_review is None:
                     indices_to_review = list(range(len(interaction_history)))
-                flagged = [i for i in indices_to_review if interaction_history[i].flagged]
+                flagged = [
+                    i for i in indices_to_review if interaction_history[i].flagged
+                ]
                 for i in flagged:
                     h = interaction_history[i]
                     h.reviewed = True
