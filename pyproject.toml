@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 wrap = ["torch", "peft", "gguf>=0.17", "httpx", "filelock", "lmstudio>=1.5"]
+dev = ["black==25.9.0", "ruff==0.14.0"]
 
 [project.scripts]
 adaptible = "adaptible.__main__:main"
@@ -44,6 +45,32 @@ exclude = [
     "notebooks",
     ".github",
 ]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+# Correctness and hygiene only: formatting belongs to black.
+#   E/F  pyflakes + pycodestyle errors   B   likely bugs (bugbear)
+#   I    import ordering                 UP  modern syntax
+#   T20  stray print()                   LOG/G  logging misuse
+#   PIE, RET, SIM  small clarity wins
+select = ["E", "F", "B", "I", "UP", "T20", "LOG", "G", "PIE", "RET", "SIM"]
+ignore = [
+    "E501",    # line length is black's job
+    "B008",    # FastAPI depends() style
+    "SIM105",  # contextlib.suppress hides the logging we just added
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The CLI and scripts talk to the user on stdout by design.
+"adaptible/__main__.py" = ["T20"]
+"adaptible/_src/wrap/__main__.py" = ["T20"]
+"adaptible/_src/cli.py" = ["T20"]
+"adaptible/_src/wrap/references.py" = ["T20"]
+"scripts/*.py" = ["T20"]
+"adaptible/_src/dev/*.py" = ["T20"]
 
 [tool.hatch.metadata]
 allow-direct-references = true

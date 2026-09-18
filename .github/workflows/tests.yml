@@ -5,6 +5,26 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    # Scoped to the runtime wrapper for now; the older MLX experiment code has
+    # its own baseline and is not reformatted by this gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install formatter and linter
+        run: python -m pip install 'black==25.9.0' 'ruff==0.14.0'
+      - name: black
+        run: |
+          python -m black --check \
+            adaptible/_src/wrap adaptible/wrap adaptible/__main__.py
+      - name: ruff
+        run: |
+          python -m ruff check \
+            adaptible/_src/wrap adaptible/wrap adaptible/__main__.py
+
   unit:
     # MLX requires Apple Silicon; macos-14+ hosted runners are arm64.
     runs-on: macos-latest
@@ -19,13 +39,13 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
+          python -m pip install -e '.[wrap,dev]'
 
       - name: Import check
         run: python -c "import adaptible"
 
-      # Model-free tests only. llm_test / integration_test download and train a
-      # real model and are run locally instead.
+      # No pretrained models: adapter_test trains a tiny random model. The
+      # real-checkpoint llm_test / integration_test suites run locally instead.
       - name: Unit tests
         env:
           ADAPTIBLE_OUTPUTS_DIR: ${{ runner.temp }}/adaptible-outputs
@@ -37,5 +57,123 @@ jobs:
             adaptible.tests.paths_test \
             adaptible.tests.eval_test \
             adaptible.tests.autonomous_test \
+            adaptible.tests.cli_test \
+            adaptible.tests.repair_test \
+            adaptible.tests.adapter_test \
+            adaptible.tests.wrap_test \
+            adaptible.tests.wrap_cli_test \
+            adaptible.tests.wrap_config_test \
+            adaptible.tests.wrap_train_worker_test \
+            adaptible.tests.wrap_gguf_roundtrip_test \
+            adaptible.tests.runtime_command_test \
+            adaptible.tests.ollama_fusion_test \
+            adaptible.tests.wrap_smoke_test \
+            adaptible.tests.wrap_recurrent_test \
+            adaptible.tests.wrap_thinking_test \
+            adaptible.tests.wrap_thinking_runtime_test \
+            adaptible.tests.wrap_thinking_mode_test \
+            adaptible.tests.wrap_thinking_draft_test \
+            adaptible.tests.wrap_sustained_test \
+            adaptible.tests.question_candidate_test \
+            adaptible.tests.wrap_scope_router_test \
+            adaptible.tests.fact_scope_test \
+            adaptible.tests.wrap_fact_scope_audit_test \
+            adaptible.tests.wrap_scope_api_test \
+            adaptible.tests.ollama_context_test \
+            adaptible.tests.ollama_thinking_test \
+            adaptible.tests.source_lineage_test \
+            adaptible.tests.references_test \
+            adaptible.tests.reference_integration_test \
+            adaptible.tests.grounding_quality_test \
+            adaptible.tests.source_property_guard_test \
+            adaptible.tests.source_relevance_test \
+            adaptible.tests.retention_test \
+            adaptible.tests.wrap_training_resume_test \
+            adaptible.tests.wrap_thinking_retry_test \
+            adaptible.tests.wrap_training_budget_test \
+            adaptible.tests.wrap_training_optimizer_test \
+            adaptible.tests.wrap_training_examples_test \
+            adaptible.tests.vllm_test \
+            adaptible.tests.wrap_integration_test \
+            adaptible.tests.experiment_equivalence_test \
+            adaptible.tests.runtime_parity_test \
+            adaptible.tests.question_candidate_structural_test \
             adaptible._src.revise.revise_test \
             -v
+
+  end-to-end:
+    # Real model, real LoRA, real adapter artefacts through all four runtime
+    # codepaths. Minutes rather than seconds, so it runs beside the fast suite.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e '.[wrap]'
+      - name: Wrapper end-to-end
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          ADAPTIBLE_OUTPUTS_DIR: ${{ runner.temp }}/adaptible-outputs
+        run: |
+          python -m unittest \
+            adaptible.tests.wrap_end_to_end_test \
+            adaptible.tests.wrap_train_worker_test \
+            adaptible.tests.wrap_gguf_roundtrip_test -v
+
+  torch-adapter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e '.[wrap]'
+      - name: Tiny random model adapter test (no checkpoint downloads)
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          python -m unittest scripts.colab.runner_test \
+            adaptible.tests.wrap_test adaptible.tests.wrap_cli_test \
+            adaptible.tests.wrap_config_test \
+            adaptible.tests.wrap_train_worker_test \
+            adaptible.tests.wrap_gguf_roundtrip_test \
+            adaptible.tests.wrap_smoke_test \
+            adaptible.tests.wrap_recurrent_test \
+            adaptible.tests.wrap_thinking_test \
+            adaptible.tests.wrap_thinking_runtime_test \
+            adaptible.tests.wrap_thinking_mode_test \
+            adaptible.tests.wrap_thinking_draft_test \
+            adaptible.tests.wrap_sustained_test \
+            adaptible.tests.question_candidate_test \
+            adaptible.tests.wrap_scope_router_test \
+            adaptible.tests.fact_scope_test \
+            adaptible.tests.wrap_fact_scope_audit_test \
+            adaptible.tests.wrap_scope_api_test \
+            adaptible.tests.ollama_context_test \
+            adaptible.tests.ollama_thinking_test \
+            adaptible.tests.source_lineage_test \
+            adaptible.tests.references_test adaptible.tests.reference_integration_test \
+            adaptible.tests.grounding_quality_test adaptible.tests.retention_test \
+            adaptible.tests.source_property_guard_test \
+            adaptible.tests.source_relevance_test \
+            adaptible.tests.wrap_training_resume_test \
+            adaptible.tests.wrap_thinking_retry_test \
+            adaptible.tests.wrap_training_budget_test \
+            adaptible.tests.wrap_training_optimizer_test \
+            adaptible.tests.wrap_training_examples_test \
+            adaptible.tests.lmstudio_test adaptible.tests.vllm_test \
+            adaptible.tests.runtime_command_test \
+            adaptible.tests.model_source_test adaptible.tests.gguf_adapter_test \
+            adaptible.tests.wrap_tokenizer_test \
+            adaptible.tests.prompt_format_test \
+            adaptible.tests.ollama_fusion_test \
+            adaptible.tests.wrap_integration_test -v
