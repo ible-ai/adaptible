@@ -122,5 +122,34 @@ The longer test requires four fully repaired facts and continues through its
 fixed review budget. The completed short tests do not establish stability over
 the original multi-hour experiments; fast model-free tests cannot establish it either.
 
+### Reproducing the original experiment exactly
+
+`--flagship-recipe` runs the self-repair loop of `scripts/cycles_mlx.py`
+through a wrapper instead of MLX. Its output was compared with the original
+token for token, on DeepSeek-R1-Distill-Qwen-1.5B at float32, with greedy
+decoding and every correction's reasoning and answer compared in full:
+
+| App | Decoding (5 prompts) | Trained adapter served (8 prompts) | One full correction cycle (8 prompts) |
+| --- | --- | --- | --- |
+| vLLM | Identical | Identical | Identical |
+| llama.cpp | Identical | Identical | Identical |
+| LM Studio | Identical | Identical | Identical |
+| Ollama | Identical | 7 of 8 identical | Not completed |
+
+A full cycle means the same sampled correction, training target, number of
+updates and keep decision, with identical generations before and after
+training. From the same starting LoRA weights, the wrapper's PyTorch trainer
+ends within 3e-6 of MLX's loss. Ollama's one divergence comes from its f16
+KV cache: llama.cpp run with that single setting changed reproduces Ollama's
+output byte for byte, and no Ollama release offers an f32 cache.
+
+Exact agreement depends on settings the wrapper now pins, because each runtime
+otherwise applies its own defaults: neutral sampling, no prompt caching, the
+checkpoint's own stored precision (read from the safetensors headers, not
+`config.json`), an f32 KV cache, flash attention off, and a small batch size so
+prefill is not rounded through f16. The original draws its LoRA initialisation
+unseeded, so two MLX runs do not match each other; `--initial-adapter` starts
+a wrapper from the initialisation of a given MLX run.
+
 [Run the integration demos](INTEGRATION.md#repeatable-live-demo) or read
 [how training and persistence work](IMPLEMENTATION.md).
