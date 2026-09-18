@@ -1,26 +1,6 @@
-"""Adaptible - LLMs that can wander."""
+"""Public exports, loaded on demand so runtime wrappers do not require MLX."""
 
-from . import autonomous
-from . import eval
-from . import cli
-from . import local
-from . import revise
-from ._src._api import Adaptible, ModelProtocol
-from ._src._classes import (
-    FeedbackRequest,
-    FeedbackResponse,
-    InteractionHistory,
-    InteractionRequest,
-    InteractionResponse,
-    ReviewResponse,
-    SyncResponse,
-    TrainingExample,
-)
-from ._src._llm import StatefulLLM
-from ._src.lookup import DocStore
-from ._src.db import Database, Example, Experiment, Response, TrainingEvent
-from ._src.db import ExperimentType, Phase, SourceType
-from ._src.db import default_judge
+from importlib import import_module
 
 __all__ = [
     "Adaptible",
@@ -40,7 +20,6 @@ __all__ = [
     "cli",
     "local",
     "revise",
-    # Database exports
     "Database",
     "Example",
     "Experiment",
@@ -51,3 +30,48 @@ __all__ = [
     "SourceType",
     "default_judge",
 ]
+
+_EXPORTS = {
+    "autonomous": (".", "autonomous"),
+    "eval": (".", "eval"),
+    "cli": (".", "cli"),
+    "local": (".", "local"),
+    "revise": (".", "revise"),
+    "Adaptible": ("._src._api", "Adaptible"),
+    "ModelProtocol": ("._src._api", "ModelProtocol"),
+    "FeedbackRequest": ("._src._classes", "FeedbackRequest"),
+    "FeedbackResponse": ("._src._classes", "FeedbackResponse"),
+    "InteractionHistory": ("._src._classes", "InteractionHistory"),
+    "InteractionRequest": ("._src._classes", "InteractionRequest"),
+    "InteractionResponse": ("._src._classes", "InteractionResponse"),
+    "ReviewResponse": ("._src._classes", "ReviewResponse"),
+    "SyncResponse": ("._src._classes", "SyncResponse"),
+    "TrainingExample": ("._src._classes", "TrainingExample"),
+    "StatefulLLM": ("._src._llm", "StatefulLLM"),
+    "DocStore": ("._src.lookup", "DocStore"),
+    "Database": ("._src.db", "Database"),
+    "Example": ("._src.db", "Example"),
+    "Experiment": ("._src.db", "Experiment"),
+    "Response": ("._src.db", "Response"),
+    "TrainingEvent": ("._src.db", "TrainingEvent"),
+    "ExperimentType": ("._src.db", "ExperimentType"),
+    "Phase": ("._src.db", "Phase"),
+    "SourceType": ("._src.db", "SourceType"),
+    "default_judge": ("._src.db", "default_judge"),
+}
+
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module, attr = _EXPORTS[name]
+    if module in (".", ".."):
+        value = import_module(module + attr, __name__)
+    else:
+        value = getattr(import_module(module, __name__), attr)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))
