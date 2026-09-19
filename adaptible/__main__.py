@@ -5,7 +5,7 @@ import sys
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "wrap":
-        from ._src.wrap.__main__ import main as wrap
+        from .wrap.__main__ import main as wrap
 
         return wrap(sys.argv[2:])
     print("Usage: adaptible wrap {ollama,llama-cpp,lm-studio,vllm} MODEL [options]")

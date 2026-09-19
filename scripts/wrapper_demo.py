@@ -490,7 +490,7 @@ def cleanup_tags(args, state):
                 removed.append(model["name"])
         # The demo has completed its restart proof and stopped the wrapper.
         # Its small adapter can recreate derived weights; retain only that.
-        from adaptible._src.wrap.ollama import remove_fused_file
+        from adaptible.wrap.ollama import remove_fused_file
 
         for name in candidates:
             remove_fused_file(state, name)
@@ -499,7 +499,7 @@ def cleanup_tags(args, state):
 
 def verify_training(state, report):
     """Check real worker output and unchanged, reused checkpoint bytes."""
-    from adaptible._src.wrap.model_source import fingerprint_base
+    from adaptible.wrap.model_source import fingerprint_base
 
     with closing(sqlite3.connect(state / "history.sqlite3")) as db:
         meta = {
@@ -567,7 +567,7 @@ def cleanup_lm_studio(args, state):
     manifest = state / "lmstudio-imports.json"
     if args.service != "lm-studio" or not manifest.exists():
         return []
-    from adaptible._src.wrap.lmstudio import LMStudio
+    from adaptible.wrap.lmstudio import LMStudio
 
     async def cleanup():
         runtime = LMStudio(

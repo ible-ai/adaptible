@@ -82,7 +82,7 @@ class TinyRunnerTest(unittest.TestCase):
         import numpy as np
         from gguf import GGUFReader
         from safetensors.torch import save_file
-        from adaptible._src.wrap.gguf_adapter import export_adapter
+        from adaptible.wrap.gguf_adapter import export_adapter
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)

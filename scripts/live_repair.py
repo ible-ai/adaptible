@@ -15,8 +15,8 @@ from pathlib import Path
 import httpx
 
 import adaptible
-from adaptible._src.lookup import DEFAULT_PASSAGES as PASSAGES
-from adaptible._src.eval.harness import contains_key_terms
+from adaptible.lookup import DEFAULT_PASSAGES as PASSAGES
+from adaptible.eval.harness import contains_key_terms
 from adaptible.eval import generate_default_dataset
 from adaptible.local import MutableHostedLLM
 

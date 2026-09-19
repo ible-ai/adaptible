@@ -12,9 +12,6 @@ build/
 # Run-time state and experiment logs (never tracked; flagship results live in results/)
 outputs/
 
-# Generated test reports
-adaptible/tests/artifacts/*.html
-
 # Local-only session notes
 CLAUDE.local.md
 codex-*

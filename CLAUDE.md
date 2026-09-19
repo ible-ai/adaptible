@@ -20,16 +20,16 @@ Requires Python 3.13+. Version `1.0.0a3`.
 python -m venv .venv && .venv/bin/pip install -e .   # editable install; use .venv/bin/python below
 
 # Fast, model-free tests (what CI runs, on macos-latest)
-python -m unittest adaptible.tests.classes_test adaptible.tests.api_test \
-    adaptible.tests.local_test adaptible.tests.paths_test adaptible.tests.eval_test \
-    adaptible.tests.autonomous_test adaptible._src.revise.revise_test -v
-python -m unittest adaptible.tests.api_test.InteractEndpointTest.test_x -v   # one test
+python -m unittest adaptible.classes_test adaptible.local.api_test \
+    adaptible.local.local_test adaptible.paths_test adaptible.eval.eval_test \
+    adaptible.autonomous.autonomous_test adaptible.revise_test -v
+python -m unittest adaptible.local.api_test.InteractEndpointTest.test_x -v   # one test
 
 # Slow: download + train a real model, mutate <outputs>/autonomous/checkpoint
-python -m unittest adaptible.tests.llm_test adaptible.tests.integration_test -v
+python -m unittest adaptible.llm_test adaptible.integration_test -v
 
 # Run things
-python -m adaptible.local                                  # FastAPI server; talk to it with python -m adaptible.cli
+python -m adaptible.local                                  # FastAPI server; talk to it with python -m adaptible.local.cli
 python -m adaptible.eval --subset 20 --shuffle --no_browser # offline eval, HTML report
 python -m adaptible.eval --training_source self_generated   # measure self-correction (run once: 1/84 valid revisions)
 python -m adaptible.autonomous --cycles 3 --no_browser      # online learning against live web search
@@ -50,7 +50,7 @@ The rest of `llm_test` and all of `integration_test` load and *train* a real mod
 run. Set `ADAPTIBLE_OUTPUTS_DIR` to a scratch directory when running them, as CI does.
 
 CLI flags are `absl.flags`, not argparse (underscores: `--no_browser`, `--train_ratio`), in
-`adaptible/_src/eval/__main__.py`, `adaptible/_src/autonomous/__main__.py`, and
+`adaptible/eval/__main__.py`, `adaptible/autonomous/__main__.py`, and
 `scripts/run_meta_experiment.py`.
 
 Formatting is black (see `.vscode/settings.json`); there is no configured linter.
@@ -59,11 +59,11 @@ Formatting is black (see `.vscode/settings.json`); there is no configured linter
 
 ### The learning loop
 
-`StatefulLLM` (`adaptible/_src/_llm.py`) owns the model, tokenizer, optimizer, and all training.
+`StatefulLLM` (`adaptible/llm.py`) owns the model, tokenizer, optimizer, and all training.
 On construction it freezes the base weights and converts the last `num_lora_layers` linear layers
 to LoRA — **only LoRA parameters ever receive gradients**.
 
-`adaptible/_src/revise/revise.py` is the glue that turns a conversation into a training example:
+`adaptible/revise.py` is the glue that turns a conversation into a training example:
 
 1. `make_revision_prompt` serializes past turns and asks the model to rewrite one, labelling it
    `[[X]] ... [[/X]]`.
@@ -92,7 +92,7 @@ which is the self-generated path. Only the ground-truth path has ever produced n
 
 ### Paths and the checkpoint gotcha
 
-`adaptible/_src/_paths.py` resolves `<outputs>` as `$ADAPTIBLE_OUTPUTS_DIR` if set, else
+`adaptible/paths.py` resolves `<outputs>` as `$ADAPTIBLE_OUTPUTS_DIR` if set, else
 `<cwd>/outputs`; never from `__file__`. Everything persisted lives there: `adaptible.db`,
 `autonomous/checkpoint`, `autonomous/state.json`, `autonomous/logs/`.
 
@@ -104,12 +104,12 @@ and `Adaptible()` do not. Pass `model_path=None` (or a `model=`) whenever a clea
 
 ### Serving
 
-`Adaptible` (`_api.py`) builds the FastAPI app around any object satisfying `ModelProtocol`, so
+`Adaptible` (`local/api.py`) builds the FastAPI app around any object satisfying `ModelProtocol`, so
 tests can inject a stub. It keeps interaction history in memory and tracks unreviewed indices.
 `/trigger_review` clears those indices and schedules `self_correct_and_train` with
 `asyncio.create_task(asyncio.to_thread(...))`, appending the task to `outstanding_tasks`; `/sync`
 awaits those tasks (logging failures rather than raising), then polls `model.ok` (which is `False`
-during backprop) until it stabilizes. `MutableHostedLLM` (`local/_server.py`) is a
+during backprop) until it stabilizes. `MutableHostedLLM` (`local/server.py`) is a
 `uvicorn.Server` subclass adding awaitable `up()`/`down()`.
 
 ### Experiments and persistence
@@ -138,19 +138,20 @@ stored on the `SeedTrajectory`. `final_trained_accuracy` is trained-items-only.
 `autonomous/node.py` is the online counterpart: search → filter claims (`_claim_is_plausible`) →
 ask the model what it believes → fact-check → train only on contradicted beliefs by default
 (`train_on_new_knowledge=False`) → re-verify, persisting `NodeState` to
-`<outputs>/autonomous/state.json`. `adaptible/_src/autonomous/README.md` has the policy table.
+`<outputs>/autonomous/state.json`. `adaptible/autonomous/README.md` has the policy table.
 
 ### Layout convention
 
-Everything public is re-exported from `adaptible/__init__.py`; implementation lives under
-`adaptible/_src/`. `adaptible/{eval,local,autonomous,revise}/` are thin alias packages
-(`from .._src.X import *` plus a `__main__.py`) so `python -m adaptible.eval` etc. work. Import
-from the package root or those aliases rather than reaching into `_src` directly. Tests are in
-`adaptible/tests/` (plus `_src/revise/revise_test.py`). Each of `_src/{eval,local,autonomous}/`
-has its own README.
+Modules used by more than one feature live directly in `adaptible/`: `llm.py`, `revise.py`,
+`classes.py`, `db.py`, `lookup.py`, `paths.py`. Each feature is a real package:
+`adaptible/{local,eval,autonomous,wrap}/`, each with a `__main__.py` and its own README.
+`adaptible/__init__.py` re-exports the public names lazily so `wrap` imports without MLX; keep
+it that way. Tests sit beside the code they cover as `<name>_test.py`; tests of `scripts/`
+live in `scripts/`. `adaptible/wrap/tiny_models.py`, `model_backed_runtime.py` and `fixtures/`
+are test helpers.
 
-`adaptible/_src/dev/` holds debugging scripts, not part of the test suite and excluded from the
-wheel.
+`scripts/dev/` holds debugging scripts, not part of the test suite and excluded from the
+wheel. `media/` holds the README's demo recordings.
 
 ## Known rough edges
 

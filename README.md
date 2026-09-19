@@ -105,7 +105,7 @@ GPU for the self-repair loop through `scripts/colab/`.
 git clone https://github.com/ible-ai/adaptible && cd adaptible
 python -m venv .venv && .venv/bin/pip install -e .
 .venv/bin/python -m adaptible.local                      # server at http://127.0.0.1:8000
-.venv/bin/python -m adaptible.cli                        # in another terminal: ask, /down, /review, /new
+.venv/bin/python -m adaptible.local.cli                        # in another terminal: ask, /down, /review, /new
 PYTHONPATH=. .venv/bin/python scripts/cycles_mlx.py      # the self-repair loop
 .venv/bin/python -m adaptible.eval --subset 20 --shuffle --no_browser   # baseline / train / re-measure
 ```
@@ -137,34 +137,36 @@ generations, training and trained adapter token for token in
 `scripts/wrapper_parity.py`, which anyone can rerun. vLLM on Apple Silicon
 computes with MLX, and Ollama's f16 KV cache can still diverge on other
 prompts.
-The [wrapper README](adaptible/_src/wrap/README.md) has setup commands, client
+The [wrapper README](adaptible/wrap/README.md) has setup commands, client
 integration, model and memory limits, and the current verification table.
 
 `scripts/colab/adaptible_cycles.ipynb` runs the loop on a free Colab T4 and
-resumes across sessions. Module READMEs under `adaptible/_src/` document
+resumes across sessions. Module READMEs under `adaptible/` document
 endpoints, flags, and metrics. These fast model-free checks test code behavior;
 they do not replace native learning runs:
 
 ```bash
-python -m unittest adaptible.tests.classes_test adaptible.tests.api_test \
-    adaptible.tests.local_test adaptible.tests.paths_test adaptible.tests.eval_test \
-    adaptible.tests.autonomous_test adaptible.tests.cli_test adaptible._src.revise.revise_test
+python -m unittest adaptible.classes_test adaptible.local.api_test \
+    adaptible.local.local_test adaptible.paths_test adaptible.eval.eval_test \
+    adaptible.autonomous.autonomous_test adaptible.local.cli_test adaptible.revise_test
 ```
 
 ## Layout
 
 ```text
-adaptible/_src/_llm.py        StatefulLLM: generation, LoRA training, loop breakers
-adaptible/_src/revise/        conversation -> training example, loss masks
-adaptible/_src/local/         FastAPI server
-adaptible/_src/cli.py         terminal client
-adaptible/_src/eval/          dataset, evaluation harness, meta-learning, reports
-adaptible/_src/autonomous/    learning from web search against the model's beliefs
+adaptible/                    shared: llm.py (StatefulLLM), revise.py (conversation ->
+                              training example), classes, db, lookup, paths
+adaptible/local/              FastAPI server and terminal client (cli.py)
+adaptible/eval/               dataset, evaluation harness, meta-learning, reports
+adaptible/autonomous/         learning from web search against the model's beliefs
+adaptible/wrap/               `adaptible wrap`: repair a model served by Ollama, llama.cpp, LM Studio, vLLM
 scripts/cycles_mlx.py         self-repair loop (MLX)
 scripts/colab/                the same loop in PyTorch, Colab notebook
 scripts/cycles_results.py     run log -> tables and plot
 results/                      write-up and data
 ```
+
+Tests sit beside the code they cover as `<name>_test.py`.
 
 ## License
 

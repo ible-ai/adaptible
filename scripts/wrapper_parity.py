@@ -52,7 +52,7 @@ ORIGINAL = ROOT / "scripts" / "cycles_mlx.py"
 SOURCE = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B"  # StatefulLLM's default
 ITEM = "geo_001"
 INIT_SEED = 0
-MAX_TOKENS = 2048  # adaptible._src._llm.MAX_TOKENS, what the experiment scores with
+MAX_TOKENS = 2048  # adaptible.llm.MAX_TOKENS, what the experiment scores with
 CONTEXT = 8192
 RUNTIMES = ("llama-cpp", "lm-studio", "vllm", "ollama")
 
@@ -100,7 +100,7 @@ def original():
     defaults are the reference.
     """
     from adaptible import InteractionHistory
-    from adaptible._src.eval.harness import contains_key_terms
+    from adaptible.eval.harness import contains_key_terms
     from adaptible.revise import make_revision_training_example
 
     functions = ("closed", "answer_of", "example_from")
@@ -263,7 +263,7 @@ def run_mlx(out):
     from safetensors.numpy import save_file
 
     import adaptible
-    from adaptible._src.eval.harness import VERIFY_LOSS_FLOOR
+    from adaptible.eval.harness import VERIFY_LOSS_FLOOR
     from adaptible.revise import collate_training_examples
 
     namespace = original()
@@ -322,7 +322,7 @@ class FixedCandidate:
     flagship_candidate shapes the training target from it."""
 
     async def complete(self, messages, *, details=None, **options):
-        from adaptible._src.wrap.thinking import completion_details
+        from adaptible.wrap.thinking import completion_details
 
         reasoning, _, answer = CANDIDATE.partition("</think>")
         detail = completion_details(
@@ -334,9 +334,9 @@ class FixedCandidate:
 
 
 def build_runtime(version, out, directory, args):
-    from adaptible._src.wrap.lmstudio import LMStudio
-    from adaptible._src.wrap.runtime import LlamaCpp, Ollama
-    from adaptible._src.wrap.vllm import VLLM
+    from adaptible.wrap.lmstudio import LMStudio
+    from adaptible.wrap.runtime import LlamaCpp, Ollama
+    from adaptible.wrap.vllm import VLLM
 
     common = dict(max_tokens=MAX_TOKENS, context_size=CONTEXT)
     gguf = str(out / "f32.gguf")
@@ -353,7 +353,7 @@ async def generate(runtime, tokenizer, questions):
     """Greedy turns as the wrapper scores them under --flagship-recipe: cut
     where the original's loop breakers stop, thought and answer joined the way
     the original returns them."""
-    from adaptible._src.wrap.loop_breaker import complete_as_original
+    from adaptible.wrap.loop_breaker import complete_as_original
 
     texts = []
     for q in questions:
@@ -379,9 +379,9 @@ async def generate(runtime, tokenizer, questions):
 
 
 async def run_wrapper(version, out, args):
-    from adaptible._src.wrap.model_source import read_architecture
-    from adaptible._src.wrap.repair import _FLAGSHIP_MAX_STEPS, Controller, Trainer
-    from adaptible._src.wrap.tokenizer import load_tokenizer
+    from adaptible.wrap.model_source import read_architecture
+    from adaptible.wrap.repair import _FLAGSHIP_MAX_STEPS, Controller, Trainer
+    from adaptible.wrap.tokenizer import load_tokenizer
 
     if not (out / "init" / "adapter_model.safetensors").exists():
         raise SystemExit("run the mlx step first: it writes the LoRA initialisation")

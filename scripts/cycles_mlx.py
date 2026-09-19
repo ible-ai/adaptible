@@ -17,9 +17,9 @@ from mlx.utils import tree_map, tree_flatten
 from mlx_lm import stream_generate
 from mlx_lm.sample_utils import make_sampler
 from adaptible import InteractionHistory
-from adaptible._src._llm import _detect_token_loop
+from adaptible.llm import _detect_token_loop
 from adaptible.revise import collate_training_examples, strip_think_tags, make_revision_training_example
-from adaptible._src.eval.harness import contains_key_terms, make_rehearsal_example, VERIFY_LOSS_FLOOR
+from adaptible.eval.harness import contains_key_terms, make_rehearsal_example, VERIFY_LOSS_FLOOR
 from adaptible.eval import generate_default_dataset
 
 PARA = {

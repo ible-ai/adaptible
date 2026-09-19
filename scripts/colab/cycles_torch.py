@@ -37,7 +37,7 @@ ITEMS = {
                     para=["Which star is closest to our planet?", "What is the closest star to Earth?",
                           "Name the star nearest to the Earth."]),
 }
-LOOP_SEQ, LOOP_REPS = 8, 3            # adaptible._src._llm token-loop breaker
+LOOP_SEQ, LOOP_REPS = 8, 3            # adaptible.llm token-loop breaker
 LORA_RANK, LORA_SCALE, LORA_LAYERS = 8, 10.0, 8
 
 

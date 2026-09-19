@@ -87,9 +87,9 @@ def tiny_model(directory, context_size):
 
 def tiny_adapter_check(args, directory, wrapper, client, model):
     """Test actual CLI restoration from seeded state, not semantic acceptance."""
-    from adaptible._src.wrap.model_source import fingerprint_base
-    from adaptible._src.wrap.repair import Trainer
-    from adaptible._src.wrap.store import Store
+    from adaptible.wrap.model_source import fingerprint_base
+    from adaptible.wrap.repair import Trainer
+    from adaptible.wrap.store import Store
 
     messages = [dict(role="user", content="Question")]
 

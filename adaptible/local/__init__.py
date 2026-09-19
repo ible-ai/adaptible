@@ -1,4 +1,3 @@
-"""Public alias for :mod:`adaptible._src.local` (a real package so `python -m adaptible.local` works)."""
+from .server import MutableHostedLLM
 
-from .._src.local import *  # noqa: F401,F403
-from .._src.local import __all__  # noqa: F401
+__all__ = ["MutableHostedLLM"]

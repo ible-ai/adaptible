@@ -1,4 +1,42 @@
-"""Public alias for :mod:`adaptible._src.autonomous` (a real package so `python -m adaptible.autonomous` works)."""
+"""Autonomous Learning Node for Adaptible.
 
-from .._src.autonomous import *  # noqa: F401,F403
-from .._src.autonomous import __all__  # noqa: F401
+This module provides an autonomous learning node that can browse external
+information sources, detect knowledge gaps or conflicts with its current
+beliefs, and train itself on corrections.
+
+Example usage:
+
+    from adaptible.autonomous import AutonomousNode
+
+    # Provide a search function that returns list of {title, snippet, url}
+    def my_search(query: str) -> list[dict]:
+        # Implement with Brave Search API, SerpAPI, etc.
+        ...
+
+    node = AutonomousNode(search_fn=my_search, seed_topics=["recent AI news"])
+
+    # Run exploration cycles (one per topic)
+    results = node.run(topics=["recent AI news", None, None])
+
+    # Or explore a specific topic
+    result = node.explore_once("recent AI announcements")
+
+    # Quiz the model
+    answers = node.quiz(["Who is the CEO of OpenAI?", "What is Bitcoin's price?"])
+
+Classes:
+    AutonomousNode: The main autonomous learning node
+    LearningEvent: Record of a single learning event
+    NodeState: Persistent state of the node
+    ExplorationResult: Result from one exploration cycle
+"""
+
+from .node import AutonomousNode, Claim, ExplorationResult, LearningEvent, NodeState
+
+__all__ = [
+    "AutonomousNode",
+    "Claim",
+    "ExplorationResult",
+    "LearningEvent",
+    "NodeState",
+]

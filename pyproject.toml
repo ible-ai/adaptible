@@ -31,15 +31,15 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["adaptible"]
 exclude = [
-    "adaptible/tests/artifacts",
-    "adaptible/tests/*.ipynb",
     "**/logs",
-    "adaptible/_src/dev",
+    "**/*_test.py",
+    "adaptible/wrap/tiny_models.py",
+    "adaptible/wrap/model_backed_runtime.py",
+    "adaptible/wrap/fixtures",
 ]
 
 [tool.hatch.build.targets.sdist]
 exclude = [
-    "adaptible/tests/artifacts",
     "**/logs",
     "outputs",
     "notebooks",
@@ -66,11 +66,11 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # The CLI and scripts talk to the user on stdout by design.
 "adaptible/__main__.py" = ["T20"]
-"adaptible/_src/wrap/__main__.py" = ["T20"]
-"adaptible/_src/cli.py" = ["T20"]
-"adaptible/_src/wrap/references.py" = ["T20"]
+"adaptible/wrap/__main__.py" = ["T20"]
+"adaptible/local/cli.py" = ["T20"]
+"adaptible/wrap/references.py" = ["T20"]
 "scripts/*.py" = ["T20"]
-"adaptible/_src/dev/*.py" = ["T20"]
+"scripts/dev/*.py" = ["T20"]
 
 [tool.hatch.metadata]
 allow-direct-references = true

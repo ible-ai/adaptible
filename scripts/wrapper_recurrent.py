@@ -340,7 +340,7 @@ def startup_base_digest(state):
 
 def verify_final_base(state, before):
     """Check original source bytes again after runtime shutdown and cleanup."""
-    from adaptible._src.wrap.model_source import fingerprint_base
+    from adaptible.wrap.model_source import fingerprint_base
 
     jobs = sorted((state / "adapters").glob("*/job.json"))
     if not jobs:
