@@ -76,12 +76,12 @@ another window:
    is done.
 4. Type `/new` and ask again in other words: `Which city is Australia's capital?`
 
-![The four steps in the terminal: Sydney, /down, /review, /new, Canberra](docs/demo.gif)
+![The four steps in the terminal: Sydney, /down, /review, /new, Canberra](media/demo.gif)
 
 <details>
 <summary>Show the model's reasoning as it streams</summary>
 
-![The same run with the model's reasoning shown as it streams](docs/demo-thinking.gif)
+![The same run with the model's reasoning shown as it streams](media/demo-thinking.gif)
 
 Both recordings are the same run with identical frame timing; the one above
 hides the reasoning behind a "thinking ..." line.
@@ -91,7 +91,7 @@ hides the reasoning behind a "thinking ..." line.
 The recording above is one run of exactly that sequence on a freshly
 started server, sped up where marked, with the elapsed real time shown
 throughout; the only cut is the ten-minute review wait, marked on the clock.
-[`docs/demo.mp4`](docs/demo.mp4) and [`docs/demo-thinking.mp4`](docs/demo-thinking.mp4)
+[`media/demo.mp4`](media/demo.mp4) and [`media/demo-thinking.mp4`](media/demo-thinking.mp4)
 are the two recordings as video. Step 4 comes out right when
 step 3 kept an update; the write-up in [`results/`](results/README.md) has
 the numbers across five facts and sixteen sessions.
