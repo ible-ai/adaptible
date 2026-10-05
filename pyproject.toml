@@ -3,7 +3,7 @@ name = "adaptible"
 version = "1.0.0a3"
 description = "A small language model that keeps its conversations and retrains itself on its own corrections, on a laptop."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "absl-py",
     "ddgs",
@@ -53,7 +53,7 @@ exclude = [
 
 [tool.ruff]
 line-length = 88
-target-version = "py313"
+target-version = "py312"
 
 [tool.ruff.lint]
 # Correctness and hygiene only: formatting belongs to black.

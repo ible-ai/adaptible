@@ -12,7 +12,7 @@ produces net learning across seeds.
 Where things stand (2026-09-13): the flagship result is the self-repair cycle loop (`scripts/cycles_mlx.py`, PyTorch port in `scripts/colab/`) plus the same loop run as a served node (`scripts/live_repair.py`: thumbs-down via `/feedback`, lookup via `DocStore`, repair in `StatefulLLM.repair`), with parsable output in `results/`. Session handoffs, findings, and probe scripts are local-only; `CLAUDE.local.md` (gitignored) says where. Never commit handoff docs, raw logs, or non-flagship results. Minimum viable experiments only.
 
 Apple Silicon only — `mlx` is a hard dependency of every code path that touches the model.
-Requires Python 3.13+. Version `1.0.0a3`.
+Requires Python 3.12+. Version `1.0.0a3`.
 
 ## Commands
 
