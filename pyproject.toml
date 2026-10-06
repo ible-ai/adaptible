@@ -49,6 +49,12 @@ exclude = [
     "outputs",
     "notebooks",
     ".github",
+    "media",
+    # Local-only notes and probes. These are ignored through .git/info/exclude,
+    # which hatchling does not read, so a local build would otherwise pack them.
+    ".local",
+    "*.local.md",
+    "codex-*",
 ]
 
 [tool.ruff]
