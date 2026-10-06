@@ -98,7 +98,7 @@ the numbers across five facts and sixteen sessions.
 
 ## Run it
 
-Python 3.11+. Apple Silicon for the server and evaluation harness; any CUDA
+Python 3.10+. Apple Silicon for the server and evaluation harness; any CUDA
 GPU for the self-repair loop through `scripts/colab/`.
 
 ```bash
