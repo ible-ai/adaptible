@@ -206,39 +206,44 @@ class WebReferences:
             return []
         process = None
         creation = None
+
+        async def run():
+            nonlocal process, creation
+            creation = asyncio.create_task(
+                asyncio.create_subprocess_exec(
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--worker",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+            )
+            process = await asyncio.shield(creation)
+            stdout, _ = await process.communicate(
+                json.dumps(
+                    {
+                        "question": question,
+                        "max_results": self.max_results,
+                        "timeout": self.timeout,
+                    }
+                ).encode()
+            )
+            if process.returncode:
+                raise ReferenceSearchError("Web reference search worker failed")
+            if len(stdout) > 64_000:
+                raise ReferenceSearchError(
+                    "Web reference search response exceeded its limit"
+                )
+            response = json.loads(stdout)
+            if response.get("error"):
+                raise ReferenceSearchError(response["error"])
+            return _sources(response["results"], self.max_results)
+
         try:
-            async with asyncio.timeout(self.timeout):
-                creation = asyncio.create_task(
-                    asyncio.create_subprocess_exec(
-                        sys.executable,
-                        str(Path(__file__).resolve()),
-                        "--worker",
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                )
-                process = await asyncio.shield(creation)
-                stdout, _ = await process.communicate(
-                    json.dumps(
-                        {
-                            "question": question,
-                            "max_results": self.max_results,
-                            "timeout": self.timeout,
-                        }
-                    ).encode()
-                )
-                if process.returncode:
-                    raise ReferenceSearchError("Web reference search worker failed")
-                if len(stdout) > 64_000:
-                    raise ReferenceSearchError(
-                        "Web reference search response exceeded its limit"
-                    )
-                response = json.loads(stdout)
-                if response.get("error"):
-                    raise ReferenceSearchError(response["error"])
-                return _sources(response["results"], self.max_results)
-        except TimeoutError as exc:
+            # wait_for rather than asyncio.timeout, which needs Python 3.11.
+            return await asyncio.wait_for(run(), self.timeout)
+        except asyncio.TimeoutError as exc:
             raise ReferenceSearchError("Web reference search timed out") from exc
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             raise ReferenceSearchError(

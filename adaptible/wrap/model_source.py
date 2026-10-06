@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 
+from . import file_digest
 from .gguf_adapter import (
     SUPPORTED_ARCHITECTURES,
     inspect_model,
@@ -146,7 +147,7 @@ def fingerprint_base(source):
     source = Path(source).expanduser().resolve(strict=True)
     if source.is_file():
         with source.open("rb") as handle:
-            return hashlib.file_digest(handle, "sha256").hexdigest()
+            return file_digest.sha256(handle).hexdigest()
     suffixes = {".json", ".safetensors", ".model", ".txt", ".tiktoken", ".jinja"}
     files = {p for p in source.rglob("*") if p.is_file() and p.suffix in suffixes}
     # An indexed shard or template directory may itself be a symlink into
@@ -160,5 +161,5 @@ def fingerprint_base(source):
         digest.update(path.relative_to(source).as_posix().encode() + b"\0")
         digest.update(str(path.stat().st_size).encode() + b"\0")
         with path.open("rb") as handle:
-            digest.update(hashlib.file_digest(handle, "sha256").digest())
+            digest.update(file_digest.sha256(handle).digest())
     return digest.hexdigest()

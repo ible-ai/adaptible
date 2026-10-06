@@ -143,9 +143,11 @@ class RuntimeCommandTest(unittest.IsolatedAsyncioTestCase):
                     run_command(sys.executable, "-c", program, ready)
                 )
                 try:
-                    async with asyncio.timeout(2):
+                    async def until_ready():
                         while not ready.exists():
                             await asyncio.sleep(0.005)
+
+                    await asyncio.wait_for(until_ready(), 2)
                     task.cancel()
                     with self.assertRaises(asyncio.CancelledError):
                         await asyncio.wait_for(task, 2)

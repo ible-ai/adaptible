@@ -310,7 +310,7 @@ class VLLM(Runtime):
                     await asyncio.wait_for(
                         self.process.wait(), config.SHUTDOWN_GRACE_SECONDS
                     )
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     try:
                         os.killpg(self.process.pid, signal.SIGKILL)
                     except ProcessLookupError:

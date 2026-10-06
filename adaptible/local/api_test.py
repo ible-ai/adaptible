@@ -11,6 +11,18 @@ from fastapi.testclient import TestClient
 import adaptible
 
 
+def open_client(test, app):
+    """A TestClient held open for the test, so its requests share one event loop.
+
+    Without it each request runs on a fresh loop, and a task created by one
+    request is awaited by the next on a loop that has already closed.
+    """
+    client = TestClient(app)
+    client.__enter__()
+    test.addCleanup(client.__exit__, None, None, None)
+    return client
+
+
 class StubModel:
     """Minimal stub that satisfies the model interface for API testing."""
 
@@ -54,7 +66,7 @@ class InteractEndpointTest(unittest.TestCase):
     def setUp(self):
         self.stub_model = StubModel()
         self.api = adaptible.Adaptible(model=self.stub_model)
-        self.client = self.enterContext(TestClient(self.api.app))
+        self.client = open_client(self, self.api.app)
 
     def test_interact_returns_response(self):
         """POST /interact should return model response."""
@@ -121,7 +133,7 @@ class TriggerReviewEndpointTest(unittest.TestCase):
     def setUp(self):
         self.stub_model = StubModel()
         self.api = adaptible.Adaptible(model=self.stub_model)
-        self.client = self.enterContext(TestClient(self.api.app))
+        self.client = open_client(self, self.api.app)
 
     def test_trigger_review_no_unreviewed(self):
         """POST /trigger_review with no unreviewed should return message."""
@@ -193,7 +205,7 @@ class TriggerReviewEndpointTest(unittest.TestCase):
         """A failing training task is logged and /sync still returns 200."""
         failing_model = StubModel(train_error=RuntimeError("backprop exploded"))
         api = adaptible.Adaptible(model=failing_model)
-        client = self.enterContext(TestClient(api.app))
+        client = open_client(self, api.app)
         client.post("/interact", json={"prompt": "Q1"})
         client.post("/trigger_review")
 
@@ -213,7 +225,7 @@ class FeedbackEndpointTest(unittest.TestCase):
     def setUp(self):
         self.stub_model = StubModel()
         self.api = adaptible.Adaptible(model=self.stub_model)
-        self.client = self.enterContext(TestClient(self.api.app))
+        self.client = open_client(self, self.api.app)
 
     def test_thumbs_down_flags_interaction(self):
         self.client.post("/interact", json={"prompt": "Q1"})
@@ -277,7 +289,7 @@ class HistoryEndpointTest(unittest.TestCase):
     def setUp(self):
         self.stub_model = StubModel()
         self.api = adaptible.Adaptible(model=self.stub_model)
-        self.client = self.enterContext(TestClient(self.api.app))
+        self.client = open_client(self, self.api.app)
 
     def test_history_empty(self):
         """GET /history with no interactions should return empty list."""
@@ -307,7 +319,7 @@ class StatusEndpointTest(unittest.TestCase):
     def setUp(self):
         self.stub_model = StubModel()
         self.api = adaptible.Adaptible(model=self.stub_model)
-        self.client = self.enterContext(TestClient(self.api.app))
+        self.client = open_client(self, self.api.app)
 
     def test_status_returns_up(self):
         """GET /status should return status up."""
@@ -323,7 +335,7 @@ class SyncEndpointTest(unittest.TestCase):
     def setUp(self):
         self.stub_model = StubModel()
         self.api = adaptible.Adaptible(model=self.stub_model)
-        self.client = self.enterContext(TestClient(self.api.app))
+        self.client = open_client(self, self.api.app)
 
     def test_sync_when_model_ok(self):
         """GET /sync should return immediately when model is ok."""

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import httpx
 
-from . import config
+from . import config, file_digest
 from .ollama import remove_fused_file, track_fused_file
 from .prompt_format import OLLAMA_QWEN3_FORMAT, OLLAMA_QWEN3_TEMPLATE_SHA256
 from .thinking import completion_details, generation_mode, thinking_complete
@@ -55,7 +55,7 @@ async def run_command(*args, env=None):
                 await asyncio.wait_for(
                     asyncio.shield(cleanup), _COMMAND_SHUTDOWN_TIMEOUT
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 if process.returncode is None:
                     try:
                         process.kill()
@@ -70,7 +70,7 @@ async def run_command(*args, env=None):
 
 def fingerprint(path):
     with Path(path).open("rb") as f:
-        return hashlib.file_digest(f, "sha256").hexdigest()
+        return file_digest.sha256(f).hexdigest()
 
 
 # The original decodes with mlx_lm's `make_sampler(temp=...)`: temperature and
@@ -486,7 +486,7 @@ class Ollama(Runtime):
             # On timeout the ownership record remains for later reconciliation.
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=30)
-            except TimeoutError as exc:
+            except asyncio.TimeoutError as exc:
                 raise RuntimeError(
                     "Ollama context creation is still pending; ownership retained for cleanup."
                 ) from exc
@@ -818,7 +818,7 @@ class LlamaCpp(Runtime):
                 self.process.terminate()
                 try:
                     await asyncio.wait_for(self.process.wait(), 15)
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     self.process.kill()
                     await self.process.wait()
             self.process = None

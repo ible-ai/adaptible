@@ -4,10 +4,12 @@ import hashlib
 import json
 from pathlib import Path
 
+from . import file_digest
+
 
 def digest(path):
     with Path(path).open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        return file_digest.sha256(stream).hexdigest()
 
 
 def training_identity(job, source_sha256):

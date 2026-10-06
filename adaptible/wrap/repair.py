@@ -3,7 +3,6 @@
 import asyncio
 import copy
 import functools
-import hashlib
 import json
 import logging
 import os
@@ -15,6 +14,7 @@ import uuid
 from pathlib import Path
 
 from ..lookup import DocStore
+from . import file_digest
 from .fact_scope import equivalent, parse_question
 from .loop_breaker import complete_as_original
 from .references import ReferenceSearchError, WebReferences
@@ -419,7 +419,7 @@ class Controller:
     @staticmethod
     def _adapter_digest(path):
         with path.open("rb") as stream:
-            return hashlib.file_digest(stream, "sha256").hexdigest()
+            return file_digest.sha256(stream).hexdigest()
 
     async def start(self):
         accepted = self.store.get("accepted")
@@ -466,7 +466,7 @@ class Controller:
                     await asyncio.wait_for(
                         self.wake.wait(), max(0.1, min(remaining, 1))
                     )
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     # Polling timeout is expected: recheck idle time and gate.
                     continue
             async with self.gate:
