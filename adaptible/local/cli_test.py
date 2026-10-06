@@ -15,7 +15,7 @@ class CliClientTest(unittest.TestCase):
         self.model = StubModel()
         self.api = adaptible.Adaptible(model=self.model)
         self.out = io.StringIO()
-        self.cli = adaptible.local.cli.Client(http=TestClient(self.api.app), out=self.out)
+        self.cli = adaptible.local.cli.Client(http=self.enterContext(TestClient(self.api.app)), out=self.out)
 
     def test_ask_streams_and_remembers_idx(self):
         self.assertTrue(self.cli.run("Hello"))
@@ -68,7 +68,7 @@ class CliColorTest(unittest.TestCase):
 
     def test_no_escapes_when_not_a_tty(self):
         out = io.StringIO()
-        cli = adaptible.local.cli.Client(http=TestClient(self.api.app), out=out)
+        cli = adaptible.local.cli.Client(http=self.enterContext(TestClient(self.api.app)), out=out)
         for line in ("Hello", "/down", "/up", "/review", "/new", "/bogus"):
             cli.run(line)
         self.assertFalse(cli.color)
@@ -76,7 +76,7 @@ class CliColorTest(unittest.TestCase):
 
     def test_escapes_when_color_on(self):
         out = io.StringIO()
-        cli = adaptible.local.cli.Client(http=TestClient(self.api.app), out=out, color=True)
+        cli = adaptible.local.cli.Client(http=self.enterContext(TestClient(self.api.app)), out=out, color=True)
         cli.run("Hello")
         cli.run("/down")
         cli.run("/new")
@@ -94,13 +94,13 @@ class CliColorTest(unittest.TestCase):
 
         api = adaptible.Adaptible(model=SplitModel())
         out = io.StringIO()
-        cli = adaptible.local.cli.Client(http=TestClient(api.app), out=out, color=True)
+        cli = adaptible.local.cli.Client(http=self.enterContext(TestClient(api.app)), out=out, color=True)
         cli.run("Q")
         text = out.getvalue()
         self.assertRegex(text, r"\033\[2m[^\033]*</think>\033\[0m\nAnswer\.\n$")  # tag dim, answer plain
         self.assertEqual(text.replace("\033[2m", "").replace("\033[0m", ""), "Thinking</think>\nAnswer.\n")
         plain = io.StringIO()
-        adaptible.local.cli.Client(http=TestClient(adaptible.Adaptible(model=SplitModel()).app), out=plain).run("Q")
+        adaptible.local.cli.Client(http=self.enterContext(TestClient(adaptible.Adaptible(model=SplitModel()).app)), out=plain).run("Q")
         self.assertEqual(plain.getvalue(), "Thinking</think>\nAnswer.\n")
 
 
