@@ -1,0 +1,10 @@
+# GitHub Pages (adapt.ible.ai) renders README.md with the default theme.
+title: adaptible
+description: A small language model that keeps its conversations and retrains itself on its own corrections, on a laptop.
+url: https://adapt.ible.ai
+baseurl: ""
+defaults:
+  - scope:
+      path: ""
+    values:
+      image: /media/og.png
