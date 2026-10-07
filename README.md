@@ -1,4 +1,4 @@
-# Adaptible
+# adaptible
 
 [self-link to github repo](https://github.com/ible-ai/adaptible)
 
@@ -6,7 +6,7 @@ A small language model that keeps its conversations and retrains itself on its
 own corrections, on a laptop.
 
 Deployed language models are frozen: they answer, forget the exchange, and
-answer the same way tomorrow. Adaptible wraps a 1.5B reasoning model
+answer the same way tomorrow. adaptible wraps a 1.5B reasoning model
 (`DeepSeek-R1-Distill-Qwen-1.5B`) in a server that records every turn,
 revisits its past answers when idle, rewrites the ones it now thinks are wrong,
 and fine-tunes LoRA adapters on the rewrites. It runs on Apple Silicon through
