@@ -23,18 +23,18 @@ def _terms(text: str) -> set[str]:
 # What the demo node can look up: the five facts the cycle runs repair, the
 # two control facts, and five distractors. Passages, not answer templates.
 DEFAULT_PASSAGES = {
- "Morocco": "Morocco is a kingdom in North Africa. Its capital is Rabat, on the Atlantic coast; Casablanca is the largest city and the economic centre.",
- "Turkey": "Turkey straddles Europe and Asia. Ankara, in central Anatolia, has been the capital since 1923; Istanbul is the largest city.",
- "Australia": "Australia is a federation of six states and two territories. The federal capital is Canberra, a planned city; Sydney and Melbourne are larger.",
- "Philippines": "The Philippines is an archipelago in Southeast Asia. Manila is the capital, and Quezon City in the same metropolitan area is the most populous city.",
- "Nearest star": "The star nearest to Earth is the Sun, about 150 million kilometres away. The next nearest, Proxima Centauri, is about 4.2 light-years away.",
- "Vietnam": "Vietnam is in Southeast Asia. Hanoi, in the north, is the capital; Ho Chi Minh City in the south is the largest city.",
- "Gold": "Gold is a chemical element with symbol Au, from the Latin aurum, and atomic number 79.",
- "Canada": "Canada is the second-largest country by area. Ottawa is the capital; Toronto is the largest city.",
- "Brazil": "Brazil is the largest country in South America. Brasilia, inaugurated in 1960, is the capital; Sao Paulo is the largest city.",
- "Moon": "The Moon is Earth's only natural satellite, about 384,000 kilometres away, and the fifth-largest moon in the Solar System.",
- "Mount Everest": "Mount Everest, on the border of Nepal and China, is the highest mountain above sea level at 8,849 metres.",
- "Switzerland": "Switzerland is a federal republic in central Europe. Bern is the federal city; Zurich is the largest city.",
+    "Morocco": "Morocco is a kingdom in North Africa. Its capital is Rabat, on the Atlantic coast; Casablanca is the largest city and the economic centre.",
+    "Turkey": "Turkey straddles Europe and Asia. Ankara, in central Anatolia, has been the capital since 1923; Istanbul is the largest city.",
+    "Australia": "Australia is a federation of six states and two territories. The federal capital is Canberra, a planned city; Sydney and Melbourne are larger.",
+    "Philippines": "The Philippines is an archipelago in Southeast Asia. Manila is the capital, and Quezon City in the same metropolitan area is the most populous city.",
+    "Nearest star": "The star nearest to Earth is the Sun, about 150 million kilometres away. The next nearest, Proxima Centauri, is about 4.2 light-years away.",
+    "Vietnam": "Vietnam is in Southeast Asia. Hanoi, in the north, is the capital; Ho Chi Minh City in the south is the largest city.",
+    "Gold": "Gold is a chemical element with symbol Au, from the Latin aurum, and atomic number 79.",
+    "Canada": "Canada is the second-largest country by area. Ottawa is the capital; Toronto is the largest city.",
+    "Brazil": "Brazil is the largest country in South America. Brasilia, inaugurated in 1960, is the capital; Sao Paulo is the largest city.",
+    "Moon": "The Moon is Earth's only natural satellite, about 384,000 kilometres away, and the fifth-largest moon in the Solar System.",
+    "Mount Everest": "Mount Everest, on the border of Nepal and China, is the highest mountain above sea level at 8,849 metres.",
+    "Switzerland": "Switzerland is a federal republic in central Europe. Bern is the federal city; Zurich is the largest city.",
 }
 
 

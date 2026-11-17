@@ -34,9 +34,7 @@ class OllamaContextTest(unittest.IsolatedAsyncioTestCase):
         self.runtime = await self.new_runtime()
 
     async def new_runtime(self, context=8192):
-        with mock.patch(
-            "adaptible.wrap.runtime.shutil.which", return_value="ollama"
-        ):
+        with mock.patch("adaptible.wrap.runtime.shutil.which", return_value="ollama"):
             runtime = Ollama(
                 "original", self.root / "state", url="http://fake", context_size=context
             )
@@ -154,7 +152,7 @@ class OllamaContextTest(unittest.IsolatedAsyncioTestCase):
         num_ctx is, because the sampler is what changes the output.
         """
         self.original["parameters"] = (
-            "num_ctx 4096\nstop \"first\"\nstop \"second\"\n"
+            'num_ctx 4096\nstop "first"\nstop "second"\n'
             "repeat_penalty 1.0\ntop_k 0\ntop_p 1.0\nmin_p 0.0\nnum_batch 8"
         )
         self.tags["original"] = copy.deepcopy(self.original)

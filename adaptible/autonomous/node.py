@@ -468,7 +468,9 @@ class AutonomousNode:
                         if _claim_is_plausible(claim, snippet):
                             claims.append(claim)
                         else:
-                            self._log(f"DROPPED implausible claim: {claim.question!r} -> {claim.answer!r} ({url})")
+                            self._log(
+                                f"DROPPED implausible claim: {claim.question!r} -> {claim.answer!r} ({url})"
+                            )
                         break  # Only extract one claim per snippet
 
         return claims
@@ -609,7 +611,9 @@ class AutonomousNode:
         ).strip()
 
         correction_judgement_response = self._ask(prompt)
-        correction_judgement_response = clean_model_response(correction_judgement_response)
+        correction_judgement_response = clean_model_response(
+            correction_judgement_response
+        )
 
         # The response should start with YES or NO directly
         correction_judgement_response_upper = (
@@ -695,7 +699,9 @@ class AutonomousNode:
         # Extract claims from search results
         claims = self._extract_claims(search_results, topic)
         result.claims_found = len(claims)
-        self._log(f"TOPIC {topic!r}: {len(search_results)} results, {len(claims)} plausible claims")
+        self._log(
+            f"TOPIC {topic!r}: {len(search_results)} results, {len(claims)} plausible claims"
+        )
 
         # Process each claim
         for claim in claims:
@@ -724,7 +730,11 @@ class AutonomousNode:
             example_id = self._db.insert_example(db_example)
 
             # Estimate token count and truncation for baseline
-            baseline_token_count = len(self.model._tokenizer.encode(maybe_generated_response_before_training or ""))
+            baseline_token_count = len(
+                self.model._tokenizer.encode(
+                    maybe_generated_response_before_training or ""
+                )
+            )
             baseline_truncated = baseline_token_count >= self._max_tokens - 1
 
             # Record baseline response
@@ -761,7 +771,9 @@ class AutonomousNode:
                 confidence_before_training,
             )
             if not conflicts:
-                self._log(f"CONSISTENT {claim.question!r} (conf={confidence_before_training})")
+                self._log(
+                    f"CONSISTENT {claim.question!r} (conf={confidence_before_training})"
+                )
                 continue
 
             event_type = "correction" if held_belief else "new"
@@ -795,7 +807,11 @@ class AutonomousNode:
                 )
 
                 # Estimate token count and truncation for post-training
-                post_token_count = len(self.model._tokenizer.encode(maybe_generated_response_after_training or ""))
+                post_token_count = len(
+                    self.model._tokenizer.encode(
+                        maybe_generated_response_after_training or ""
+                    )
+                )
                 post_truncated = post_token_count >= self._max_tokens - 1
 
                 # Record post-training response
@@ -831,7 +847,9 @@ class AutonomousNode:
                 confidence_after_training=confidence_after_training,
                 trained=should_train,
             )
-            vizible.blue(f"  [{event_type.upper()}{'' if should_train else ', not trained'}] Q: {event.question}")
+            vizible.blue(
+                f"  [{event_type.upper()}{'' if should_train else ', not trained'}] Q: {event.question}"
+            )
             vizible.cyan(f"  Old: {maybe_generated_response_before_training}")
             if should_train:
                 vizible.green(f"  New: {maybe_generated_response_after_training}")
@@ -887,7 +905,9 @@ class AutonomousNode:
                     vizible.red(f"Error: {result.error}")
 
                 for event in result.events:
-                    tag = event.event_type.upper() + ("" if event.trained else ", NOT TRAINED")
+                    tag = event.event_type.upper() + (
+                        "" if event.trained else ", NOT TRAINED"
+                    )
                     vizible.blue(f"\n  [{tag}]")
                     vizible.blue(f"  Q: {event.question}")
                     if event.before_training_answer:
@@ -899,7 +919,9 @@ class AutonomousNode:
         if self._current_experiment_id is not None:
             self._db.complete_experiment(self._current_experiment_id)
             if verbose:
-                print(f"\nResults saved to database (experiment_id={self._current_experiment_id})")
+                print(
+                    f"\nResults saved to database (experiment_id={self._current_experiment_id})"
+                )
 
         # Mark model as stable after run
         self.model._model_is_stable = True

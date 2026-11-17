@@ -112,9 +112,7 @@ class WrapperDemoContractTest(unittest.TestCase):
             runtime.close = mock.AsyncMock()
             server = mock.Mock(serve=mock.AsyncMock())
             with (
-                mock.patch(
-                    "adaptible.wrap.__main__.LlamaCpp", return_value=runtime
-                ),
+                mock.patch("adaptible.wrap.__main__.LlamaCpp", return_value=runtime),
                 mock.patch(
                     "adaptible.wrap.__main__.read_architecture",
                     return_value="qwen2",

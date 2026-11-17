@@ -84,18 +84,35 @@ class QuestionCandidateTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_structural_candidates_reach_completed_classifier(self):
         pairs = (
-            ("Which bureau maintains the Silver Acorn Trust?", "The Silver Acorn Trust is maintained by which bureau?"),
-            ("In which district is the Misty Sparrow Studio situated?", "Which district contains the Misty Sparrow Studio?"),
-            ("What is the rental charge for the Bronze Kite Pass?", "How much does it cost to rent the Bronze Kite Pass?"),
-            ("What is the Cloud Rune sculpture carved from?", "Which material is used to carve the Cloud Rune sculpture?"),
-            ("What is the elapsed duration of a Blue Cormorant voyage?", "How long does a Blue Cormorant voyage last?"),
+            (
+                "Which bureau maintains the Silver Acorn Trust?",
+                "The Silver Acorn Trust is maintained by which bureau?",
+            ),
+            (
+                "In which district is the Misty Sparrow Studio situated?",
+                "Which district contains the Misty Sparrow Studio?",
+            ),
+            (
+                "What is the rental charge for the Bronze Kite Pass?",
+                "How much does it cost to rent the Bronze Kite Pass?",
+            ),
+            (
+                "What is the Cloud Rune sculpture carved from?",
+                "Which material is used to carve the Cloud Rune sculpture?",
+            ),
+            (
+                "What is the elapsed duration of a Blue Cormorant voyage?",
+                "How long does a Blue Cormorant voyage last?",
+            ),
         )
         for a, b in pairs:
             with self.subTest(a=a, b=b):
                 result = await self.route(a, b)
                 self.assertEqual(result["scope"], 8)
                 self.assertEqual(result["classifier"]["verdict"], "same_fact")
-                self.assertNotIn("SECRET", json.dumps(self.runtime.complete.call_args.args))
+                self.assertNotIn(
+                    "SECRET", json.dumps(self.runtime.complete.call_args.args)
+                )
         self.assertEqual(self.runtime.complete.await_count, len(pairs))
 
     async def test_same_entity_different_property_is_still_a_model_decision(self):
@@ -112,7 +129,10 @@ class QuestionCandidateTest(unittest.IsolatedAsyncioTestCase):
             ("Who mentors Vera Vale?", "Whom does Vera Vale mentor?"),
             ("Who follows Vera Vale?", "Who is followed by Vera Vale?"),
             ("Who employs Vera Vale?", "Who is directly employed by Vera Vale?"),
-            ("What is the total charge for the Bronze Kite Pass?", "How much does it cost to purchase the Bronze Kite Pass?"),
+            (
+                "What is the total charge for the Bronze Kite Pass?",
+                "How much does it cost to purchase the Bronze Kite Pass?",
+            ),
             ("Who mentors Vera Vale?", "Who does Vera Vale mentor?"),
             (
                 "Who directed Winter Ember in 2015?",

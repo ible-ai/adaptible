@@ -13,7 +13,9 @@ class CliClientTest(unittest.TestCase):
         self.model = StubModel()
         self.api = adaptible.Adaptible(model=self.model)
         self.out = io.StringIO()
-        self.cli = adaptible.local.cli.Client(http=open_client(self, self.api.app), out=self.out)
+        self.cli = adaptible.local.cli.Client(
+            http=open_client(self, self.api.app), out=self.out
+        )
 
     def test_ask_streams_and_remembers_idx(self):
         self.assertTrue(self.cli.run("Hello"))
@@ -21,7 +23,9 @@ class CliClientTest(unittest.TestCase):
         self.assertEqual(self.cli.last_idx, 0)
         self.cli.run("Again")
         self.assertEqual(self.cli.last_idx, 1)
-        self.assertEqual(self.api.interaction_history[1].llm_response, "Streamed: Again")
+        self.assertEqual(
+            self.api.interaction_history[1].llm_response, "Streamed: Again"
+        )
 
     def test_down_flags_last_answer(self):
         self.cli.run("Hello")
@@ -40,7 +44,10 @@ class CliClientTest(unittest.TestCase):
         self.cli.run("/down")
         self.cli.run("/review")
         self.assertEqual(len(self.model.self_correct_calls), 1)
-        self.assertRegex(self.out.getvalue(), r"\[review\] started on 1 answer\(s\).*\n\[review\] done in \d+ s")
+        self.assertRegex(
+            self.out.getvalue(),
+            r"\[review\] started on 1 answer\(s\).*\n\[review\] done in \d+ s",
+        )
         self.out.truncate(0)
         self.out.seek(0)
         self.cli.run("/review")
@@ -74,7 +81,9 @@ class CliColorTest(unittest.TestCase):
 
     def test_escapes_when_color_on(self):
         out = io.StringIO()
-        cli = adaptible.local.cli.Client(http=open_client(self, self.api.app), out=out, color=True)
+        cli = adaptible.local.cli.Client(
+            http=open_client(self, self.api.app), out=out, color=True
+        )
         cli.run("Hello")
         cli.run("/down")
         cli.run("/new")
@@ -92,13 +101,23 @@ class CliColorTest(unittest.TestCase):
 
         api = adaptible.Adaptible(model=SplitModel())
         out = io.StringIO()
-        cli = adaptible.local.cli.Client(http=open_client(self, api.app), out=out, color=True)
+        cli = adaptible.local.cli.Client(
+            http=open_client(self, api.app), out=out, color=True
+        )
         cli.run("Q")
         text = out.getvalue()
-        self.assertRegex(text, r"\033\[2m[^\033]*</think>\033\[0m\nAnswer\.\n$")  # tag dim, answer plain
-        self.assertEqual(text.replace("\033[2m", "").replace("\033[0m", ""), "Thinking</think>\nAnswer.\n")
+        self.assertRegex(
+            text, r"\033\[2m[^\033]*</think>\033\[0m\nAnswer\.\n$"
+        )  # tag dim, answer plain
+        self.assertEqual(
+            text.replace("\033[2m", "").replace("\033[0m", ""),
+            "Thinking</think>\nAnswer.\n",
+        )
         plain = io.StringIO()
-        adaptible.local.cli.Client(http=open_client(self, adaptible.Adaptible(model=SplitModel()).app), out=plain).run("Q")
+        adaptible.local.cli.Client(
+            http=open_client(self, adaptible.Adaptible(model=SplitModel()).app),
+            out=plain,
+        ).run("Q")
         self.assertEqual(plain.getvalue(), "Thinking</think>\nAnswer.\n")
 
 

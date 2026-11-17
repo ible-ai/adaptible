@@ -39,7 +39,9 @@ class MutableHostedLLM(uvicorn.Server):
         if app is None:
             # The default node can look things up in the demo store, so a
             # thumbs-down leads to a repair.
-            app = Adaptible(model=StatefulLLM(lookup=DocStore(DEFAULT_PASSAGES).search)).app
+            app = Adaptible(
+                model=StatefulLLM(lookup=DocStore(DEFAULT_PASSAGES).search)
+            ).app
         super().__init__(config=uvicorn.Config(app, host=host, port=port))
         self._startup_done = asyncio.Event()
         self._serve_task = None

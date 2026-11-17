@@ -46,7 +46,9 @@ class ExperimentType(Enum):
 Judge = Callable[[str, str, list[str] | None], bool]
 
 
-def default_judge(response: str, ground_truth: str, key_terms: list[str] | None) -> bool:
+def default_judge(
+    response: str, ground_truth: str, key_terms: list[str] | None
+) -> bool:
     """Default correctness judge using key term matching.
 
     Args:
@@ -487,7 +489,11 @@ class Database:
                     response.phase.value,
                     response.token_count,
                     response.max_tokens,
-                    1 if response.truncated else (0 if response.truncated is False else None),
+                    (
+                        1
+                        if response.truncated
+                        else (0 if response.truncated is False else None)
+                    ),
                 ),
             )
             return cursor.lastrowid  # type: ignore
@@ -887,13 +893,16 @@ class Database:
                 else 0
             ),
             "retention_rate": (
-                (trained_baseline_correct - trained_regressed) / trained_baseline_correct
+                (trained_baseline_correct - trained_regressed)
+                / trained_baseline_correct
                 if trained_baseline_correct > 0
                 else 1.0
             ),
             "regression_count": trained_regressed,
             "holdout_count": holdout_count,
-            "holdout_accuracy": holdout_correct / holdout_count if holdout_count > 0 else 0,
+            "holdout_accuracy": (
+                holdout_correct / holdout_count if holdout_count > 0 else 0
+            ),
         }
 
     # =========================================================================

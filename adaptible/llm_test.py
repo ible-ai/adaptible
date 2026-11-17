@@ -632,7 +632,12 @@ class JointTrainingStepTest(unittest.TestCase):
         # ((train_loss, stop_loss), rehearsal_loss): only the correction's
         # stop loss drives the stop rule; both other losses are reported.
         step, calls = self._scripted(
-            [((3.0, 6.05), 0.5), ((2.5, 2.1), 0.45), ((2.2, 0.58), 0.41), ((2.0, 0.2), 0.4)]
+            [
+                ((3.0, 6.05), 0.5),
+                ((2.5, 2.1), 0.45),
+                ((2.2, 0.58), 0.41),
+                ((2.0, 0.2), 0.4),
+            ]
         )
         stats = llm.run_joint_training_steps(
             step, max_steps=12, loss_target=0.6, rehearsal_count=2
@@ -644,7 +649,6 @@ class JointTrainingStepTest(unittest.TestCase):
         self.assertEqual(stats.final_train_loss, 2.2)
         self.assertEqual(stats.rehearsal_final_loss, 0.41)
         self.assertTrue(stats.stopped_early)
-
 
     def test_three_tuples_count_active_rehearsal_and_record_initial_loss(self):
         # (correction_loss, mean_rehearsal_loss, active_count): the active
@@ -707,7 +711,9 @@ class ActiveRehearsalTest(unittest.TestCase):
         self.assertEqual(llm.active_rehearsal(initial, initial, 0.05), [False, False])
         # ...unless the margin is zero and the loss is strictly above.
         self.assertEqual(llm.active_rehearsal(initial, initial, 0.0), [False, False])
-        self.assertEqual(llm.active_rehearsal([0.381, 0.5], initial, 0.0), [True, False])
+        self.assertEqual(
+            llm.active_rehearsal([0.381, 0.5], initial, 0.0), [True, False]
+        )
 
     def test_zero_margin_is_strict(self):
         self.assertEqual(llm.active_rehearsal([0.5], [0.5], 0.0), [False])
@@ -757,9 +763,7 @@ class CombineGradsTest(unittest.TestCase):
 
     def test_unit_weight_single_rehearsal(self):
         grads_c = self._tree([1.0], [[0.0]])
-        combined = llm.combine_grads(
-            grads_c, [self._tree([-1.0], [[2.0]])], weight=1.0
-        )
+        combined = llm.combine_grads(grads_c, [self._tree([-1.0], [[2.0]])], weight=1.0)
         self.assertEqual(self._flat(combined), ([0.0], [[2.0]]))
 
     def test_empty_rehearsal_returns_correction_unchanged(self):

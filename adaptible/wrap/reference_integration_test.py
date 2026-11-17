@@ -419,7 +419,8 @@ class ReferenceHistoryMigrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             database = sqlite3.connect(path / "history.sqlite3")
-            database.executescript("""
+            database.executescript(
+                """
                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE interactions (
                     id INTEGER PRIMARY KEY, messages TEXT NOT NULL,
@@ -428,7 +429,8 @@ class ReferenceHistoryMigrationTest(unittest.TestCase):
                     status TEXT NOT NULL DEFAULT 'new',
                     reason TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT ''
                 );
-                """)
+                """
+            )
             accepted = {"directory": str(path / "old-adapter")}
             database.executemany(
                 "INSERT INTO meta VALUES (?, ?)",

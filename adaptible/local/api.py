@@ -78,7 +78,9 @@ class Adaptible:
                 raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
             print(f"Received request: {request}")
             # Generate the response using the current state of the model.
-            response_text = self.model.generate_response(request.prompt, use_history=request.use_history)
+            response_text = self.model.generate_response(
+                request.prompt, use_history=request.use_history
+            )
 
             # Store the interaction for later review
             interaction_idx = len(self.interaction_history)
@@ -118,7 +120,9 @@ class Adaptible:
 
             async def relay():
                 chunks = []
-                async for chunk in self.model.stream_response(request.prompt, use_history=request.use_history):
+                async for chunk in self.model.stream_response(
+                    request.prompt, use_history=request.use_history
+                ):
                     chunks.append(chunk)
                     yield chunk
                 record.llm_response = "".join(chunks).strip()
@@ -141,13 +145,20 @@ class Adaptible:
             if not 0 <= request.interaction_idx < len(self.interaction_history):
                 raise HTTPException(status_code=404, detail="No such interaction.")
             if request.thumbs not in ("up", "down"):
-                raise HTTPException(status_code=400, detail="thumbs must be 'up' or 'down'.")
+                raise HTTPException(
+                    status_code=400, detail="thumbs must be 'up' or 'down'."
+                )
             h = self.interaction_history[request.interaction_idx]
             h.flagged = request.thumbs == "down"
             if h.flagged:
                 h.reviewed = False
-                if request.interaction_idx not in self.unreviewed_interaction_history_indices:
-                    self.unreviewed_interaction_history_indices.append(request.interaction_idx)
+                if (
+                    request.interaction_idx
+                    not in self.unreviewed_interaction_history_indices
+                ):
+                    self.unreviewed_interaction_history_indices.append(
+                        request.interaction_idx
+                    )
             return {"interaction_idx": request.interaction_idx, "flagged": h.flagged}
 
         @self.app.post("/trigger_review", response_model=ReviewResponse)

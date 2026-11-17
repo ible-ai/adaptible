@@ -624,10 +624,15 @@ class TrainingSourceTest(_TempDbTest):
                 self.assertEqual(len(model.rationale_prompts), 3)
                 for item, prompt in zip(dataset.items[:3], model.rationale_prompts):
                     self.assertEqual(
-                        prompt, harness.make_rationale_prompt(item.question, item.correct_answer)
+                        prompt,
+                        harness.make_rationale_prompt(
+                            item.question, item.correct_answer
+                        ),
                     )
                     self.assertTrue(prompt.startswith(item.question))
-                    self.assertIn(f"The correct answer is: {item.correct_answer}", prompt)
+                    self.assertIn(
+                        f"The correct answer is: {item.correct_answer}", prompt
+                    )
                 body = "{answer}"
                 rationale_for = fake_rationale
             else:
@@ -686,7 +691,8 @@ class TrainingSourceTest(_TempDbTest):
             # The report card shows the rationale that went into the target.
             for item in dataset.items[:3]:
                 self.assertIn(
-                    f"<strong>Rationale (in target):</strong> {rationale_for(item)}", text
+                    f"<strong>Rationale (in target):</strong> {rationale_for(item)}",
+                    text,
                 )
 
     def test_think_mode_rationale_missing_skips_item_and_is_counted(self):
@@ -726,7 +732,9 @@ class TrainingSourceTest(_TempDbTest):
             generate_html_report(result, self.tmp_path / "missing.html")
         ).read_text()
         self.assertIn("rationales missing: <code>3</code>", text)
-        self.assertIn("<strong>Rationale:</strong> MISSING (item skipped, not trained)", text)
+        self.assertIn(
+            "<strong>Rationale:</strong> MISSING (item skipped, not trained)", text
+        )
 
         # self_generated: the revision carries no </think> at all. The model
         # generates inside the open think block, so the whole output is its
@@ -745,7 +753,8 @@ class TrainingSourceTest(_TempDbTest):
         for item, target in zip(dataset.items[:3], model.trained_targets):
             revision = f"[[0]] The answer is {item.correct_answer}. [[/0]]"
             self.assertEqual(
-                target, f"{revision}\n</think>\n\nThe answer is {item.correct_answer}.{EOS}"
+                target,
+                f"{revision}\n</think>\n\nThe answer is {item.correct_answer}.{EOS}",
             )
         self.assertEqual(result.rationale_missing_count, 0)
         self.assertEqual(len(result.train_items), 3)
@@ -826,7 +835,9 @@ class TrainingSourceTest(_TempDbTest):
             expected = expected[: expected.rfind(". ") + 1]
             self.assertTrue(expected.endswith("."))
             self.assertLess(len(expected), 60)
-            self.assertEqual(target, f"{expected}\n</think>\n\n{item.correct_answer}{EOS}")
+            self.assertEqual(
+                target, f"{expected}\n</think>\n\n{item.correct_answer}{EOS}"
+            )
             r = by_id[item.id]
             self.assertEqual(r.rationale_text, expected)
             self.assertEqual(r.rationale_tokens, len(expected))
@@ -848,9 +859,9 @@ class TrainingSourceTest(_TempDbTest):
         self.assertIn("truncated: <code>3</code>", text)
         self.assertIn("tokens, truncated)</em>", text)
         # An untruncated run under the default cap records the default.
-        result = EvaluationHarness(model=FakeModel(dataset, think=True), db=self.db).run(
-            dataset, EvaluationConfig(name="default-cap"), verbose=False
-        )
+        result = EvaluationHarness(
+            model=FakeModel(dataset, think=True), db=self.db
+        ).run(dataset, EvaluationConfig(name="default-cap"), verbose=False)
         self.assertEqual(result.config.rationale_max_tokens, 512)
         self.assertEqual(result.to_dict()["config"]["rationale_max_tokens"], 512)
         for bad in (0, -5, 2.5):
@@ -865,19 +876,23 @@ class TrainingSourceTest(_TempDbTest):
             dataset,
             think=True,
             rationale=lambda item: (
-                "" if item.id in {"q02", "q05"}
+                ""
+                if item.id in {"q02", "q05"}
                 else f"{fake_rationale(item)}\n</think>\n\nSo {item.correct_answer}."
             ),
         )
         config = MetaLearningConfig(
-            name="meta-missing", seeds=[1], checkpoint_interval=4, train_ratio=0.8,
+            name="meta-missing",
+            seeds=[1],
+            checkpoint_interval=4,
+            train_ratio=0.8,
             rationale_max_tokens=100,
         )
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            result = MetaLearningExperiment(model_factory=lambda: model, db=self.db).run(
-                dataset, config, verbose=True
-            )
+            result = MetaLearningExperiment(
+                model_factory=lambda: model, db=self.db
+            ).run(dataset, config, verbose=True)
         traj = result.trajectories[1]
         trained_ids = traj_train_ids(dataset, seed=1)
         skipped = sum(1 for i in ("q02", "q05") if i in trained_ids)
@@ -888,7 +903,9 @@ class TrainingSourceTest(_TempDbTest):
         self.assertEqual(traj.checkpoints[-1].step, len(trained_ids) - skipped)
         self.assertIn("Skipped q0", buf.getvalue())
         self.assertIn(f"{skipped} rationales missing", buf.getvalue())
-        self.assertEqual(self._config_json_for(traj.experiment_id)["rationale_max_tokens"], 100)
+        self.assertEqual(
+            self._config_json_for(traj.experiment_id)["rationale_max_tokens"], 100
+        )
         self.assertEqual(
             MetaLearningConfig.from_dict(config.to_dict()).rationale_max_tokens, 100
         )
@@ -998,7 +1015,9 @@ class TrainingSourceTest(_TempDbTest):
         model = FakeModel(dataset, think=False)
         model._tokenizer = FakeTokenizer(think=True)
         EvaluationHarness(model=model, db=self.db).run(
-            dataset, EvaluationConfig(name="fallback", think_mode="baseline"), verbose=False
+            dataset,
+            EvaluationConfig(name="fallback", think_mode="baseline"),
+            verbose=False,
         )
         for item, target in zip(dataset.items[:3], model.trained_targets):
             self.assertEqual(target, f"</think>\n\n{item.correct_answer}{EOS}")
@@ -1023,7 +1042,9 @@ class TrainingSourceTest(_TempDbTest):
     def test_model_kwargs_are_recorded_and_used_lazily(self):
         dataset = make_dataset(4)
         model = FakeModel(dataset)
-        h = EvaluationHarness(model=model, db=self.db, model_kwargs={"learning_rate": 1e-5})
+        h = EvaluationHarness(
+            model=model, db=self.db, model_kwargs={"learning_rate": 1e-5}
+        )
         h.run(dataset, EvaluationConfig(name="lr"), verbose=False)
         self.assertEqual(
             self._config_json_for(self._latest_experiment_id())["model_kwargs"],
@@ -1331,7 +1352,9 @@ class MetaLearningTest(_TempDbTest):
             traj = result.trajectories[1]
             self.assertEqual(len(model.trained_batches), 8)
             for masked, full in (b[0] for b in model.trained_batches):
-                item = next(i for q, i in by_question.items() if f"<user>{q}</user>" in full)
+                item = next(
+                    i for q, i in by_question.items() if f"<user>{q}</user>" in full
+                )
                 self.assertEqual((masked, full), expect(item, item.correct_answer))
             for stop in model.trained_stop_targets:
                 self.assertTrue(stop.endswith(EOS))
@@ -1353,21 +1376,30 @@ class MetaLearningTest(_TempDbTest):
         # Deprecated alias.
         self.assertEqual(MetaLearningConfig(close_think=False).think_mode, "none")
         # Legacy files: only close_think, or neither.
-        base = {"name": "x", "seeds": [1], "checkpoint_interval": 1,
-                "training_iterations": 1, "train_ratio": 0.5}
+        base = {
+            "name": "x",
+            "seeds": [1],
+            "checkpoint_interval": 1,
+            "training_iterations": 1,
+            "train_ratio": 0.5,
+        }
         self.assertEqual(MetaLearningConfig.from_dict(base).think_mode, "none")
         self.assertEqual(
-            MetaLearningConfig.from_dict({**base, "close_think": True}).think_mode, "empty"
+            MetaLearningConfig.from_dict({**base, "close_think": True}).think_mode,
+            "empty",
         )
         self.assertEqual(
-            MetaLearningConfig.from_dict({**base, "close_think": False}).think_mode, "none"
+            MetaLearningConfig.from_dict({**base, "close_think": False}).think_mode,
+            "none",
         )
 
     def test_meta_rehearsal_and_model_kwargs(self):
         dataset = make_dataset(10)
         # seed 1 shuffle of 10 items: 8 trained, 2 holdout. Everything is known
         # at baseline so the rehearsal pool is the whole trained split.
-        model = FakeModel(dataset, think=True, known_at_baseline={i.id for i in dataset})
+        model = FakeModel(
+            dataset, think=True, known_at_baseline={i.id for i in dataset}
+        )
         config = MetaLearningConfig(
             name="reh",
             seeds=[1],
@@ -1378,7 +1410,9 @@ class MetaLearningTest(_TempDbTest):
             train_correct_items=True,
         )
         experiment = MetaLearningExperiment(
-            model_factory=lambda: model, db=self.db, model_kwargs={"learning_rate": 3e-5}
+            model_factory=lambda: model,
+            db=self.db,
+            model_kwargs={"learning_rate": 3e-5},
         )
         result = experiment.run(dataset, config, verbose=False)
         traj = result.trajectories[1]
@@ -1391,7 +1425,9 @@ class MetaLearningTest(_TempDbTest):
         self.assertTrue(all(shape[0] == 1 for shape in model.batch_shapes))
         self.assertEqual(traj.train_rehearsal_final_losses, [0.41] * 8)
         self.assertAlmostEqual(traj.mean_train_rehearsal_final_loss, 0.41)
-        self.assertIn("(train loss 0.58, rehearsal 0.41)", traj.training_summary_text(12, 0.6))
+        self.assertIn(
+            "(train loss 0.58, rehearsal 0.41)", traj.training_summary_text(12, 0.6)
+        )
         self.assertEqual(result.model_kwargs, {"learning_rate": 3e-5})
         holdout_questions = {
             dataset[idx].question for idx in traj_holdout_indices(dataset, seed=1)
@@ -1401,7 +1437,10 @@ class MetaLearningTest(_TempDbTest):
             for masked, full in rows[1:]:
                 q = full.split("<user>")[1].split("</user>")[0]
                 self.assertNotIn(q, holdout_questions)
-                self.assertRegex(masked, r"^Thinking about q\d\d\.\n</think>\n\nIt is Answer\d+\.<eos>$")
+                self.assertRegex(
+                    masked,
+                    r"^Thinking about q\d\d\.\n</think>\n\nIt is Answer\d+\.<eos>$",
+                )
         cfg = self._config_json_for(traj.experiment_id)
         self.assertEqual(cfg["rehearsal_k"], 2)
         self.assertEqual(cfg["rehearsal_max_tokens"], 768)
@@ -1416,7 +1455,9 @@ class MetaLearningTest(_TempDbTest):
         path = self.tmp_path / "reh.json"
         result.save(path)
         loaded = MetaLearningResult.load(path)
-        self.assertEqual(loaded.trajectories[1].train_rehearsal_final_losses, [0.41] * 8)
+        self.assertEqual(
+            loaded.trajectories[1].train_rehearsal_final_losses, [0.41] * 8
+        )
         self.assertEqual(loaded.config.rehearsal_weight, 1.0)
         self.assertEqual(loaded.model_kwargs, {"learning_rate": 3e-5})
 
@@ -1742,7 +1783,9 @@ class RehearsalTest(_TempDbTest):
             self.assertEqual(rehearsed, r.rehearsal_item_ids)
         # Holdout items are untouched and have no rehearsal ids.
         self.assertEqual(by_id["q05"].rehearsal_item_ids, [])
-        self.assertNotIn("q05", {rid for r in result.items for rid in r.rehearsal_item_ids})
+        self.assertNotIn(
+            "q05", {rid for r in result.items for rid in r.rehearsal_item_ids}
+        )
         # One training event per item, not per call.
         experiment_id = self._latest_experiment_id()
         events = self.db.get_training_events_for_experiment(experiment_id)
@@ -1865,9 +1908,7 @@ class RehearsalTest(_TempDbTest):
         self.assertEqual(model.joint_calls, [])
         self.assertEqual(model.train_kwargs, [(12, 0.6, 12)] * 3)
         self.assertTrue(all(shape[0] == 1 for shape in model.batch_shapes))
-        self.assertTrue(
-            all(i.train_rehearsal_final_loss is None for i in result.items)
-        )
+        self.assertTrue(all(i.train_rehearsal_final_loss is None for i in result.items))
         self.assertIsNone(result.mean_train_rehearsal_final_loss)
         self.assertNotIn("rehearsal", result.training_summary_text())
 
@@ -1875,7 +1916,9 @@ class RehearsalTest(_TempDbTest):
         dataset = make_dataset(4)
         model = FakeModel(dataset, known_at_baseline={i.id for i in dataset})
         EvaluationHarness(model=model, db=self.db).run(
-            dataset, EvaluationConfig(name="k0", rehearsal_k=0, train_correct_items=True), verbose=False
+            dataset,
+            EvaluationConfig(name="k0", rehearsal_k=0, train_correct_items=True),
+            verbose=False,
         )
         self.assertEqual(model.joint_calls, [])
         self.assertEqual(model.train_kwargs, [(12, 0.6, 12)] * 3)
@@ -1887,7 +1930,8 @@ class RehearsalTest(_TempDbTest):
         for _ in range(2):
             model = FakeModel(dataset, think=True, known_at_baseline=known)
             result = EvaluationHarness(model=model, db=self.db).run(
-                dataset, EvaluationConfig(
+                dataset,
+                EvaluationConfig(
                     name="seeded", rehearsal_k=2, seed=3, train_correct_items=True
                 ),
                 verbose=False,
@@ -1957,9 +2001,14 @@ class CollapseSummaryTest(unittest.TestCase):
         )
         result.items = [
             ItemResult(
-                item_id="q", question="Q", correct_answer="A", key_terms=["a"],
-                initial_response="x", initial_response_raw="x",
-                initial_has_key_terms=False, initial_token_count=42,
+                item_id="q",
+                question="Q",
+                correct_answer="A",
+                key_terms=["a"],
+                initial_response="x",
+                initial_response_raw="x",
+                initial_has_key_terms=False,
+                initial_token_count=42,
             )
         ]
         self.assertEqual(result.mean_baseline_tokens, 42.0)
@@ -1976,11 +2025,14 @@ class CollapseSummaryTest(unittest.TestCase):
                 dataset, EvaluationConfig(name="tok", train_ratio=2 / 3), verbose=False
             )
             for item in result.items:
-                self.assertEqual(item.initial_token_count, len(item.initial_response_raw))
+                self.assertEqual(
+                    item.initial_token_count, len(item.initial_response_raw)
+                )
                 self.assertEqual(item.post_token_count, len(item.post_response_raw))
             self.assertEqual(result.post_empty_think_count, 0)
             self.assertEqual(
-                result.holdout_summary_text(), "Holdout accuracy: 100.0% (1/1, baseline 1/1)"
+                result.holdout_summary_text(),
+                "Holdout accuracy: 100.0% (1/1, baseline 1/1)",
             )
 
 
@@ -2000,11 +2052,18 @@ class LossTargetTest(_TempDbTest):
         self.assertEqual(MetaLearningConfig(name="m").training_iterations, 12)
         # Round-trips, and legacy files without the key mean fixed-count.
         self.assertEqual(
-            MetaLearningConfig.from_dict(MetaLearningConfig(name="m").to_dict()).loss_target,
+            MetaLearningConfig.from_dict(
+                MetaLearningConfig(name="m").to_dict()
+            ).loss_target,
             0.6,
         )
-        legacy = {"name": "x", "seeds": [1], "checkpoint_interval": 1,
-                  "training_iterations": 25, "train_ratio": 0.5}
+        legacy = {
+            "name": "x",
+            "seeds": [1],
+            "checkpoint_interval": 1,
+            "training_iterations": 25,
+            "train_ratio": 0.5,
+        }
         self.assertIsNone(MetaLearningConfig.from_dict(legacy).loss_target)
 
     def test_harness_passes_target_and_records_steps(self):
@@ -2175,9 +2234,7 @@ class LossTargetTest(_TempDbTest):
             "rehearsal active in 33% of steps",
         )
         out = buf.getvalue()
-        self.assertRegex(
-            out, r"\(rehearsal 0\.40→0\.43 \(active 2/6\)\), \d+\.\ds"
-        )
+        self.assertRegex(out, r"\(rehearsal 0\.40→0\.43 \(active 2/6\)\), \d+\.\ds")
         self.assertIn("rehearsal active in 33% of steps", out)
         d = result.to_dict()
         self.assertEqual(d["config"]["rehearsal_margin"], 0.05)
@@ -2235,15 +2292,20 @@ class LossTargetTest(_TempDbTest):
             rehearsal_losses=[0.40, 0.47, 0.43],
         )
         config = MetaLearningConfig(
-            name="meta-hinge", seeds=[1], checkpoint_interval=4, train_ratio=0.8,
-            rehearsal_k=2, rehearsal_margin=0.02, think_mode="baseline",
+            name="meta-hinge",
+            seeds=[1],
+            checkpoint_interval=4,
+            train_ratio=0.8,
+            rehearsal_k=2,
+            rehearsal_margin=0.02,
+            think_mode="baseline",
             train_correct_items=True,
         )
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            result = MetaLearningExperiment(model_factory=lambda: model, db=self.db).run(
-                dataset, config, verbose=True
-            )
+            result = MetaLearningExperiment(
+                model_factory=lambda: model, db=self.db
+            ).run(dataset, config, verbose=True)
         traj = result.trajectories[1]
         self.assertEqual({c["rehearsal_margin"] for c in model.joint_calls}, {0.02})
         # Margin 0.02: step 2 (0.47) and step 3 (0.43) both drift past 0.42.
@@ -2258,9 +2320,17 @@ class LossTargetTest(_TempDbTest):
         cfg = self._config_json_for(traj.experiment_id)
         self.assertEqual(cfg["rehearsal_margin"], 0.02)
         self.assertEqual(cfg["rationale_max_tokens"], 512)
-        self.assertEqual(MetaLearningConfig.from_dict(config.to_dict()).rehearsal_margin, 0.02)
-        self.assertEqual(MetaLearningConfig.from_dict({**config.to_dict()}).rationale_max_tokens, 512)
-        legacy = {k: v for k, v in config.to_dict().items() if k not in ("rehearsal_margin", "rationale_max_tokens")}
+        self.assertEqual(
+            MetaLearningConfig.from_dict(config.to_dict()).rehearsal_margin, 0.02
+        )
+        self.assertEqual(
+            MetaLearningConfig.from_dict({**config.to_dict()}).rationale_max_tokens, 512
+        )
+        legacy = {
+            k: v
+            for k, v in config.to_dict().items()
+            if k not in ("rehearsal_margin", "rationale_max_tokens")
+        }
         self.assertEqual(MetaLearningConfig.from_dict(legacy).rehearsal_margin, 0.05)
         d = traj.to_dict()
         self.assertEqual(d["train_rehearsal_active_steps"], [4] * 8)
@@ -2279,7 +2349,9 @@ class LossTargetTest(_TempDbTest):
         )
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            EvaluationHarness(model=model, db=self.db).run(dataset, config, verbose=True)
+            EvaluationHarness(model=model, db=self.db).run(
+                dataset, config, verbose=True
+            )
         out = buf.getvalue()
         self.assertIn("Rehearsal k: 1 (max tokens: 768, weight: 1, margin: 0.05)", out)
         self.assertIn("LoRA: rank 8, layers 8, scale 10", out)
@@ -2315,10 +2387,14 @@ class LossTargetTest(_TempDbTest):
         self.assertEqual(cfg["lora"], {"rank": 8, "layers": 4, "scale": 2.0})
         self.assertEqual(result.model_kwargs, kwargs)
         self.assertEqual(result.lora_settings_text(), "LoRA: rank 8, layers 4, scale 2")
-        self.assertEqual(result.to_dict()["lora"], {"rank": 8, "layers": 4, "scale": 2.0})
+        self.assertEqual(
+            result.to_dict()["lora"], {"rank": 8, "layers": 4, "scale": 2.0}
+        )
         # Defaults match StatefulLLM's when nothing was passed.
         self.assertEqual(harness.lora_settings({}), (8, 8, 10.0))
-        self.assertEqual(harness.lora_model_kwargs(), harness.lora_model_kwargs(8, 8, 10.0))
+        self.assertEqual(
+            harness.lora_model_kwargs(), harness.lora_model_kwargs(8, 8, 10.0)
+        )
         for bad in ({"rank": 0}, {"layers": -1}, {"scale": 0}):
             with self.assertRaises(ValueError):
                 harness.lora_model_kwargs(**bad)
@@ -2343,7 +2419,9 @@ class LossTargetTest(_TempDbTest):
         config = EvaluationConfig(name="v", train_ratio=0.5)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            EvaluationHarness(model=model, db=self.db).run(dataset, config, verbose=True)
+            EvaluationHarness(model=model, db=self.db).run(
+                dataset, config, verbose=True
+            )
         out = buf.getvalue()
         self.assertIn("Loss target: 0.6 (step cap: 12)", out)
         self.assertRegex(out, r"Trained \(3 steps, loss 6\.05 → 0\.58, \d+\.\ds\)")
@@ -2361,7 +2439,10 @@ class LossTargetTest(_TempDbTest):
         dataset = make_dataset(10)
         model = FakeModel(dataset)
         config = MetaLearningConfig(
-            name="mlt", seeds=[7], checkpoint_interval=4, train_ratio=0.8,
+            name="mlt",
+            seeds=[7],
+            checkpoint_interval=4,
+            train_ratio=0.8,
             training_iterations=6,
         )
         buf = io.StringIO()
@@ -2376,7 +2457,9 @@ class LossTargetTest(_TempDbTest):
         self.assertEqual(traj.train_cap_hits, 0)
         self.assertAlmostEqual(traj.mean_train_steps, 3.0)
         self.assertAlmostEqual(traj.mean_train_final_loss, 0.58)
-        self.assertRegex(out, r"Trained q\d\d \(3 steps, loss 6\.05 → 0\.58, \d+\.\ds\)")
+        self.assertRegex(
+            out, r"Trained q\d\d \(3 steps, loss 6\.05 → 0\.58, \d+\.\ds\)"
+        )
         self.assertIn(
             "Training: mean 3.0 steps/item (cap 6, answer-loss target 0.60), "
             "mean final answer loss 0.58 (train loss 0.58); 0 items hit the cap; "
@@ -2421,7 +2504,9 @@ class LossTargetTest(_TempDbTest):
         )
         path = generate_html_report(result, str(self.tmp_path / "r2.html"))
         text = pathlib.Path(path).read_text()
-        self.assertIn("mean final answer loss 0.58 (train loss 0.58, rehearsal 0.41)", text)
+        self.assertIn(
+            "mean final answer loss 0.58 (train loss 0.58, rehearsal 0.41)", text
+        )
 
 
 class SkipCorrectTest(_TempDbTest):
@@ -2443,9 +2528,7 @@ class SkipCorrectTest(_TempDbTest):
 
         # Only the baseline-wrong train items reached the model.
         self.assertEqual(model.train_calls, 3)
-        self.assertEqual(
-            model.trained_targets, [f"Answer{i}{EOS}" for i in (0, 2, 4)]
-        )
+        self.assertEqual(model.trained_targets, [f"Answer{i}{EOS}" for i in (0, 2, 4)])
         self.assertEqual([r.item_id for r in result.train_items], ["q00", "q02", "q04"])
         # The skipped ones are their own bucket: not trained, not holdout.
         self.assertEqual(
@@ -2476,7 +2559,10 @@ class SkipCorrectTest(_TempDbTest):
             "Skipped (baseline correct): 2; of which 0 regressed after other "
             "items' training",
         )
-        self.assertEqual(result.holdout_summary_text(), "Holdout accuracy: 100.0% (1/1, baseline 1/1)")
+        self.assertEqual(
+            result.holdout_summary_text(),
+            "Holdout accuracy: 100.0% (1/1, baseline 1/1)",
+        )
         # One training event per trained item; none for the skipped ones.
         experiment_id = self._latest_experiment_id()
         self.assertEqual(
@@ -2563,9 +2649,9 @@ class SkipCorrectTest(_TempDbTest):
         self.assertIs(config.train_correct_items, False)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            result = MetaLearningExperiment(model_factory=lambda: model, db=self.db).run(
-                dataset, config, verbose=True
-            )
+            result = MetaLearningExperiment(
+                model_factory=lambda: model, db=self.db
+            ).run(dataset, config, verbose=True)
         traj = result.trajectories[1]
         train_ids = traj_train_ids(dataset, seed=1)
         skipped = [i for i in train_ids if i in known]
@@ -2615,18 +2701,27 @@ class SkipCorrectTest(_TempDbTest):
             traj.checkpoints[-1].skipped_correct_ids,
         )
         # Legacy files trained every item.
-        legacy = {k: v for k, v in config.to_dict().items() if k != "train_correct_items"}
+        legacy = {
+            k: v for k, v in config.to_dict().items() if k != "train_correct_items"
+        }
         self.assertIs(MetaLearningConfig.from_dict(legacy).train_correct_items, True)
         # With train_correct_items=True every train-split item is trained.
         model = FakeModel(dataset, known_at_baseline=known)
-        traj = MetaLearningExperiment(model_factory=lambda: model, db=self.db).run(
-            dataset,
-            MetaLearningConfig(
-                name="meta-all", seeds=[1], checkpoint_interval=4, train_ratio=0.8,
-                train_correct_items=True,
-            ),
-            verbose=False,
-        ).trajectories[1]
+        traj = (
+            MetaLearningExperiment(model_factory=lambda: model, db=self.db)
+            .run(
+                dataset,
+                MetaLearningConfig(
+                    name="meta-all",
+                    seeds=[1],
+                    checkpoint_interval=4,
+                    train_ratio=0.8,
+                    train_correct_items=True,
+                ),
+                verbose=False,
+            )
+            .trajectories[1]
+        )
         self.assertEqual(model.train_calls, len(train_ids))
         self.assertEqual(traj.skipped_correct_ids, [])
 
@@ -2654,7 +2749,9 @@ class VerifyTest(_TempDbTest):
         self.assertEqual(model.train_calls, 3)
         # Extra rounds halve the target (call 1 ended at 0.58 -> 0.29, then
         # 0.6/4 = 0.15 = VERIFY_LOSS_FLOOR) instead of training with none.
-        self.assertEqual(model.train_kwargs, [(12, 0.6, 12), (2, 0.29, 2), (2, 0.15, 2)])
+        self.assertEqual(
+            model.train_kwargs, [(12, 0.6, 12), (2, 0.29, 2), (2, 0.15, 2)]
+        )
         self.assertEqual([s.steps for s in model.training_stats], [3, 2, 2])
         self.assertEqual(q00.train_steps, 7)
         self.assertEqual(q00.verify_attempts, 3)
@@ -2721,7 +2818,10 @@ class VerifyTest(_TempDbTest):
         result = EvaluationHarness(model=model, db=self.db).run(
             dataset,
             EvaluationConfig(
-                name="verify-cap", train_ratio=0.5, verify_steps=2, training_iterations=6
+                name="verify-cap",
+                train_ratio=0.5,
+                verify_steps=2,
+                training_iterations=6,
             ),
             verbose=False,
         )
@@ -2742,13 +2842,18 @@ class VerifyTest(_TempDbTest):
             "(mean 3.0 checks/item); 1 still wrong at the cap",
         )
         self.assertEqual(
-            [e.training_iterations for e in self.db.get_training_events_for_experiment(1)],
+            [
+                e.training_iterations
+                for e in self.db.get_training_events_for_experiment(1)
+            ],
             [6],
         )
         text = pathlib.Path(
             generate_html_report(result, self.tmp_path / "verify-cap.html")
         ).read_text()
-        self.assertIn("✗ still wrong at the step cap after 3 checks (6 steps total)", text)
+        self.assertIn(
+            "✗ still wrong at the step cap after 3 checks (6 steps total)", text
+        )
 
         # An item already at the cap after the first call gets exactly one
         # check and no extra training.
@@ -2756,13 +2861,18 @@ class VerifyTest(_TempDbTest):
         result = EvaluationHarness(model=model, db=self.db).run(
             dataset,
             EvaluationConfig(
-                name="verify-cap1", train_ratio=0.5, verify_steps=2, training_iterations=4
+                name="verify-cap1",
+                train_ratio=0.5,
+                verify_steps=2,
+                training_iterations=4,
             ),
             verbose=False,
         )
         q00 = next(r for r in result.items if r.item_id == "q00")
         self.assertEqual(model.train_kwargs, [(4, 0.6, 4)])
-        self.assertEqual((q00.train_steps, q00.verify_attempts, q00.verified), (4, 1, False))
+        self.assertEqual(
+            (q00.train_steps, q00.verify_attempts, q00.verified), (4, 1, False)
+        )
 
         # A passing first check makes exactly one check and no extra call.
         model = FakeModel(dataset)
@@ -2773,7 +2883,9 @@ class VerifyTest(_TempDbTest):
         )
         q00 = next(r for r in result.items if r.item_id == "q00")
         self.assertEqual(model.train_kwargs, [(12, 0.6, 12)])
-        self.assertEqual((q00.train_steps, q00.verify_attempts, q00.verified), (3, 1, True))
+        self.assertEqual(
+            (q00.train_steps, q00.verify_attempts, q00.verified), (3, 1, True)
+        )
         self.assertEqual(len(model.question_prompts), 2 * 2 + 1)
 
     def test_verify_off_makes_no_extra_generations(self):
@@ -2795,9 +2907,13 @@ class VerifyTest(_TempDbTest):
         self.assertEqual(result.verified_count, 0)
         self.assertEqual(result.verify_still_wrong_count, 0)
         self.assertEqual(result.mean_verify_attempts, 0.0)
-        self.assertNotIn("Verification", pathlib.Path(
-            generate_html_report(result, self.tmp_path / "off.html")
-        ).read_text().split("<h2>Overall Metrics</h2>")[1].split("<div class=\"metrics-grid\">")[0])
+        self.assertNotIn(
+            "Verification",
+            pathlib.Path(generate_html_report(result, self.tmp_path / "off.html"))
+            .read_text()
+            .split("<h2>Overall Metrics</h2>")[1]
+            .split('<div class="metrics-grid">')[0],
+        )
         for bad in (-1, 1.5, True):
             with self.assertRaises(ValueError):
                 EvaluationConfig(verify_steps=bad)
@@ -2821,7 +2937,10 @@ class VerifyTest(_TempDbTest):
         q00 = next(r for r in result.items if r.item_id == "q00")
         self.assertEqual(model.train_kwargs, [])
         self.assertEqual(
-            [(c["loss_target"], c["max_steps"], c["rehearsal_k"]) for c in model.joint_calls],
+            [
+                (c["loss_target"], c["max_steps"], c["rehearsal_k"])
+                for c in model.joint_calls
+            ],
             [(0.6, 12, 2), (0.29, 2, 2)],
         )
         # The same rehearsal rows went into both calls.
@@ -2829,7 +2948,9 @@ class VerifyTest(_TempDbTest):
             model.joint_calls[0]["rehearsal_targets"],
             model.joint_calls[1]["rehearsal_targets"],
         )
-        self.assertEqual((q00.train_steps, q00.verify_attempts, q00.verified), (5, 2, True))
+        self.assertEqual(
+            (q00.train_steps, q00.verify_attempts, q00.verified), (5, 2, True)
+        )
         self.assertEqual(len(q00.rehearsal_item_ids), 2)
         self.assertEqual(q00.train_rehearsal_pairs, 10)
         # Last call's last (second) scripted rehearsal loss.
@@ -2841,14 +2962,17 @@ class VerifyTest(_TempDbTest):
         dataset = make_dataset(10)
         model = FakeModel(dataset, learns_after_steps=4)
         config = MetaLearningConfig(
-            name="meta-verify", seeds=[1], checkpoint_interval=4, train_ratio=0.8,
+            name="meta-verify",
+            seeds=[1],
+            checkpoint_interval=4,
+            train_ratio=0.8,
             verify_steps=3,
         )
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            result = MetaLearningExperiment(model_factory=lambda: model, db=self.db).run(
-                dataset, config, verbose=True
-            )
+            result = MetaLearningExperiment(
+                model_factory=lambda: model, db=self.db
+            ).run(dataset, config, verbose=True)
         traj = result.trajectories[1]
         # First item: 3 steps -> wrong -> 3 more -> right (6 total, 2 checks).
         # Later items: the model already has its 4 steps, so 3 steps and one
@@ -2886,11 +3010,17 @@ class VerifyTest(_TempDbTest):
         self.assertEqual(loaded.config.verify_steps, 3)
         # Off: nothing recorded as verified.
         model = FakeModel(dataset)
-        traj = MetaLearningExperiment(model_factory=lambda: model, db=self.db).run(
-            dataset,
-            MetaLearningConfig(name="meta-off", seeds=[1], checkpoint_interval=4, train_ratio=0.8),
-            verbose=False,
-        ).trajectories[1]
+        traj = (
+            MetaLearningExperiment(model_factory=lambda: model, db=self.db)
+            .run(
+                dataset,
+                MetaLearningConfig(
+                    name="meta-off", seeds=[1], checkpoint_interval=4, train_ratio=0.8
+                ),
+                verbose=False,
+            )
+            .trajectories[1]
+        )
         self.assertEqual(traj.verified, [None] * 8)
         self.assertEqual(traj.verify_attempts, [0] * 8)
         self.assertEqual(traj.verified_count, 0)

@@ -209,9 +209,7 @@ def generate_html_report(
     verify_steps = getattr(result.config, "verify_steps", 0)
     interference_text = html.escape(result.interference_summary_text())
     verification_html = (
-        f"<br>{html.escape(result.verification_summary_text())}"
-        if verify_steps
-        else ""
+        f"<br>{html.escape(result.verification_summary_text())}" if verify_steps else ""
     )
     if training_source == "self_generated":
         training_source_text = (

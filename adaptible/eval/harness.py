@@ -943,9 +943,7 @@ def interference_summary_text(skipped: int, regressed: int) -> str:
     )
 
 
-def verification_summary_text(
-    verified: list[bool | None], attempts: list[int]
-) -> str:
+def verification_summary_text(verified: list[bool | None], attempts: list[int]) -> str:
     """Format the one-line verify-after-target summary.
 
     ``Verification: 9/12 items verified correct after training (mean 1.8
@@ -1392,7 +1390,9 @@ class TrainingOutcome:
         """``verified ✓ (2 checks)`` / ``not verified at cap (3 checks)``; empty when off."""
         if self.verified is None:
             return ""
-        checks = f"{self.verify_attempts} check{'s' if self.verify_attempts != 1 else ''}"
+        checks = (
+            f"{self.verify_attempts} check{'s' if self.verify_attempts != 1 else ''}"
+        )
         if self.verified:
             return f"verified ✓ ({checks})"
         return f"not verified at cap ({checks})"
@@ -1761,7 +1761,10 @@ class EvaluationHarness:
                     "verify_steps": config.verify_steps,
                     "model_kwargs": self._model_kwargs,
                     "lora": dict(
-                        zip(("rank", "layers", "scale"), lora_settings(self._model_kwargs))
+                        zip(
+                            ("rank", "layers", "scale"),
+                            lora_settings(self._model_kwargs),
+                        )
                     ),
                     "dataset_name": dataset.name,
                     "dataset_version": dataset.version,
@@ -1979,7 +1982,9 @@ class EvaluationHarness:
                     if outcome.revision_answer is not None:
                         was = "✓" if item_result.initial_has_key_terms else "✗"
                         now = "✓" if outcome.revision_has_key_terms else "✗"
-                        same = "" if item_result.revision_changed_text else " (verbatim)"
+                        same = (
+                            "" if item_result.revision_changed_text else " (verbatim)"
+                        )
                         print(f"       Revision judged {was} → {now}{same}")
 
         # Phase 3: Post-training inference
@@ -2039,9 +2044,15 @@ class EvaluationHarness:
             print(f"Total time: {result.total_time_seconds:.1f}s")
             print(f"Baseline accuracy: {result.baseline_accuracy:.1%}")
             n_train = len(result.train_items)
-            print(f"Train post-accuracy: {result.train_post_accuracy:.1%} (n={n_train})")
-            print(f"Train improvement rate: {result.train_improvement_rate:.1%} (n={n_train})")
-            print(f"Train retention rate: {result.train_retention_rate:.1%} (n={n_train})")
+            print(
+                f"Train post-accuracy: {result.train_post_accuracy:.1%} (n={n_train})"
+            )
+            print(
+                f"Train improvement rate: {result.train_improvement_rate:.1%} (n={n_train})"
+            )
+            print(
+                f"Train retention rate: {result.train_retention_rate:.1%} (n={n_train})"
+            )
             print(result.holdout_summary_text())
             print(result.interference_summary_text())
             if config.verify_steps > 0:

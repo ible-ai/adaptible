@@ -252,7 +252,8 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
             else "N/A"
         )
 
-        trajectory_rows.append(f"""
+        trajectory_rows.append(
+            f"""
             <tr class="{row_class}">
                 <td>{seed}{badge}</td>
                 <td>{score_str}</td>
@@ -266,7 +267,8 @@ def generate_summary_html(result: MetaLearningResult, output_path: pathlib.Path)
                 <td>{f"{traj.verified_count}/{len(traj.verified)}" if result.config.verify_steps else "off"}</td>
                 <td>{traj.total_time_seconds:.1f}s</td>
             </tr>
-            """)
+            """
+        )
 
     # Build checkpoint progression for best seed
     checkpoint_data = []

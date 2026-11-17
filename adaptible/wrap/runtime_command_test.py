@@ -52,7 +52,6 @@ class LlamaCppPayloadTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runtime.close()
 
-
     async def test_prompt_cache_is_off_so_a_seeded_draw_reproduces(self):
         """Measured against llama-server: the same seed and prompt back to back
         returned 1961 then 1613 characters with the cache on, and the same 1961
@@ -68,9 +67,7 @@ class LlamaCppPayloadTest(unittest.IsolatedAsyncioTestCase):
             runtime = LlamaCpp(source, directory, executable="unused-llama-server")
             try:
                 self.assertIs(runtime.payload({})["cache_prompt"], False)
-                self.assertIs(
-                    runtime.payload({}, frozen=True)["cache_prompt"], False
-                )
+                self.assertIs(runtime.payload({}, frozen=True)["cache_prompt"], False)
                 # An explicit request still wins; the default is a default.
                 self.assertIs(
                     runtime.payload({"cache_prompt": True})["cache_prompt"], True
@@ -143,6 +140,7 @@ class RuntimeCommandTest(unittest.IsolatedAsyncioTestCase):
                     run_command(sys.executable, "-c", program, ready)
                 )
                 try:
+
                     async def until_ready():
                         while not ready.exists():
                             await asyncio.sleep(0.005)
@@ -230,7 +228,9 @@ class LlamaCppPrecisionTest(unittest.IsolatedAsyncioTestCase):
         this failing: each alone leaves the gap to MLX near 1e-4."""
         from adaptible.wrap.runtime import LLAMA_CPP_FULL_PRECISION
 
-        settings = dict(zip(LLAMA_CPP_FULL_PRECISION[::2], LLAMA_CPP_FULL_PRECISION[1::2]))
+        settings = dict(
+            zip(LLAMA_CPP_FULL_PRECISION[::2], LLAMA_CPP_FULL_PRECISION[1::2])
+        )
         self.assertEqual(
             settings,
             {

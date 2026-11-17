@@ -824,9 +824,7 @@ class RuntimeMemoryTest(unittest.IsolatedAsyncioTestCase):
 
         with (
             tempfile.TemporaryDirectory() as directory,
-            mock.patch(
-                "adaptible.wrap.runtime.shutil.which", return_value="ollama"
-            ),
+            mock.patch("adaptible.wrap.runtime.shutil.which", return_value="ollama"),
         ):
             runtime = Ollama("base", Path(directory))
             await runtime.client.aclose()
@@ -921,7 +919,9 @@ class TrainerPrecisionTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
-            self.assertIs(checkpoint_dtype(source, {"gguf_file": "m.gguf"}), torch.float32)
+            self.assertIs(
+                checkpoint_dtype(source, {"gguf_file": "m.gguf"}), torch.float32
+            )
             self.assertIs(checkpoint_dtype(source, {}), torch.float32)
             (source / "config.json").write_text(json.dumps({"torch_dtype": "nonsense"}))
             self.assertIs(checkpoint_dtype(source, {}), torch.float32)

@@ -23,9 +23,7 @@ class OllamaThinkingTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        with mock.patch(
-            "adaptible.wrap.runtime.shutil.which", return_value="ollama"
-        ):
+        with mock.patch("adaptible.wrap.runtime.shutil.which", return_value="ollama"):
             self.runtime = Ollama(
                 "test-model", self.root / "state", url="http://native.fixture"
             )
@@ -237,9 +235,7 @@ class UnconditionalReasonerThinkTest(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        with mock.patch(
-            "adaptible.wrap.runtime.shutil.which", return_value="ollama"
-        ):
+        with mock.patch("adaptible.wrap.runtime.shutil.which", return_value="ollama"):
             self.runtime = Ollama(
                 "deepseek-r1", Path(self.temp.name) / "state", url="http://fixture"
             )
@@ -291,9 +287,7 @@ class SelectiveReasonerTurnTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        with mock.patch(
-            "adaptible.wrap.runtime.shutil.which", return_value="ollama"
-        ):
+        with mock.patch("adaptible.wrap.runtime.shutil.which", return_value="ollama"):
             self.runtime = Ollama(
                 "deepseek-r1", self.root / "state", url="http://native.fixture"
             )

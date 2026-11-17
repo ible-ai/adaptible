@@ -1145,7 +1145,10 @@ class MetaLearningExperiment:
                     "verify_steps": config.verify_steps,
                     "model_kwargs": self._model_kwargs,
                     "lora": dict(
-                        zip(("rank", "layers", "scale"), lora_settings(self._model_kwargs))
+                        zip(
+                            ("rank", "layers", "scale"),
+                            lora_settings(self._model_kwargs),
+                        )
                     ),
                     "holdout_every_checkpoint": config.holdout_every_checkpoint,
                     "dataset_name": dataset.name,
@@ -1227,10 +1230,7 @@ class MetaLearningExperiment:
             # Train on this batch
             for idx in batch:
                 item = dataset[idx]
-                if (
-                    not config.train_correct_items
-                    and baseline_responses[item.id][1]
-                ):
+                if not config.train_correct_items and baseline_responses[item.id][1]:
                     # Nothing to correct: not trained, not in the window.
                     # Re-inferred in phase 3 to measure interference.
                     skipped_correct_ids.append(item.id)

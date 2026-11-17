@@ -129,9 +129,7 @@ class OllamaPromptDiscoveryTest(unittest.IsolatedAsyncioTestCase):
                     },
                 )
 
-            runtime.client = httpx.AsyncClient(
-                transport=httpx.MockTransport(respond)
-            )
+            runtime.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
             try:
                 await runtime.discover()
                 initial = runtime.serving_template_digest

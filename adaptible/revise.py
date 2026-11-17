@@ -134,9 +134,7 @@ def revision_prompt_preset(name: str) -> tuple[str, DialogStyle]:
         return REWRITE_INSTRUCTIONS, "chat"
     if name == "fewshot":
         return REWRITE_INSTRUCTIONS_FEWSHOT, "plain"
-    raise ValueError(
-        f"revision_prompt must be one of {REVISION_PROMPTS}, got {name!r}"
-    )
+    raise ValueError(f"revision_prompt must be one of {REVISION_PROMPTS}, got {name!r}")
 
 
 def _make_revision_prompt(
@@ -266,7 +264,9 @@ def strip_think_tags(text: str | None) -> str:
     if text is None:
         return ""
     # First try to remove complete <think>...</think> blocks
-    cleaned = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(
+        r"<think>.*?</think>\s*", "", text, flags=re.DOTALL | re.IGNORECASE
+    )
     # Also handle cases where only </think> appears (partial tag)
     cleaned = re.sub(r".*</think>\s*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
     return cleaned.strip()
@@ -433,7 +433,9 @@ def _serialize_interactions_to_string(
             ``User: ...\nAssistant: ...`` with no tokenizer involvement.
     """
     if dialog_style not in ("chat", "plain"):
-        raise ValueError(f"dialog_style must be 'chat' or 'plain', got {dialog_style!r}")
+        raise ValueError(
+            f"dialog_style must be 'chat' or 'plain', got {dialog_style!r}"
+        )
     turns = []
     for interaction in interactions:
         llm_response = interaction.llm_response

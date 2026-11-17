@@ -13,6 +13,7 @@ _HOST = "127.0.0.1"
 _PORT = 8000
 _ADDR = f"{_HOST}:{_PORT}/static/"
 
+
 async def main():
     """Main program loop, run asychnronously."""
     server = adaptible.MutableHostedLLM(host=_HOST, port=_PORT)

@@ -20,7 +20,9 @@ async def main():
     try:
         await server.up()
         vizible.green("Successfully launched server and enter eval framework")
-        vizible.blue(f"Server address: {_ADDR}\nTalk to it with: python -m adaptible.local.cli --url {_ADDR}")
+        vizible.blue(
+            f"Server address: {_ADDR}\nTalk to it with: python -m adaptible.local.cli --url {_ADDR}"
+        )
         await asyncio.sleep(24 * 60 * 60)  # 1 day.
     except KeyboardInterrupt:
         vizible.red("Turn down requested.")

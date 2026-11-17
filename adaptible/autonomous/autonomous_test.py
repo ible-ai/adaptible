@@ -39,7 +39,11 @@ class ClaimIsPlausibleTest(unittest.TestCase):
             "NBCNews.com provides the latest top news stories.",
             "NBCNews.com offers breaking headlines and video updates.",
         )
-        self.assertFalse(_claim_is_plausible(claim, "NBCNews.com provides the latest top news stories and video."))
+        self.assertFalse(
+            _claim_is_plausible(
+                claim, "NBCNews.com provides the latest top news stories and video."
+            )
+        )
 
     def test_rejects_short_question(self):
         claim = _claim("Revenue?", "Apple reported revenue of $94.9 billion.")
@@ -50,7 +54,9 @@ class ClaimIsPlausibleTest(unittest.TestCase):
             "What is the main focus of the content?",
             "The main focus is to provide top news stories from The Associated Press.",
         )
-        snippet = "Top News: US & International Top News Stories Today. The Associated Press."
+        snippet = (
+            "Top News: US & International Top News Stories Today. The Associated Press."
+        )
         self.assertFalse(_claim_is_plausible(claim, snippet))
 
     def test_rejects_site_name_in_answer(self):
@@ -58,7 +64,9 @@ class ClaimIsPlausibleTest(unittest.TestCase):
             "Where can you read the latest headlines today?",
             "You can read them on apnews.com.",
         )
-        self.assertFalse(_claim_is_plausible(claim, "Read headlines on apnews.com today."))
+        self.assertFalse(
+            _claim_is_plausible(claim, "Read headlines on apnews.com today.")
+        )
 
     def test_rejects_ungrounded_answer(self):
         claim = _claim(
@@ -128,7 +136,9 @@ class ExtractClaimsTest(unittest.TestCase):
 
     def test_parses_q_and_a(self):
         node = self._node(
-            ["Q: What was Apple's Q4 2024 revenue?\nA: Apple reported revenue of $94.9 billion."]
+            [
+                "Q: What was Apple's Q4 2024 revenue?\nA: Apple reported revenue of $94.9 billion."
+            ]
         )
         claims = node._extract_claims(self.results, "t")
         self.assertEqual(len(claims), 1)
@@ -250,11 +260,15 @@ class TrainingPolicyTest(unittest.TestCase):
 
 class DefaultPathsTest(unittest.TestCase):
     def test_defaults_follow_outputs_dir(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
-            os.environ, {"ADAPTIBLE_OUTPUTS_DIR": tmp}
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(os.environ, {"ADAPTIBLE_OUTPUTS_DIR": tmp}),
         ):
             node = _NoModelNode(
-                [], search_fn=lambda q: [], seed_topics=["t"], db=Database(Path(tmp) / "x.db")
+                [],
+                search_fn=lambda q: [],
+                seed_topics=["t"],
+                db=Database(Path(tmp) / "x.db"),
             )
             self.assertEqual(node.state_path, Path(tmp) / "autonomous" / "state.json")
             self.assertEqual(node.log_dir, Path(tmp) / "autonomous" / "logs")
@@ -300,10 +314,16 @@ class NodeStateLegacyLoadTest(unittest.TestCase):
             state = NodeState(started_at="now")
             state.learning_history.append(
                 LearningEvent(
-                    timestamp="t", question="q?", before_training_answer="a",
-                    after_training_answer=None, source="s", source_url=None,
-                    event_type="new", verified_answer="v",
-                    confidence_before_training=0.0, confidence_after_training=0.0,
+                    timestamp="t",
+                    question="q?",
+                    before_training_answer="a",
+                    after_training_answer=None,
+                    source="s",
+                    source_url=None,
+                    event_type="new",
+                    verified_answer="v",
+                    confidence_before_training=0.0,
+                    confidence_after_training=0.0,
                     trained=False,
                 )
             )
@@ -312,7 +332,12 @@ class NodeStateLegacyLoadTest(unittest.TestCase):
         self.assertEqual(loaded.learning_history, state.learning_history)
 
     def test_shipped_state_file_loads(self):
-        shipped = Path(__file__).resolve().parents[2] / "outputs" / "autonomous" / "state.json"
+        shipped = (
+            Path(__file__).resolve().parents[2]
+            / "outputs"
+            / "autonomous"
+            / "state.json"
+        )
         if not shipped.exists():
             self.skipTest("no shipped state.json")
         state = NodeState.load(shipped)

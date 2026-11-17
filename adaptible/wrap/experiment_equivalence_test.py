@@ -341,9 +341,7 @@ class OptimizerEquivalenceTest(unittest.TestCase):
         )
 
         parameter = [torch.nn.Parameter(torch.zeros(2))]
-        self.assertIsInstance(
-            training_optimizer(parameter, thinking=True), MLXAdamW
-        )
+        self.assertIsInstance(training_optimizer(parameter, thinking=True), MLXAdamW)
         self.assertNotIsInstance(
             training_optimizer(parameter, thinking=False), MLXAdamW
         )
@@ -390,9 +388,7 @@ class InitialAdapterTest(unittest.TestCase):
         from adaptible.wrap.repair import Controller
 
         controller = Controller.__new__(Controller)
-        controller.initial_adapter = (
-            Path(initial_adapter) if initial_adapter else None
-        )
+        controller.initial_adapter = Path(initial_adapter) if initial_adapter else None
         return controller
 
     def test_the_first_candidate_starts_from_the_given_draw(self):

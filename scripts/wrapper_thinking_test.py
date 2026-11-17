@@ -11,15 +11,21 @@ from scripts import wrapper_recurrent as recurrent
 
 class HarnessHTTPErrorTest(unittest.TestCase):
     def test_native_error_body_retains_http_exception_and_response(self):
-        response = httpx.Response(400, json={"error": "this model requires boolean thinking"})
+        response = httpx.Response(
+            400, json={"error": "this model requires boolean thinking"}
+        )
         with httpx.Client(
             base_url="http://wrapper.invalid",
             transport=httpx.MockTransport(lambda request: response),
         ) as client:
             with self.assertRaises(httpx.HTTPStatusError) as caught:
-                demo.request(client, "POST", "/v1/chat/completions",
-                             headers={"Authorization": "Bearer private-header"},
-                             json={"messages": "private-request-body"})
+                demo.request(
+                    client,
+                    "POST",
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer private-header"},
+                    json={"messages": "private-request-body"},
+                )
         error = caught.exception
         self.assertIn("this model requires boolean thinking", str(error))
         self.assertIs(error.response, response)

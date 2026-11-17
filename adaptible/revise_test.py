@@ -270,12 +270,16 @@ class SerializeInteractionsPlainTest(unittest.TestCase):
             result,
             "[[0]] User: What is 2+2?\nAssistant: 5\n[[1]] User: Sure?\nAssistant: Yes.",
         )
-        self.assertEqual(turns, ["User: What is 2+2?\nAssistant: 5", "User: Sure?\nAssistant: Yes."])
+        self.assertEqual(
+            turns, ["User: What is 2+2?\nAssistant: 5", "User: Sure?\nAssistant: Yes."]
+        )
         self.assertNotIn("<|im_start|>", result)
         self.mock_tokenizer.apply_chat_template.assert_not_called()
 
     def test_plain_not_enumerated(self):
-        interactions = [InteractionHistory(idx=0, user_input="Hi", llm_response="Hello")]
+        interactions = [
+            InteractionHistory(idx=0, user_input="Hi", llm_response="Hello")
+        ]
         result, _ = _serialize_interactions_to_string(
             interactions,
             should_enumerate=False,
@@ -301,7 +305,9 @@ class SerializeInteractionsPlainTest(unittest.TestCase):
         self.assertEqual(result, "[[0]] User: Hi\nAssistant: Hello")
 
     def test_chat_is_default_and_uses_template(self):
-        interactions = [InteractionHistory(idx=0, user_input="Hi", llm_response="Hello")]
+        interactions = [
+            InteractionHistory(idx=0, user_input="Hi", llm_response="Hello")
+        ]
         result, _ = _serialize_interactions_to_string(
             interactions,
             should_enumerate=True,
@@ -344,7 +350,9 @@ class FewShotPromptTest(unittest.TestCase):
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.side_effect = AssertionError("must not be called")
         interactions = [
-            InteractionHistory(idx=0, user_input="Who wrote Hamlet?", llm_response="Dickens.")
+            InteractionHistory(
+                idx=0, user_input="Who wrote Hamlet?", llm_response="Dickens."
+            )
         ]
         prompt = make_revision_prompt(
             interactions, tokenizer, instructions=instructions, dialog_style=style
@@ -360,7 +368,9 @@ class FewShotPromptTest(unittest.TestCase):
         tokenizer.apply_chat_template.assert_not_called()
 
     def test_preset_lookup(self):
-        self.assertEqual(revision_prompt_preset("default"), (REWRITE_INSTRUCTIONS, "chat"))
+        self.assertEqual(
+            revision_prompt_preset("default"), (REWRITE_INSTRUCTIONS, "chat")
+        )
         self.assertEqual(
             revision_prompt_preset("fewshot"), (REWRITE_INSTRUCTIONS_FEWSHOT, "plain")
         )
@@ -368,7 +378,9 @@ class FewShotPromptTest(unittest.TestCase):
             revision_prompt_preset("zero_shot")
 
     def test_default_prompt_unchanged(self):
-        self.assertTrue(REWRITE_INSTRUCTIONS.startswith("You are a professional editor"))
+        self.assertTrue(
+            REWRITE_INSTRUCTIONS.startswith("You are a professional editor")
+        )
         self.assertNotIn("Example 1", REWRITE_INSTRUCTIONS)
 
 
@@ -651,7 +663,9 @@ class RationaleFromOutputTest(unittest.TestCase):
 
     def test_nothing_gives_empty(self):
         for out in (None, "", "   ", "</think>\n\nCanberra.", "<think></think>x"):
-            self.assertEqual(rationale_from_output(out, self.tokenizer), ("", 0, False), out)
+            self.assertEqual(
+                rationale_from_output(out, self.tokenizer), ("", 0, False), out
+            )
 
     def test_truncates_at_last_sentence_boundary(self):
         out = "First sentence. Second sentence. Third one runs long."
@@ -710,7 +724,9 @@ class _CharTokenizer:
     def apply_chat_template(
         self, conversation, tokenize=False, add_generation_prompt=False, **kwargs
     ):
-        text = "".join(f"<{m['role']}>{m['content']}</{m['role']}>" for m in conversation)
+        text = "".join(
+            f"<{m['role']}>{m['content']}</{m['role']}>" for m in conversation
+        )
         if add_generation_prompt:
             text += self.generation_suffix
         return text
@@ -733,7 +749,9 @@ class CloseThinkTest(unittest.TestCase):
 
     def _example(self, suffix, **kwargs):
         tokenizer = _CharTokenizer(suffix)
-        interactions = [InteractionHistory(idx=0, user_input="Q?", llm_response="wrong")]
+        interactions = [
+            InteractionHistory(idx=0, user_input="Q?", llm_response="wrong")
+        ]
         example = make_collated_training_example(
             "[[0]] Right answer. [[/0]]", interactions, tokenizer, **kwargs
         )
@@ -764,9 +782,7 @@ class CloseThinkTest(unittest.TestCase):
         tokenizer, example = self._example(self.THINK_PREFIX, close_think=False)
         masked, full = self._decode(tokenizer, example)
         self.assertEqual(masked, "Right answer.<eos>")
-        self.assertEqual(
-            full, f"<user>Q?</user>{self.THINK_PREFIX}Right answer.<eos>"
-        )
+        self.assertEqual(full, f"<user>Q?</user>{self.THINK_PREFIX}Right answer.<eos>")
 
     def test_think_without_trailing_newline_is_still_closed(self):
         tokenizer, example = self._example("<assistant><think>")
@@ -786,7 +802,9 @@ class SplitThinkTest(unittest.TestCase):
         )
 
     def test_bare_close_tag(self):
-        self.assertEqual(split_think("reason\n</think>\n\nanswer"), ("reason", "answer"))
+        self.assertEqual(
+            split_think("reason\n</think>\n\nanswer"), ("reason", "answer")
+        )
 
     def test_no_tag(self):
         self.assertEqual(split_think("just an answer"), ("", "just an answer"))
@@ -815,7 +833,9 @@ class ThinkModeTest(unittest.TestCase):
 
     def _run(self, llm_response, suffix=GEN, **kwargs):
         tokenizer = _CharTokenizer(suffix)
-        interactions = [InteractionHistory(idx=0, user_input="Q?", llm_response=llm_response)]
+        interactions = [
+            InteractionHistory(idx=0, user_input="Q?", llm_response=llm_response)
+        ]
         example = make_collated_training_example(
             "[[0]] Canberra. [[/0]]", interactions, tokenizer, **kwargs
         )
@@ -840,15 +860,25 @@ class ThinkModeTest(unittest.TestCase):
         self.assertEqual(len(mask), len(prefix) + len(target) - 1)
 
     def test_baseline_with_full_think_tags(self):
-        full, masked, _ = self._run("<think>\nr\n</think>\n\nSydney.", think_mode="baseline")
-        self.assertEqual(full, f"<user>Q?</user>{self.GEN}r\n</think>\n\nCanberra.<eos>")
+        full, masked, _ = self._run(
+            "<think>\nr\n</think>\n\nSydney.", think_mode="baseline"
+        )
+        self.assertEqual(
+            full, f"<user>Q?</user>{self.GEN}r\n</think>\n\nCanberra.<eos>"
+        )
         self.assertEqual(masked, "Canberra.<eos>")
 
     def test_baseline_without_reasoning_falls_back_to_empty(self):
-        for llm_response in ("Sydney.", "</think>\n\nSydney.", "<think></think>Sydney."):
+        for llm_response in (
+            "Sydney.",
+            "</think>\n\nSydney.",
+            "<think></think>Sydney.",
+        ):
             full, masked, _ = self._run(llm_response, think_mode="baseline")
             self.assertEqual(masked, f"{THINK_CLOSE}Canberra.<eos>")
-            self.assertEqual(full, f"<user>Q?</user>{self.GEN}{THINK_CLOSE}Canberra.<eos>")
+            self.assertEqual(
+                full, f"<user>Q?</user>{self.GEN}{THINK_CLOSE}Canberra.<eos>"
+            )
 
     def test_empty_and_none_modes(self):
         full, masked, _ = self._run(self.BASELINE, think_mode="empty")
@@ -861,7 +891,9 @@ class ThinkModeTest(unittest.TestCase):
     def test_default_mode_is_empty_and_close_think_alias(self):
         _, masked, _ = self._run(self.BASELINE)
         self.assertEqual(masked, f"{THINK_CLOSE}Canberra.<eos>")
-        _, masked, _ = self._run(self.BASELINE, close_think=False, think_mode="baseline")
+        _, masked, _ = self._run(
+            self.BASELINE, close_think=False, think_mode="baseline"
+        )
         self.assertEqual(masked, "Canberra.<eos>")
         self.assertEqual(resolve_think_mode("baseline", None), "baseline")
         self.assertEqual(resolve_think_mode("baseline", True), "baseline")
@@ -872,13 +904,17 @@ class ThinkModeTest(unittest.TestCase):
             resolve_think_mode("reasoning", None)
 
     def test_baseline_is_noop_without_think_template(self):
-        full, masked, _ = self._run(self.BASELINE, suffix="<assistant>", think_mode="baseline")
+        full, masked, _ = self._run(
+            self.BASELINE, suffix="<assistant>", think_mode="baseline"
+        )
         self.assertEqual(masked, "Canberra.<eos>")
         self.assertEqual(full, "<user>Q?</user><assistant>Canberra.<eos>")
 
     def test_unbatched_revision_example_matches_collated(self):
         tokenizer = _CharTokenizer(self.GEN)
-        interactions = [InteractionHistory(idx=0, user_input="Q?", llm_response=self.BASELINE)]
+        interactions = [
+            InteractionHistory(idx=0, user_input="Q?", llm_response=self.BASELINE)
+        ]
         single = make_revision_training_example(
             "[[0]] Canberra. [[/0]]", interactions, tokenizer, think_mode="baseline"
         )
@@ -897,11 +933,15 @@ class RationaleModeTest(unittest.TestCase):
 
     GEN = "<assistant><think>\n"
     BASELINE = "Let me think.\nSydney?\n</think>\n\nThe capital is Sydney."
-    RATIONALE = "Sydney is the largest city, but the capital was purpose-built.\nCanberra."
+    RATIONALE = (
+        "Sydney is the largest city, but the capital was purpose-built.\nCanberra."
+    )
 
     def _run(self, llm_response=BASELINE, suffix=GEN, **kwargs):
         tokenizer = _CharTokenizer(suffix)
-        interactions = [InteractionHistory(idx=0, user_input="Q?", llm_response=llm_response)]
+        interactions = [
+            InteractionHistory(idx=0, user_input="Q?", llm_response=llm_response)
+        ]
         example = make_revision_training_example(
             "[[0]] Canberra. [[/0]]", interactions, tokenizer, **kwargs
         )
@@ -948,7 +988,9 @@ class RationaleModeTest(unittest.TestCase):
 
     def test_piecewise_tokenization_matches_joint(self):
         tokenizer = _CharTokenizer(self.GEN)
-        interactions = [InteractionHistory(idx=0, user_input="Q?", llm_response=self.BASELINE)]
+        interactions = [
+            InteractionHistory(idx=0, user_input="Q?", llm_response=self.BASELINE)
+        ]
         example = make_revision_training_example(
             "[[0]] Canberra. [[/0]]",
             interactions,
@@ -986,7 +1028,9 @@ class RationaleModeTest(unittest.TestCase):
 
     def test_rationale_is_stripped(self):
         full, _, _, _, _ = self._run(think_mode="rationale", rationale="  r  \n")
-        self.assertEqual(full, f"<user>Q?</user>{self.GEN}r\n</think>\n\nCanberra.<eos>")
+        self.assertEqual(
+            full, f"<user>Q?</user>{self.GEN}r\n</think>\n\nCanberra.<eos>"
+        )
 
     def test_rationale_is_noop_without_think_template(self):
         full, masked, stopped, _, _ = self._run(
@@ -1001,7 +1045,9 @@ class RationaleModeTest(unittest.TestCase):
         self.assertEqual(resolve_think_mode("rationale", None), "rationale")
         self.assertEqual(resolve_think_mode("rationale", False), "none")
         tokenizer = _CharTokenizer(self.GEN)
-        interactions = [InteractionHistory(idx=0, user_input="Q?", llm_response=self.BASELINE)]
+        interactions = [
+            InteractionHistory(idx=0, user_input="Q?", llm_response=self.BASELINE)
+        ]
         single = make_revision_training_example(
             "[[0]] Canberra. [[/0]]",
             interactions,
@@ -1023,7 +1069,9 @@ class RationaleModeTest(unittest.TestCase):
     def test_template_opens_think(self):
         messages = [{"role": "user", "content": "Q?"}]
         self.assertTrue(template_opens_think(_CharTokenizer(self.GEN), messages))
-        self.assertTrue(template_opens_think(_CharTokenizer("<assistant><think>"), messages))
+        self.assertTrue(
+            template_opens_think(_CharTokenizer("<assistant><think>"), messages)
+        )
         self.assertFalse(template_opens_think(_CharTokenizer("<assistant>"), messages))
         self.assertFalse(
             template_opens_think(_CharTokenizer("<assistant><think></think>"), messages)
@@ -1044,21 +1092,30 @@ class MakeTrainingExampleTest(unittest.TestCase):
         self.assertEqual(ex.input.tolist(), seq[:-1])
         self.assertEqual(ex.label.tolist(), seq[1:])
         n = len(f"<user>Q</user>{self.GEN}")
-        self.assertEqual(ex.mask.tolist(), [0] * (n - 1) + [1] * len("r</think>\n\nA<eos>"))
+        self.assertEqual(
+            ex.mask.tolist(), [0] * (n - 1) + [1] * len("r</think>\n\nA<eos>")
+        )
 
     def test_prompt_suffix_is_masked(self):
         tokenizer = _CharTokenizer(self.GEN)
         ex = make_training_example(
-            [{"role": "user", "content": "Q"}], "A<eos>", tokenizer, prompt_suffix="r</think>\n\n"
+            [{"role": "user", "content": "Q"}],
+            "A<eos>",
+            tokenizer,
+            prompt_suffix="r</think>\n\n",
         )
-        masked = tokenizer.decode(t for t, m in zip(ex.label.tolist(), ex.mask.tolist()) if m)
+        masked = tokenizer.decode(
+            t for t, m in zip(ex.label.tolist(), ex.mask.tolist()) if m
+        )
         self.assertEqual(masked, "A<eos>")
         self.assertEqual(sum(ex.mask.tolist()), len("A<eos>"))
 
     def test_collate_pads_inputs_with_pad_id_and_mask_with_zero(self):
         tokenizer = _CharTokenizer(self.GEN)
         tokenizer.eos_token_id = 7777
-        short = make_training_example([{"role": "user", "content": "Q"}], "A<eos>", tokenizer)
+        short = make_training_example(
+            [{"role": "user", "content": "Q"}], "A<eos>", tokenizer
+        )
         long = make_training_example(
             [{"role": "user", "content": "Q"}], "A much longer answer<eos>", tokenizer
         )
@@ -1087,8 +1144,12 @@ class MakeTrainingExampleTest(unittest.TestCase):
         self.assertEqual(padding_token_for(tokenizer), 5)
 
     def test_collate_fn_custom_padding_never_pads_mask(self):
-        a = TrainingExample(input=mx.array([1, 2]), label=mx.array([2, 3]), mask=mx.array([1, 1]))
-        b = TrainingExample(input=mx.array([1]), label=mx.array([2]), mask=mx.array([1]))
+        a = TrainingExample(
+            input=mx.array([1, 2]), label=mx.array([2, 3]), mask=mx.array([1, 1])
+        )
+        b = TrainingExample(
+            input=mx.array([1]), label=mx.array([2]), mask=mx.array([1])
+        )
         batch = _collate_fn([a, b], padding_token=9)
         self.assertEqual(batch.input.tolist()[1], [1, 9])
         self.assertEqual(batch.mask.tolist()[1], [1, 0])
@@ -1107,7 +1168,9 @@ class MakeTrainingExampleTest(unittest.TestCase):
         self.assertEqual(ex.input.tolist(), seq[:-1])
         self.assertEqual(ex.label.tolist(), seq[1:])
         n = len(f"<user>Q</user>{self.GEN}")
-        self.assertEqual(ex.mask.tolist(), [0] * (n - 1) + [1] * len("r</think>\n\nA<eos>"))
+        self.assertEqual(
+            ex.mask.tolist(), [0] * (n - 1) + [1] * len("r</think>\n\nA<eos>")
+        )
         n_stop = len("A<eos>")
         self.assertEqual(
             ex.stop_mask.tolist(), [0] * (len(seq) - 1 - n_stop) + [1] * n_stop
@@ -1121,13 +1184,18 @@ class MakeTrainingExampleTest(unittest.TestCase):
         tokenizer = _CharTokenizer(self.GEN)
         with self.assertRaises(ValueError):
             make_training_example(
-                [{"role": "user", "content": "Q"}], "A<eos>", tokenizer, stop_text="B<eos>"
+                [{"role": "user", "content": "Q"}],
+                "A<eos>",
+                tokenizer,
+                stop_text="B<eos>",
             )
         with self.assertRaises(ValueError):
             make_training_example(
                 [{"role": "user", "content": "Q"}], "A<eos>", tokenizer, stop_text=""
             )
-        ex = make_training_example([{"role": "user", "content": "Q"}], "A<eos>", tokenizer)
+        ex = make_training_example(
+            [{"role": "user", "content": "Q"}], "A<eos>", tokenizer
+        )
         self.assertIsNone(ex.stop_mask)
 
     def test_collate_pads_stop_mask_with_zero(self):
@@ -1145,11 +1213,17 @@ class MakeTrainingExampleTest(unittest.TestCase):
         n_short = len(short.input)
         n_long = len(long.input)
         self.assertEqual(batch.stop_mask.shape, (2, n_long))
-        self.assertEqual(batch.stop_mask.tolist()[0][:n_short], short.stop_mask.tolist())
-        self.assertEqual(batch.stop_mask.tolist()[0][n_short:], [0] * (n_long - n_short))
+        self.assertEqual(
+            batch.stop_mask.tolist()[0][:n_short], short.stop_mask.tolist()
+        )
+        self.assertEqual(
+            batch.stop_mask.tolist()[0][n_short:], [0] * (n_long - n_short)
+        )
         self.assertEqual(batch.stop_mask.tolist()[1], long.stop_mask.tolist())
         # Mixed: an example without a stop mask contributes its loss mask.
-        plain = make_training_example([{"role": "user", "content": "Q"}], "A<eos>", tokenizer)
+        plain = make_training_example(
+            [{"role": "user", "content": "Q"}], "A<eos>", tokenizer
+        )
         batch = collate_training_examples([plain, long], tokenizer)
         self.assertIsNotNone(batch.stop_mask)
         self.assertEqual(batch.stop_mask.tolist()[0][:n_short], plain.mask.tolist())

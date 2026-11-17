@@ -437,9 +437,7 @@ class RealResponseCorrectionTest(unittest.TestCase):
         for k, v in params.items():
             key = f"{prefix}.{k}" if prefix else k
             if isinstance(v, dict):
-                result.update(
-                    RealResponseCorrectionTest._flatten_params(v, key)
-                )
+                result.update(RealResponseCorrectionTest._flatten_params(v, key))
             elif isinstance(v, list):
                 for i, item in enumerate(v):
                     if isinstance(item, dict):

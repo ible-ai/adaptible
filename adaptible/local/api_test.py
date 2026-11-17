@@ -228,7 +228,9 @@ class FeedbackEndpointTest(unittest.TestCase):
 
     def test_thumbs_down_flags_interaction(self):
         self.client.post("/interact", json={"prompt": "Q1"})
-        response = self.client.post("/feedback", json={"interaction_idx": 0, "thumbs": "down"})
+        response = self.client.post(
+            "/feedback", json={"interaction_idx": 0, "thumbs": "down"}
+        )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"interaction_idx": 0, "flagged": True})
         self.assertTrue(self.api.interaction_history[0].flagged)
@@ -236,7 +238,9 @@ class FeedbackEndpointTest(unittest.TestCase):
     def test_thumbs_up_clears_flag(self):
         self.client.post("/interact", json={"prompt": "Q1"})
         self.client.post("/feedback", json={"interaction_idx": 0, "thumbs": "down"})
-        response = self.client.post("/feedback", json={"interaction_idx": 0, "thumbs": "up"})
+        response = self.client.post(
+            "/feedback", json={"interaction_idx": 0, "thumbs": "up"}
+        )
         self.assertFalse(response.json()["flagged"])
         self.assertFalse(self.api.interaction_history[0].flagged)
 
@@ -261,12 +265,16 @@ class FeedbackEndpointTest(unittest.TestCase):
         self.assertEqual(len(self.api.interaction_history), 1)
 
     def test_unknown_index_is_404(self):
-        response = self.client.post("/feedback", json={"interaction_idx": 3, "thumbs": "down"})
+        response = self.client.post(
+            "/feedback", json={"interaction_idx": 3, "thumbs": "down"}
+        )
         self.assertEqual(response.status_code, 404)
 
     def test_bad_thumbs_is_400(self):
         self.client.post("/interact", json={"prompt": "Q1"})
-        response = self.client.post("/feedback", json={"interaction_idx": 0, "thumbs": "sideways"})
+        response = self.client.post(
+            "/feedback", json={"interaction_idx": 0, "thumbs": "sideways"}
+        )
         self.assertEqual(response.status_code, 400)
 
     def test_stream_interact_records_history_with_index_header(self):
@@ -278,7 +286,9 @@ class FeedbackEndpointTest(unittest.TestCase):
         self.assertEqual(self.api.interaction_history[0].llm_response, "Streamed: Q1")
         self.assertEqual(self.api.unreviewed_interaction_history_indices, [0])
         # The streamed answer can be rated like any other.
-        response = self.client.post("/feedback", json={"interaction_idx": 0, "thumbs": "down"})
+        response = self.client.post(
+            "/feedback", json={"interaction_idx": 0, "thumbs": "down"}
+        )
         self.assertTrue(response.json()["flagged"])
 
 
