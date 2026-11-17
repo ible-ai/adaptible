@@ -1,6 +1,7 @@
 # Environments / caches
 .venv/
 __pycache__/
+.ruff_cache
 *.pyc
 .DS_Store
 

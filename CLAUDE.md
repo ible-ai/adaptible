@@ -53,7 +53,7 @@ CLI flags are `absl.flags`, not argparse (underscores: `--no_browser`, `--train_
 `adaptible/eval/__main__.py`, `adaptible/autonomous/__main__.py`, and
 `scripts/run_meta_experiment.py`.
 
-Formatting is black (see `.vscode/settings.json`); there is no configured linter.
+Formatting is black; imports and lint are ruff (`[tool.ruff]` in `pyproject.toml`; both pinned in the `dev` extra).
 
 ## Architecture
 
