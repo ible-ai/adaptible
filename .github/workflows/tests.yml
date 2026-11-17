@@ -58,6 +58,7 @@ jobs:
           ADAPTIBLE_OUTPUTS_DIR: ${{ runner.temp }}/adaptible-outputs
         run: |
           python -m unittest \
+            adaptible.init_test \
             adaptible.classes_test \
             adaptible.local.api_test \
             adaptible.local.local_test \

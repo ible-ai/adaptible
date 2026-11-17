@@ -1,10 +1,45 @@
-"""Public exports, loaded on demand so runtime wrappers do not require MLX."""
+"""Public exports, loaded on demand so runtime wrappers do not require MLX.
+
+At runtime every name resolves lazily through `__getattr__` and `_EXPORTS`. The
+`TYPE_CHECKING` block repeats the same imports for IDEs and type checkers only (it never
+executes), so go-to-definition and autocomplete work. `init_test.py` keeps the two in sync.
+"""
 
 from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from . import autonomous, eval, local, revise, wrap
+    from .classes import (
+        FeedbackRequest,
+        FeedbackResponse,
+        InteractionHistory,
+        InteractionRequest,
+        InteractionResponse,
+        ReviewResponse,
+        SyncResponse,
+        TrainingExample,
+    )
+    from .db import (
+        Database,
+        Example,
+        Experiment,
+        ExperimentType,
+        Phase,
+        Response,
+        SourceType,
+        TrainingEvent,
+        default_judge,
+    )
+    from .llm import StatefulLLM
+    from .local.api import Adaptible, ModelProtocol
+    from .local.server import MutableHostedLLM
+    from .lookup import DocStore
 
 __all__ = [
     "Adaptible",
     "ModelProtocol",
+    "MutableHostedLLM",
     "FeedbackRequest",
     "FeedbackResponse",
     "InteractionHistory",
@@ -39,6 +74,7 @@ _EXPORTS = {
     "wrap": (".", "wrap"),
     "Adaptible": (".local.api", "Adaptible"),
     "ModelProtocol": (".local.api", "ModelProtocol"),
+    "MutableHostedLLM": (".local.server", "MutableHostedLLM"),
     "FeedbackRequest": (".classes", "FeedbackRequest"),
     "FeedbackResponse": (".classes", "FeedbackResponse"),
     "InteractionHistory": (".classes", "InteractionHistory"),
