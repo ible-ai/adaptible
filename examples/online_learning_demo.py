@@ -78,10 +78,8 @@ async def _forwardprop(
             think_response, visible_response = model_response.split("</think>", 1)
         except Exception as e:
             raise ValueError(f"Response could not be parsed!\n{model_response}") from e
-        vizible.blue(think_response)
-        print("")
-        vizible.green(visible_response)
-        print("")
+        vizible.blue(think_response + "\n")
+        vizible.green(visible_response + "\n")
     return model_responses
 
 
