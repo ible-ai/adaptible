@@ -16,7 +16,7 @@ import sys
 import tempfile
 import unittest
 import warnings
-from typing import Callable
+from collections.abc import Callable
 
 import adaptible
 from adaptible import llm

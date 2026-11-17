@@ -10,9 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..classes import InteractionHistory, TrainingExample
 from .. import llm
-from ..llm import StatefulLLM, TrainingStats
+from ..classes import InteractionHistory, TrainingExample
 from ..db import (
     Database,
     Example,
@@ -23,9 +22,9 @@ from ..db import (
     SourceType,
     TrainingEvent,
 )
+from ..llm import StatefulLLM, TrainingStats
 from ..revise import (
     DEFAULT_RATIONALE_MAX_TOKENS,
-    THINK_MODES,
     InvalidRevisionError,
     collate_training_examples,
     make_revision_prompt,

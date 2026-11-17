@@ -1,9 +1,9 @@
 """Recurrent demo pass criteria; real native checks are explicitly opt-in."""
 
 import copy
+import hashlib
 import json
 import os
-import hashlib
 import sqlite3
 import tempfile
 import unittest

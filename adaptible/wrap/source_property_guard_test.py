@@ -1,7 +1,7 @@
 """Capital-source guards: no model or network is required."""
 
-import unittest
 import json
+import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 

@@ -4,8 +4,8 @@ import unittest
 from unittest import mock
 
 from adaptible.wrap.references import (
-    ReferenceSearchError,
     SEARCH_BACKENDS,
+    ReferenceSearchError,
     _search_sync,
     _sources,
 )

@@ -165,12 +165,13 @@ class TinyHFTrainingTest(unittest.TestCase):
         from tokenizers import pre_tokenizers
         from transformers import (
             AutoTokenizer,
-            Qwen2Tokenizer,
             Qwen2Config,
             Qwen2ForCausalLM,
+            Qwen2Tokenizer,
             Qwen3Config,
             Qwen3ForCausalLM,
         )
+
         from adaptible.wrap.train import train
 
         with tempfile.TemporaryDirectory() as directory:

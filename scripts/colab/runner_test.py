@@ -79,9 +79,11 @@ class TinyRunnerTest(unittest.TestCase):
 
     def test_gguf_export_preserves_qwen_projection_layout(self):
         import json
+
         import numpy as np
         from gguf import GGUFReader
         from safetensors.torch import save_file
+
         from adaptible.wrap.gguf_adapter import export_adapter
 
         with tempfile.TemporaryDirectory() as directory:

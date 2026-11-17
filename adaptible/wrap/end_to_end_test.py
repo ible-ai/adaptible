@@ -19,10 +19,8 @@ from unittest import mock
 
 import httpx
 
-from adaptible.wrap.app import create_app
-from adaptible.wrap.repair import Controller, Trainer
-from adaptible.wrap.store import Store
 from adaptible.wrap import tiny_models as tiny
+from adaptible.wrap.app import create_app
 from adaptible.wrap.model_backed_runtime import (
     FACT,
     LlamaCppHarness,
@@ -32,6 +30,8 @@ from adaptible.wrap.model_backed_runtime import (
     TinyGenerator,
     VLLMHarness,
 )
+from adaptible.wrap.repair import Controller, Trainer
+from adaptible.wrap.store import Store
 
 
 class EndToEndRepairTest(unittest.IsolatedAsyncioTestCase):

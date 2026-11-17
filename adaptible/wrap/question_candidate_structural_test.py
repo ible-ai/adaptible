@@ -1,6 +1,8 @@
 """Disjoint structural candidate tests; eligibility never authorizes an adapter."""
 import unittest
+
 from adaptible.wrap.question_candidate import candidate_diagnostics
+
 
 class StructuralCandidateTest(unittest.TestCase):
     def test_structure_without_new_category_vocabulary(self):

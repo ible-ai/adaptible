@@ -10,12 +10,13 @@ the eval framework and autonomous learning node. It enables:
 
 import hashlib
 import sqlite3
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any
 
 from . import paths
 

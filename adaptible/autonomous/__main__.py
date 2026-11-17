@@ -18,16 +18,16 @@ State, logs and the checkpoint live under ``$ADAPTIBLE_OUTPUTS_DIR`` (default
 ``autonomous/checkpoint/``.
 """
 
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 import vizible
-import time
 from absl import app, flags
 from ddgs import DDGS
 
-from .node import AutonomousNode
 from .. import paths
+from .node import AutonomousNode
 
 # Specific factual queries - use "current" or 2025 to ensure we're testing
 # information beyond the model's training cutoff

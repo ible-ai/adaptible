@@ -5,8 +5,8 @@ embedding and output weights stand in for a base model; only a rank-two update
 can learn the two target transitions.
 """
 
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 
 
 class WrapperTrainingBudgetTest(unittest.TestCase):

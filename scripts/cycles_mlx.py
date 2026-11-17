@@ -12,15 +12,21 @@ from a reference-note prompt at T=0.7; stored ones in outputs/runs/ceiling.json 
 Train with the committed recipe, generate the original + 3 paraphrases, judge, and KEEP
 the weights only if the 4-prompt score rises and the loop count does not; else restore
 (checksum-verified) and try the next candidate. Same tables as mve_paraphrase.py."""
-import os, re, json, mlx.core as mx, mlx.optimizers as optim, adaptible
-from mlx.utils import tree_map, tree_flatten
+import os
+import re
+
+import mlx.core as mx
+import mlx.optimizers as optim
+from mlx.utils import tree_flatten, tree_map
 from mlx_lm import stream_generate
 from mlx_lm.sample_utils import make_sampler
+
+import adaptible
 from adaptible import InteractionHistory
-from adaptible.llm import _detect_token_loop
-from adaptible.revise import collate_training_examples, strip_think_tags, make_revision_training_example
-from adaptible.eval.harness import contains_key_terms, make_rehearsal_example, VERIFY_LOSS_FLOOR
 from adaptible.eval import generate_default_dataset
+from adaptible.eval.harness import VERIFY_LOSS_FLOOR, contains_key_terms
+from adaptible.llm import _detect_token_loop
+from adaptible.revise import collate_training_examples, make_revision_training_example
 
 PARA = {
  "geo_010": ["Which city is the capital of Morocco?", "Morocco's seat of government is in which city?", "Name the capital city of the Kingdom of Morocco."],

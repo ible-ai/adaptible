@@ -23,12 +23,19 @@ import json
 import random
 import time
 import warnings
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from ..llm import StatefulLLM
 from ..db import Database, Experiment, ExperimentType, Phase
+from ..llm import StatefulLLM
+from ..revise import (
+    DEFAULT_RATIONALE_MAX_TOKENS,
+    resolve_think_mode,
+    revision_prompt_preset,
+    validate_rationale_max_tokens,
+)
 from .dataset import TriviaDataset, TriviaItem
 from .harness import (
     _infer_and_record,
@@ -38,22 +45,16 @@ from .harness import (
     interference_summary_text,
     lora_settings,
     lora_settings_text,
+    normalize_loss_target,
     sample_rehearsal_ids,
     training_summary_text,
     validate_rehearsal_k,
     validate_rehearsal_margin,
     validate_rehearsal_max_tokens,
     validate_rehearsal_weight,
+    validate_training_source,
     validate_verify_steps,
     verification_summary_text,
-    normalize_loss_target,
-    validate_training_source,
-)
-from ..revise import (
-    DEFAULT_RATIONALE_MAX_TOKENS,
-    resolve_think_mode,
-    revision_prompt_preset,
-    validate_rationale_max_tokens,
 )
 
 # Minimum improvable+forgettable items a window needs before its rates feed the

@@ -11,8 +11,7 @@ from mlx.utils import tree_flatten
 from mlx_lm.models.qwen2 import Model, ModelArgs
 from mlx_lm.tuner.utils import linear_to_lora_layers
 
-from adaptible import StatefulLLM, TrainingExample
-from adaptible import llm
+from adaptible import StatefulLLM, TrainingExample, llm
 
 
 class TinyAdapterTest(unittest.TestCase):

@@ -256,7 +256,7 @@ class VLLMLiveAdapterTest(unittest.IsolatedAsyncioTestCase):
     async def test_local_training_changes_logits_and_base_survives_restart(self):
         import torch
         from tokenizers import pre_tokenizers
-        from transformers import Qwen2Tokenizer, Qwen2Config, Qwen2ForCausalLM
+        from transformers import Qwen2Config, Qwen2ForCausalLM, Qwen2Tokenizer
 
         from adaptible.wrap.repair import Trainer
 

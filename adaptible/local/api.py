@@ -4,7 +4,7 @@ import asyncio
 import collections
 import time
 from asyncio import log
-from typing import Any, List, Protocol
+from typing import Any, Protocol
 
 import tqdm
 import vizible
@@ -33,8 +33,8 @@ class ModelProtocol(Protocol):
     def reset_conversation(self) -> None: ...
     def self_correct_and_train(
         self,
-        interaction_history: List[InteractionHistory],
-        indices_to_review: List[int] | None = None,
+        interaction_history: list[InteractionHistory],
+        indices_to_review: list[int] | None = None,
         verbose: bool = False,
     ) -> bool: ...
 
@@ -58,8 +58,8 @@ class Adaptible:
             )
 
         # In-memory store or interaction history from the current session.
-        self.interaction_history: List[InteractionHistory] = []
-        self.unreviewed_interaction_history_indices: List[int] = []
+        self.interaction_history: list[InteractionHistory] = []
+        self.unreviewed_interaction_history_indices: list[int] = []
 
         # Background training tasks dispatched by /trigger_review and drained by /sync.
         self.outstanding_tasks: collections.deque[asyncio.Task[Any]] = (

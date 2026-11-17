@@ -2,15 +2,16 @@
 
 import copy
 import json
-from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 
 class ThinkingResumeTest(unittest.TestCase):
     def setUp(self):
         import torch
+
         from adaptible.wrap.training_optimizer import MLXAdamW
 
         self.torch = torch
@@ -73,6 +74,7 @@ class ThinkingResumeTest(unittest.TestCase):
 
     def save_first(self):
         from safetensors.torch import save_file
+
         from adaptible.wrap.training_resume import save_resume
 
         optimizer = self.factory(self.model)
@@ -93,6 +95,7 @@ class ThinkingResumeTest(unittest.TestCase):
 
     def test_uninterrupted_and_resumed_weights_and_all_moments_match(self):
         from safetensors.torch import load_file
+
         from adaptible.wrap.training_resume import load_manifest, restore_optimizer
 
         uninterrupted = copy.deepcopy(self.model)

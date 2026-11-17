@@ -5,8 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from adaptible import InteractionHistory, StatefulLLM
-from adaptible import llm
+from adaptible import InteractionHistory, StatefulLLM, llm
 
 
 class RepairRollbackTest(unittest.TestCase):

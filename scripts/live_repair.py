@@ -9,16 +9,20 @@ key-term judge and the rephrasings never enter the loop. Log lines are grep-able
 
     PYTHONPATH=. .venv/bin/python scripts/live_repair.py --sessions 8 --out outputs/runs/live
 """
-import argparse, asyncio, json, os, re, sys, time
+import argparse
+import asyncio
+import json
+import os
+import time
 from pathlib import Path
 
 import httpx
 
 import adaptible
-from adaptible.lookup import DEFAULT_PASSAGES as PASSAGES
-from adaptible.eval.harness import contains_key_terms
 from adaptible.eval import generate_default_dataset
+from adaptible.eval.harness import contains_key_terms
 from adaptible.local import MutableHostedLLM
+from adaptible.lookup import DEFAULT_PASSAGES as PASSAGES
 
 PARA = {
  "geo_010": ["Which city is the capital of Morocco?", "Morocco's seat of government is in which city?", "Name the capital city of the Kingdom of Morocco."],

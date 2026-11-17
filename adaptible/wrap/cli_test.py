@@ -9,7 +9,8 @@ from unittest import mock
 
 import httpx
 
-from adaptible.wrap.__main__ import parser as wrapper_parser, serve
+from adaptible.wrap.__main__ import parser as wrapper_parser
+from adaptible.wrap.__main__ import serve
 from adaptible.wrap.model_source import fingerprint_base
 from adaptible.wrap.store import Store
 from scripts import wrapper_demo as demo

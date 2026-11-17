@@ -8,13 +8,12 @@ python examples/online_learning_demo.py
 
 import asyncio
 import json
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import aiohttp
 import vizible
 
 import adaptible
-
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 #                                           Constants.                                            #

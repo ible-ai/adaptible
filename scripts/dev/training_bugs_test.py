@@ -15,7 +15,7 @@ Run with:
 
 import inspect
 import unittest
-from typing import List, cast
+from typing import cast
 
 import mlx.core as mx
 import mlx.nn
@@ -140,7 +140,7 @@ class LossReductionBugTest(unittest.TestCase):
 
         # Set logits so positions 0-2 are wrong, 3-4 are right
         logits_np = logits.tolist()
-        logits_np = cast(List[List[List[float]]], logits_np)
+        logits_np = cast(list[list[list[float]]], logits_np)
         for pos in range(3):
             logits_np[0][pos][0] = 10.0  # Wrong prediction
         for pos in range(3, 5):

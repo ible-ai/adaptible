@@ -4,9 +4,9 @@ import asyncio
 import importlib.util
 import json
 import unittest
+from unittest.mock import ANY, DEFAULT, AsyncMock, patch
 
 import httpx
-from unittest.mock import ANY, DEFAULT, AsyncMock, patch
 
 from adaptible.wrap.scope_router import ScopeRouter
 

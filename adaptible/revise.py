@@ -1,7 +1,8 @@
 """Utilities for self-reflective model revisions."""
 
 import re
-from typing import Literal, Sequence, Tuple
+from collections.abc import Sequence
+from typing import Literal
 
 import mlx.core as mx
 from transformers.tokenization_utils import PreTrainedTokenizer
@@ -271,7 +272,7 @@ def strip_think_tags(text: str | None) -> str:
     return cleaned.strip()
 
 
-def split_think(text: str | None) -> Tuple[str, str]:
+def split_think(text: str | None) -> tuple[str, str]:
     """Split a response into its reasoning and its answer.
 
     Handles ``<think>...</think>answer``, bare ``reasoning</think>answer``
@@ -312,7 +313,7 @@ def validate_rationale_max_tokens(rationale_max_tokens: int) -> None:
 
 def truncate_at_sentence(
     text: str, tokenizer: PreTrainedTokenizer, max_tokens: int
-) -> Tuple[str, int, bool]:
+) -> tuple[str, int, bool]:
     """Cap ``text`` at ``max_tokens`` tokens, cutting at the last sentence boundary.
 
     Counts with ``tokenizer.encode``. When the text is over the cap the first
@@ -350,7 +351,7 @@ def rationale_from_output(
     output: str | None,
     tokenizer: PreTrainedTokenizer,
     max_tokens: int = DEFAULT_RATIONALE_MAX_TOKENS,
-) -> Tuple[str, int, bool]:
+) -> tuple[str, int, bool]:
     """The reasoning in a model output, for ``think_mode="rationale"``.
 
     With a ``</think>`` in the output the think block before it is the
@@ -423,7 +424,7 @@ def _serialize_interactions_to_string(
     continue_final_message: bool,
     strip_thinking: bool = True,
     dialog_style: DialogStyle = "chat",
-) -> Tuple[str, Sequence[str]]:
+) -> tuple[str, Sequence[str]]:
     """Render interactions as text, one entry per turn.
 
     Args:

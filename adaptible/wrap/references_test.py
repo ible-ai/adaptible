@@ -7,12 +7,12 @@ import unittest
 from unittest import mock
 
 from adaptible.wrap.references import (
-    ReferenceSearchError,
     SEARCH_BACKENDS,
+    ReferenceSearchError,
     WebReferences,
     _public_url,
-    _sources,
     _search_sync,
+    _sources,
 )
 
 

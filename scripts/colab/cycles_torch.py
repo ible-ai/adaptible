@@ -12,12 +12,22 @@ with `python cycles_torch.py --out <same dir>`.
 
 Log lines (grep-able, same as the MLX probe): BASE / SAMPLE / CAND / CYCLE / SUMMARY.
 """
-import argparse, json, math, os, re, socket, sys, time, unicodedata
+import argparse
+import json
+import re
+import socket
+import time
+import unicodedata
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 from peft import LoraConfig, get_peft_model
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
 # ----------------------------------------------------------------------------- items
 ITEMS = {

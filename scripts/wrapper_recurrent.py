@@ -32,13 +32,13 @@ import httpx
 from scripts.wrapper_demo import (
     WrapperProcess,
     chat,
-    record_adaptation,
     cleanup_lm_studio,
     cleanup_tags,
+    record_adaptation,
     request,
     require,
-    stream_chat,
     split_thinking,
+    stream_chat,
     verify_training,
 )
 

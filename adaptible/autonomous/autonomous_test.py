@@ -7,7 +7,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from adaptible.autonomous import node as node_module
 from adaptible.autonomous.node import (
     AutonomousNode,
     Claim,

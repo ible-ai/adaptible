@@ -1,11 +1,11 @@
 """Owned subprocess cancellation, using tiny local Python children only."""
 
 import asyncio
-from pathlib import Path
 import signal
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from adaptible.wrap.runtime import LlamaCpp, run_command

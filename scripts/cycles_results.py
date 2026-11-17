@@ -14,7 +14,10 @@ Output, in ``--out``:
     python scripts/cycles_results.py --log outputs/runs/mve_cycles.log --out results/<name>
     python scripts/cycles_results.py --history history.json --out results/<name>
 """
-import argparse, csv, json, re
+import argparse
+import csv
+import json
+import re
 from pathlib import Path
 
 ITEMS = ["geo_010", "geo_004", "geo_001", "geo_013", "sci_017"]

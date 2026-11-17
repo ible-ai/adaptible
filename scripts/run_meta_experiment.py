@@ -67,17 +67,17 @@ Examples:
 """
 
 import json
+import os
 import pathlib
 import sys
 import webbrowser
-import os
 
 # Add parent to path for imports
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
+import vizible
 from absl import app, flags
 
-import vizible
 import adaptible
 
 # Access eval submodule through package

@@ -8,9 +8,9 @@ import sys
 import uvicorn
 from fastapi import FastAPI
 
-from .api import Adaptible
 from ..llm import StatefulLLM
 from ..lookup import DEFAULT_PASSAGES, DocStore
+from .api import Adaptible
 
 logging.basicConfig(
     level=logging.INFO,

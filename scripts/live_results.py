@@ -8,7 +8,11 @@ node's own marks before/after, kept), and score.svg (outside score per session,
 controls dashed). The node's own marks come from the run log's REPAIR lines;
 everything else from history.json.
 """
-import argparse, csv, json, re, sys
+import argparse
+import csv
+import json
+import re
+import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))

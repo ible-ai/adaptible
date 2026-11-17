@@ -24,8 +24,8 @@ from pathlib import Path
 
 import httpx
 
-from adaptible.eval.harness import contains_key_terms
 from adaptible.eval import generate_default_dataset
+from adaptible.eval.harness import contains_key_terms
 
 # scripts/cycles_mlx.py PARA, verbatim.
 PARA = {

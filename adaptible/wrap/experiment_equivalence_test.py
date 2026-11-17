@@ -21,8 +21,8 @@ import sys
 import unittest
 from pathlib import Path
 
-from adaptible.eval.harness import contains_key_terms
 from adaptible.eval import generate_default_dataset
+from adaptible.eval.harness import contains_key_terms
 
 sys.path.insert(0, "scripts")
 
@@ -333,12 +333,12 @@ class OptimizerEquivalenceTest(unittest.TestCase):
         """Driven, not read: the trainer's own selector on the flag the
         flagship path sets, against the selector on the flag it would have
         had if detection said this model does not reason."""
+        import torch
+
         from adaptible.wrap.training_optimizer import (
             MLXAdamW,
             training_optimizer,
         )
-
-        import torch
 
         parameter = [torch.nn.Parameter(torch.zeros(2))]
         self.assertIsInstance(

@@ -6,7 +6,10 @@ about the wrong city. Two facts the base model already knows are controls.
 
     python scripts/colab/probe_torch.py --run /workspace/out/seed3000 --adapters base,23,39
 """
-import argparse, importlib.util, json, re, sys, unicodedata
+import argparse
+import importlib.util
+import json
+import unicodedata
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("cycles_torch", Path(__file__).with_name("cycles_torch.py"))

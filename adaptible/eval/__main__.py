@@ -64,6 +64,7 @@ import webbrowser
 import vizible
 from absl import app, flags
 
+from ..revise import DEFAULT_RATIONALE_MAX_TOKENS, REVISION_PROMPTS, THINK_MODES
 from . import (
     TRAINING_SOURCES,
     EvaluationConfig,
@@ -80,7 +81,6 @@ from .harness import (
     lora_model_kwargs,
     lora_settings_text,
 )
-from ..revise import DEFAULT_RATIONALE_MAX_TOKENS, REVISION_PROMPTS, THINK_MODES
 
 _NAME = flags.DEFINE_string("name", "default", "Experiment name")
 _TRAIN_RATIO = flags.DEFINE_float("train_ratio", 0.8, "Train/holdout split ratio")

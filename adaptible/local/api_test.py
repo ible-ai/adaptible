@@ -3,9 +3,8 @@
 These tests use a stub model to test API logic in isolation.
 """
 
-from typing import List
-
 import unittest
+
 from fastapi.testclient import TestClient
 
 import adaptible
@@ -30,8 +29,8 @@ class StubModel:
         self.ok = True
         self._call_count = 0
         # Every call to self_correct_and_train, as (interaction_history, indices).
-        self.self_correct_calls: List[
-            tuple[List[adaptible.InteractionHistory], List[int] | None]
+        self.self_correct_calls: list[
+            tuple[list[adaptible.InteractionHistory], list[int] | None]
         ] = []
         self._train_error = train_error
 
@@ -42,8 +41,8 @@ class StubModel:
 
     def self_correct_and_train(
         self,
-        interaction_history: List[adaptible.InteractionHistory],
-        indices_to_review: List[int] | None = None,
+        interaction_history: list[adaptible.InteractionHistory],
+        indices_to_review: list[int] | None = None,
         verbose: bool = False,
     ) -> bool:
         del verbose

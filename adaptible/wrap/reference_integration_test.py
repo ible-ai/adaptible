@@ -17,8 +17,8 @@ from unittest.mock import AsyncMock
 import httpx
 
 from adaptible.wrap.app import create_app
-from adaptible.wrap.repair import Controller
 from adaptible.wrap.references import ReferenceSearchError
+from adaptible.wrap.repair import Controller
 from adaptible.wrap.store import Store
 from adaptible.wrap.wrap_test import FakeRuntime, FakeTrainer
 

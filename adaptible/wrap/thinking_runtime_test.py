@@ -1,20 +1,18 @@
 """Thinking mode, final-only evaluation, and masked trace learning contracts."""
 
-import asyncio
 import json
-from pathlib import Path
-import sqlite3
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 
 from adaptible.wrap.app import create_app
 from adaptible.wrap.prompt_format import (
-    render_ollama_qwen3,
     OLLAMA_QWEN3_FORMAT,
     OLLAMA_QWEN3_TEMPLATE_SHA256,
+    render_ollama_qwen3,
 )
 from adaptible.wrap.repair import Controller
 from adaptible.wrap.retention import evaluate_retention, retention_regressions

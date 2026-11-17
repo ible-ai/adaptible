@@ -7,7 +7,7 @@ advance and the run says only what the model does with what it found.
 
 import re
 import unicodedata
-from typing import Mapping
+from collections.abc import Mapping
 
 _STOP = frozenset(
     "a an the of in on at to is are was were be been what which who whom whose where when "

@@ -9,18 +9,18 @@ weight updates via LoRA fine-tuning.
 
 import dataclasses
 import json
-import textwrap
 import random
 import re
-from collections.abc import Mapping, Sequence
+import textwrap
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, List
+from typing import Any
+
 import vizible
 
 from .. import paths
 from ..classes import InteractionHistory, TrainingExample
-from ..llm import MAX_TOKENS, StatefulLLM
 from ..db import (
     Database,
     Example,
@@ -32,6 +32,7 @@ from ..db import (
     TrainingEvent,
     canonical_id_for_question,
 )
+from ..llm import MAX_TOKENS, StatefulLLM
 from ..revise import clean_model_response, make_collated_training_example
 
 
@@ -176,8 +177,8 @@ def _claim_is_plausible(claim: Claim, snippet: str) -> bool:
 class NodeState:
     """Persistent state of the autonomous node."""
 
-    learning_history: List[LearningEvent] = dataclasses.field(default_factory=list)
-    topics_explored: List[str] = dataclasses.field(default_factory=list)
+    learning_history: list[LearningEvent] = dataclasses.field(default_factory=list)
+    topics_explored: list[str] = dataclasses.field(default_factory=list)
     total_updates: int = 0
     total_searches: int = 0
     started_at: str = ""
@@ -221,7 +222,7 @@ class ExplorationResult:
     claims_found: int = 0
     beliefs_checked: int = 0
     updates_made: int = 0
-    events: List[LearningEvent] = dataclasses.field(default_factory=list)
+    events: list[LearningEvent] = dataclasses.field(default_factory=list)
     error: str | None = None
 
 

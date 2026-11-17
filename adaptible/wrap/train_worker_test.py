@@ -15,6 +15,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from adaptible.wrap import tiny_models as tiny
 from adaptible.wrap.gguf_adapter import SUPPORTED_ARCHITECTURES, inspect_model
 from adaptible.wrap.model_source import (
     inspect_base,
@@ -23,7 +24,6 @@ from adaptible.wrap.model_source import (
 )
 from adaptible.wrap.tokenizer import load_tokenizer
 from adaptible.wrap.train import train
-from adaptible.wrap import tiny_models as tiny
 
 REASONING = "<think>\nMorocco's largest city is Casablanca.\n</think>"
 

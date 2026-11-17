@@ -23,6 +23,7 @@ from unittest import mock
 
 import torch
 
+from adaptible.wrap import tiny_models as tiny
 from adaptible.wrap.gguf_adapter import (
     PERMUTED_ARCHITECTURES,
     SUPPORTED_ARCHITECTURES,
@@ -30,7 +31,6 @@ from adaptible.wrap.gguf_adapter import (
 )
 from adaptible.wrap.gguf_fusion import fuse_gguf
 from adaptible.wrap.train import train
-from adaptible.wrap import tiny_models as tiny
 
 # A correct fusion differs from its PEFT reference only by float16 rounding,
 # which measures ~4e-4 of the adapter's effect. A mis-permuted one measures

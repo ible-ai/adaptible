@@ -34,9 +34,10 @@ class PromptFormatTest(unittest.TestCase):
                 self.assertEqual(json.dumps(case["messages"]), before)
 
     def test_worker_uses_native_prefix_for_primary_and_additional_examples(self):
-        from adaptible.wrap.training_examples import encode_examples
-        from transformers import Qwen2Tokenizer
         from tokenizers.pre_tokenizers import ByteLevel
+        from transformers import Qwen2Tokenizer
+
+        from adaptible.wrap.training_examples import encode_examples
 
         tokenizer = Qwen2Tokenizer(
             vocab={

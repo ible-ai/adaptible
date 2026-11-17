@@ -6,9 +6,9 @@ Usage:
 """
 
 import argparse
-import sys
 import datetime
 import pathlib
+import sys
 
 # Add parent to path for imports
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
@@ -17,11 +17,11 @@ from adaptible import (
     Database,
     Example,
     Experiment,
-    Response,
-    TrainingEvent,
     ExperimentType,
     Phase,
+    Response,
     SourceType,
+    TrainingEvent,
     default_judge,
 )
 
