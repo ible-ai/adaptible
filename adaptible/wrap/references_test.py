@@ -235,14 +235,16 @@ class WebReferencesTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(created[0].returncode)
 
     def test_provider_no_result_exception_is_distinct_from_provider_error(self):
+        from ddgs.engines import ENGINES
         from ddgs.exceptions import DDGSException
 
+        installed = [b for b in SEARCH_BACKENDS if b in ENGINES["text"]]
         with mock.patch("ddgs.DDGS") as provider:
             search = provider.return_value.__enter__.return_value.text
             search.side_effect = DDGSException("No results found.")
             self.assertEqual(_search_sync("city question", 5, 20), [])
             search.assert_called_once_with(
-                "city question", max_results=15, backend=",".join(SEARCH_BACKENDS)
+                "city question", max_results=15, backend=",".join(installed)
             )
             search.side_effect = DDGSException("provider connection failed")
             with self.assertRaises(DDGSException):

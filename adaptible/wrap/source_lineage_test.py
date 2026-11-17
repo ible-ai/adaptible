@@ -33,7 +33,11 @@ class BackendSelectionTest(unittest.TestCase):
             search.return_value = []
             self.assertEqual(_search_sync("A question", 5, 20), [])
             requested = search.call_args.kwargs["backend"].split(",")
-            self.assertEqual(requested, list(SEARCH_BACKENDS))
+            # ddgs disables engines between releases (9.16.1 dropped google), so
+            # expect the supported backends this ddgs still offers, in order.
+            installed = [b for b in SEARCH_BACKENDS if b in ENGINES["text"]]
+            self.assertTrue(installed)
+            self.assertEqual(requested, installed)
             self.assertTrue(set(requested) <= ENGINES["text"].keys())
             self.assertFalse(set(requested) & {"auto", "all", "yahoo"})
 
