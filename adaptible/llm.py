@@ -2,12 +2,13 @@
 
 import collections
 import dataclasses
-import re
 import functools
 import math
+import re
 import threading
+from collections.abc import AsyncIterable, Callable, Sequence
 from pathlib import Path
-from typing import Any, AsyncIterable, Callable, List, Sequence, Tuple, cast
+from typing import Any, cast
 
 import immutabledict
 import mlx
@@ -38,7 +39,6 @@ from .revise import (
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 #                         Default constants.                          #
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-# _MODEL_NAME = "lmstudio-community/Qwen3-4B-Thinking-2507-MLX-8bit"
 # _MODEL_NAME = "lmstudio-community/Qwen3-4B-Instruct-2507-MLX-8bit"
 _MODEL_NAME = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B"
 # _MODEL_NAME = "mlx-community/DeepSeek-R1-Qwen3-0528-8B-4bit-AWQ"
@@ -47,7 +47,6 @@ MAX_TOKENS = 2048
 # Kept as a module-level name for backward compatibility (``autonomous/`` imports it);
 # resolved through ``paths`` so that it honours ``$ADAPTIBLE_OUTPUTS_DIR``.
 MODEL_PATH = default_checkpoint_path()
-# MAX_TOKENS = 8192
 _LEARNING_RATE = 2e-5
 _EPOCHS = 5
 # Training recipe. These are the settings of the self-repair cycle runs in
@@ -81,19 +80,19 @@ _CONTROL_PROMPTS = (
 )
 _USE_DORA = False
 # Loop detection configuration: Check for repeating sequences to prevent infinite loops.
-# LOOP_DETECTION_SEQUENCE_LENGTH: Length of token sequence to check for repetition.
-# LOOP_DETECTION_MAX_REPETITIONS: Number of times a sequence can repeat before stopping.
+# Length of token sequence to check for repetition.
 _LOOP_DETECTION_SEQUENCE_LENGTH = 8
+# Number of times a sequence can repeat before stopping.
 _LOOP_DETECTION_MAX_REPETITIONS = 3
 
 
 def _detect_token_loop(
-    tokens: List[int], sequence_length: int, max_repetitions: int
+    tokens: Sequence[int], sequence_length: int, max_repetitions: int
 ) -> bool:
     """Detect if the most recent tokens form a repeating loop.
 
     Args:
-        tokens: List of generated token IDs.
+        tokens: Generated token IDs.
         sequence_length: Length of sequence to check for repetition.
         max_repetitions: Maximum number of times a sequence can repeat.
 
@@ -124,7 +123,7 @@ def _load(
     use_dora: bool,
     lora_parameters: dict | None = None,
     model_path: Path | None = None,
-) -> Tuple[mlx.nn.Module, PreTrainedTokenizer]:
+) -> tuple[mlx.nn.Module, PreTrainedTokenizer]:
     """Load model parameters and tokenizer.
 
     Args:
@@ -176,7 +175,7 @@ def _loss_fn(
     targets: mlx.core.array,
     mask: mlx.core.array,
     stop_mask: mlx.core.array | None = None,
-) -> Tuple[mlx.core.array, mlx.core.array]:
+) -> tuple[mlx.core.array, mlx.core.array]:
     """Masked-mean cross entropy: ``(train_loss, stop_loss)``.
 
     ``train_loss`` is the mean over ``mask`` and is what gradients are taken
@@ -205,11 +204,11 @@ def _loss_fn(
     return train_loss, stop_loss
 
 
-StepLoss = float | Tuple[float, float]
+StepLoss = float | tuple[float, float]
 """What a step function returns: one loss, or ``(train_loss, stop_loss)``."""
 
 
-def _split_step_loss(loss: Any) -> Tuple[float, float]:
+def _split_step_loss(loss: Any) -> tuple[float, float]:
     """``(train_loss, stop_loss)`` from a scalar or a pair (scalar: both equal)."""
     if isinstance(loss, (tuple, list)):
         train_loss, stop_loss = loss
@@ -366,7 +365,7 @@ def active_rehearsal(
     ]
 
 
-JointStepResult = Tuple[StepLoss, float | None] | Tuple[StepLoss, float | None, int]
+JointStepResult = tuple[StepLoss, float | None] | tuple[StepLoss, float | None, int]
 
 
 def run_joint_training_steps(
@@ -571,15 +570,15 @@ class StatefulLLM:
 
     def apply_chat_template(
         self,
-        messages: List[dict[str, str]],
-    ) -> List[int]:
+        messages: Sequence[dict[str, str]],
+    ) -> list[int]:
         """Applies chat template to messages.
 
         Args:
-            messages: List of message dicts with 'role' and 'content' keys.
+            messages: Message dicts with 'role' and 'content' keys.
 
         Returns:
-            Formatted chat string.
+            Token ids of the formatted chat, ending with the generation prompt.
         """
         # transformers >= 5 returns a BatchEncoding unless return_dict=False;
         # mlx_lm.stream_generate needs a plain list of token ids.
@@ -590,7 +589,7 @@ class StatefulLLM:
 
     def _messages_for_prompt(
         self, prompt: str, use_history: bool
-    ) -> List[dict[str, str]]:
+    ) -> list[dict[str, str]]:
         """Builds the message list to feed the chat template for a new user turn.
 
         When ``use_history`` is set the user turn is appended to the persistent
@@ -744,7 +743,7 @@ class StatefulLLM:
                         self._loop_detection_sequence_length,
                         self._loop_detection_max_repetitions,
                     ):
-                        vizible.red(f"⚠️  Loop detected! Stopping generation early.")
+                        vizible.red("⚠️  Loop detected! Stopping generation early.")
                         vizible.red(
                             f"   Generated {len(generated_tokens)} tokens before loop detection."
                         )
@@ -768,8 +767,8 @@ class StatefulLLM:
 
     def _self_correct(
         self,
-        interaction_history: List[InteractionHistory],
-        indices_to_review: List[int] | None,
+        interaction_history: Sequence[InteractionHistory],
+        indices_to_review: Sequence[int] | None,
         verbose: bool,
     ) -> TrainingExample:
         self._model_is_stable = False
@@ -871,7 +870,7 @@ class StatefulLLM:
         _prepare_training_device(verbose)
         progress = tqdm.tqdm(desc="Training", total=max_steps)
 
-        def one_step() -> Tuple[float, float]:
+        def one_step() -> tuple[float, float]:
             train_loss, stop_loss = _step(
                 example.input, example.label, example.mask, stop_mask
             )
@@ -891,7 +890,7 @@ class StatefulLLM:
     def _train_joint_locked(
         self,
         correction: TrainingExample,
-        rehearsal: List[TrainingExample],
+        rehearsal: Sequence[TrainingExample],
         verbose: bool,
         max_steps: int,
         loss_target: float | None,
@@ -940,7 +939,7 @@ class StatefulLLM:
         # Per-example rehearsal loss at the first step: the hinge's anchor.
         initial_losses: list[float] | None = None
 
-        def one_step() -> Tuple[Tuple[float, float], float | None, int]:
+        def one_step() -> tuple[tuple[float, float], float | None, int]:
             nonlocal initial_losses
             (train_c, stop_c), grads_c = loss_and_grad_fn(
                 self._model,
@@ -1070,7 +1069,7 @@ class StatefulLLM:
     def train_on_examples(
         self,
         correction: TrainingExample,
-        rehearsal: List[TrainingExample],
+        rehearsal: Sequence[TrainingExample],
         *,
         loss_target: float | None,
         max_steps: int,
@@ -1155,7 +1154,7 @@ class StatefulLLM:
             )
         )
 
-    def _snapshot(self) -> Tuple[Any, float]:
+    def _snapshot(self) -> tuple[Any, float]:
         """Copies the adapter weights; ``_restore`` puts them back."""
         params = mlx.utils.tree_map(lambda x: x + 0, self._model.trainable_parameters())
         # Evaluate now: a lazy copy evaluated later from another thread (the
@@ -1163,7 +1162,7 @@ class StatefulLLM:
         mlx.core.eval(params)
         return params, self._checksum()
 
-    def _restore(self, snap: Tuple[Any, float]) -> None:
+    def _restore(self, snap: tuple[Any, float]) -> None:
         """Puts a snapshot's weights back, verified by checksum, with a fresh optimizer."""
         params, s = snap
         self._model.update(mlx.utils.tree_map(lambda x: x + 0, params))
@@ -1304,7 +1303,7 @@ class StatefulLLM:
 
     def _score_prompts(
         self, question: str, prompts: Sequence[str], name: str
-    ) -> Tuple[int, str]:
+    ) -> tuple[int, str]:
         """Answers each prompt with the current weights; reads each answer under the frozen adapter."""
         answers = [self.generate_response(p, use_history=False) for p in prompts]
         cur = self._snapshot()
@@ -1455,8 +1454,8 @@ class StatefulLLM:
 
     def self_correct_and_train(
         self,
-        interaction_history: List[InteractionHistory],
-        indices_to_review: List[int] | None = None,
+        interaction_history: Sequence[InteractionHistory],
+        indices_to_review: Sequence[int] | None = None,
         verbose: bool = False,
     ) -> bool:
         """Reviews unreviewed interactions and trains on what it finds.
